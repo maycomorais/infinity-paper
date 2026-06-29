@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Papelaria Manager</title>
+  <link rel="stylesheet" href="style.css" />
+  <!-- Supabase UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+
+<!-- ── LOGIN ─────────────────────────────────────────────── -->
+<div id="login-screen" class="login-page">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="login-logo-icon">🖨️</div>
+    </div>
+    <div>
+      <h1 class="login-title">Papelaria<br>Manager</h1>
+      <p class="login-sub" id="empresa-nome-login">Gestão completa de papelaria e xerox</p>
+    </div>
+    <div class="field">
+      <label>E-mail</label>
+      <input type="email" id="login-email" class="input" placeholder="operador@papelaria.com" />
+    </div>
+    <div class="field">
+      <label>Senha</label>
+      <input type="password" id="login-password" class="input" placeholder="••••••••" />
+    </div>
+    <button class="btn btn--primary btn--lg" id="btn-login" style="width:100%">
+      Entrar
+    </button>
+    <p style="text-align:center;font-size:var(--t-xs);color:var(--c-text-3)">
+      Primeiro acesso? Use as credenciais fornecidas pelo administrador.
+    </p>
+  </div>
+</div>
+
+<!-- ── APP ───────────────────────────────────────────────── -->
+<div id="app-screen" class="layout" style="display:none">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <div class="sidebar-logo-icon">🖨️</div>
+      <div>
+        <div class="sidebar-logo-text">Infiniy Paper</div>
+        <div class="sidebar-logo-sub" id="empresa-nome-sidebar">Manager</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav" id="sidebar-nav">
+      <!-- Gerada via JS -->
+    </nav>
+
+    <div class="sidebar-footer">
+      <div style="display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-2) var(--sp-1);margin-bottom:var(--sp-2);overflow:hidden;white-space:nowrap">
+        <div style="width:32px;height:32px;border-radius:50%;background:var(--c-primary);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:.8rem">👤</div>
+        <div style="min-width:0">
+          <div style="font-size:var(--t-xs);font-weight:600;overflow:hidden;text-overflow:ellipsis" id="user-name-sidebar">—</div>
+          <div style="font-size:10px;color:var(--c-text-3)" id="user-role-sidebar">—</div>
+        </div>
+      </div>
+      <button class="sidebar-toggle" id="sidebar-collapse-btn">
+        <span id="sidebar-toggle-icon">◀</span>
+        <span id="sidebar-toggle-label">Recolher</span>
+      </button>
+      <button class="sidebar-toggle" id="btn-logout" style="margin-top:var(--sp-1);color:var(--c-danger)">
+        <span>⎋</span>
+        <span class="sidebar-label">Sair</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main" id="main">
+    <!-- TOPBAR -->
+    <header class="topbar">
+      <div>
+        <div class="topbar-title" id="page-title">Dashboard</div>
+        <div class="topbar-subtitle" id="page-subtitle" style="display:none"></div>
+      </div>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </header>
+
+    <!-- DYNAMIC CONTENT -->
+    <div class="page-content" id="page-content">
+      <!-- Injected by router -->
+    </div>
+  </main>
+
+</div>
+
+<!-- MODAL GLOBAL -->
+<div class="modal-overlay" id="global-modal">
+  <div class="modal" id="global-modal-inner" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <h2 class="modal-title" id="modal-title">Modal</h2>
+      <button class="modal-close" id="modal-close-btn">✕</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<!-- Scripts -->
+<script src="config.js?v=1.0.0"></script>
+<script src="app.js?v=1.0.0"></script>
+</body>
+</html>

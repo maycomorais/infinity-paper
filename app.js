@@ -1,0 +1,4273 @@
+// ============================================================
+// PAPELARIA MANAGER — app.js
+// SPA Router + Auth + Módulos
+// ============================================================
+
+'use strict';
+
+// ── SUPABASE INIT ─────────────────────────────────────────
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ── STATE GLOBAL ──────────────────────────────────────────
+const State = {
+  user: null,
+  userProfile: null,
+  empresa: null,
+  caixaSessao: null,
+  impressoras: [],
+  precosCopia: [],
+  currentPage: null,
+};
+
+// ── NAV CONFIG ────────────────────────────────────────────
+const NAV = [
+  { group: 'Principal' },
+  { id: 'dashboard',    label: 'Dashboard',     icon: '📊', page: renderDashboard, roles: ['admin', 'funcionario'] },
+  { id: 'copias',       label: 'Cópias / PDV',  icon: '🖨️', page: renderCopias,   pdv: true, roles: ['admin', 'funcionario'] },
+  { id: 'vendas',       label: 'Vendas Loja',   icon: '🛍️', page: renderVendas, roles: ['admin', 'funcionario'] },
+  { id: 'passagens',    label: 'Passagens NSA', icon:'🚌', page: renderPassagens, roles: ['admin', 'funcionario'] },
+  { group: 'Produção' },
+  { id: 'fila',         label: 'Fila de Produção', icon:'🖨️', page: renderFilaProducao, pdv: true, roles: ['admin', 'funcionario'] },
+  
+  { group: 'Cadastros' },
+  { id: 'usuarios', label: 'Usuários', icon: '👥', page: renderUsuarios, roles: ['admin'] },
+
+
+  { group: 'Gestão' },
+  { id: 'caixa',        label: 'Caixa',         icon: '💰', page: renderCaixa, roles: ['admin', 'funcionario'] },
+  { id: 'estoque',      label: 'Estoque',       icon: '📦', page: renderEstoque, roles: ['admin', 'funcionario'] },
+  { id: 'contas',       label: 'Contas',        icon: '📋', page: renderContas, roles: ['admin'] },
+  { id: 'compras',      label: 'Compras',       icon: '🛒', page: renderCompras, roles: ['admin'] },
+
+  { group: 'Cadastros' },
+  { id: 'clientes',     label: 'Clientes',      icon: '👥', page: renderClientes, roles: ['admin'] },
+  { id: 'funcionarios', label: 'Funcionários',  icon: '👔', page: renderFuncionarios, roles: ['admin'] },
+  { id: 'fornecedores', label: 'Fornecedores',  icon: '🏭', page: renderFornecedores, roles: ['admin'] },
+  { id: 'impressoras',  label: 'Impressoras',   icon: '🖥️', page: renderImpressoras, roles: ['admin', 'funcionario'] },
+  { id: 'precos',       label: 'Tabela de Preços', icon:'💲', page: renderPrecos, roles: ['admin', 'funcionario'] },
+];
+
+// ── BOOT ──────────────────────────────────────────────────
+(async () => {
+  const { data: { session } } = await sb.auth.getSession();
+  if (session?.user) {
+    State.user = session.user;
+    await initApp();
+  } else {
+    showLogin();
+  }
+
+  sb.auth.onAuthStateChange(async (_event, session) => {
+    if (session) {
+      State.user = session.user;
+      await initApp();
+    } else {
+      State.user = null;
+      showLogin();
+    }
+  });
+})();
+
+// ── AUTH ──────────────────────────────────────────────────
+function showLogin() {
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('app-screen').style.display = 'none';
+}
+
+document.getElementById('btn-login').addEventListener('click', async () => {
+  const email = document.getElementById('login-email').value.trim();
+  const pwd = document.getElementById('login-password').value;
+  if (!email || !pwd) { toast('Preencha e-mail e senha', 'warning'); return; }
+  const btn = document.getElementById('btn-login');
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Entrando...';
+  const { error } = await sb.auth.signInWithPassword({ email, password: pwd });
+  if (error) { toast(error.message || 'Erro ao entrar', 'error'); }
+  btn.disabled = false;
+  btn.textContent = 'Entrar';
+});
+
+document.getElementById('btn-logout').addEventListener('click', async () => {
+  await sb.auth.signOut();
+  State.user = null;
+  State.userProfile = null;
+});
+
+// ── INIT APP ──────────────────────────────────────────────
+async function initApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app-screen').style.display = 'flex';
+
+  // Carrega dados base
+  await Promise.all([loadEmpresa(), loadImpressoras(), loadPrecosCopia()]);
+
+  if (State.empresa?.config?.cotacao_brl) {
+    setCotacao(State.empresa.config.cotacao_brl);
+    // Atualiza o campo do widget se ele já existir
+    const input = document.getElementById('input-cotacao');
+    if (input) input.value = State.empresa.config.cotacao_brl;
+  }
+
+  if (State.user) {
+    State.userProfile = await loadUserProfile(State.user.id);
+  }
+
+  if (State.userProfile && !State.userProfile.ativo) {
+  toast('⚠️ Seu usuário está bloqueado. Contate o administrador.', 'error');
+  await sb.auth.signOut();
+  showLogin();
+  return;
+}
+  
+  // Sidebar
+  buildSidebar();
+  document.getElementById('user-name-sidebar').textContent = State.user?.email?.split('@')[0] || 'Operador';
+  document.getElementById('user-role-sidebar').textContent = State.userProfile?.role || 'Operador';
+
+  // Widget de cotação BRL na topbar
+  renderCotacaoWidget();
+
+  // Rota inicial
+  navigate('dashboard');
+
+  // Sidebar collapse
+  document.getElementById('sidebar-collapse-btn').addEventListener('click', () => {
+    const sb = document.getElementById('sidebar');
+    sb.classList.toggle('collapsed');
+    const collapsed = sb.classList.contains('collapsed');
+    document.getElementById('sidebar-toggle-icon').textContent = collapsed ? '▶' : '◀';
+    document.getElementById('sidebar-toggle-label').textContent = collapsed ? 'Expandir' : 'Recolher';
+  });
+
+  // Modal close
+  document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+  document.getElementById('global-modal').addEventListener('click', e => {
+    if (e.target.id === 'global-modal') closeModal();
+  });
+}
+
+// ── CONFIGURAÇÕES DE CAIXA ──────────────────────────────
+const CONFIG = {
+  getLimiteSangria: async () => {
+    const { data, error } = await sb.from('empresa').select('config').single();
+    if (error) return 1000000; // fallback
+    return data?.config?.limite_sangria || 1000000;
+  },
+  setLimiteSangria: async (valor) => {
+    const { data, error } = await sb.from('empresa').select('config').single();
+    if (error) return;
+    const config = data?.config || {};
+    config.limite_sangria = valor;
+    await sb.from('empresa').update({ config }).eq('id', data.id);
+  }
+};
+
+async function loadUserProfile(userId) {
+  const { data, error } = await sb
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .single();
+  if (error) {
+    console.error('Erro ao carregar perfil:', error);
+    // Se não existir perfil, cria um padrão (funcionario)
+    if (error.code === 'PGRST116') {
+      const { data: newProfile, error: insertError } = await sb
+        .from('profiles')
+        .insert({ id: userId, role: 'funcionario', nome: State.user?.email })
+        .select()
+        .single();
+      if (!insertError) return newProfile;
+    }
+    return { role: 'funcionario' };
+  }
+  return data;
+}
+
+async function loadEmpresa() {
+  const { data } = await sb.from('empresa').select('*').limit(1).single();
+  if (data) {
+    State.empresa = data;
+    document.getElementById('empresa-nome-login').textContent = data.nome;
+    document.getElementById('empresa-nome-sidebar').textContent = data.nome;
+  }
+}
+async function loadImpressoras() {
+  const { data } = await sb.from('impressoras').select('*').eq('ativa', true).order('nome');
+  State.impressoras = data || [];
+}
+async function loadPrecosCopia() {
+  const { data } = await sb.from('precos_copia').select('*').eq('ativo', true);
+  State.precosCopia = data || [];
+}
+
+// ── SIDEBAR ───────────────────────────────────────────────
+function buildSidebar() {
+  const nav = document.getElementById('sidebar-nav');
+  const userRole = State.userProfile?.role || 'funcionario';
+
+  // Filtra os itens que o usuário pode ver
+  const visibleItems = NAV.filter(item => {
+    if (item.group) return true; // grupos sempre visíveis, mas podemos esconder se não houver itens filhos visíveis
+    return !item.roles || item.roles.includes(userRole);
+  });
+
+  // Para grupos, verifica se há pelo menos um item visível abaixo
+  const grupos = {};
+  let html = '';
+  let currentGroup = null;
+
+  visibleItems.forEach(item => {
+    if (item.group) {
+      currentGroup = item.group;
+      // Se o grupo já foi adicionado, não repete
+      if (!grupos[currentGroup]) {
+        grupos[currentGroup] = true;
+        html += `<div class="nav-group-label">${item.group}</div>`;
+      }
+    } else {
+      html += `<div class="nav-item" data-page="${item.id}" role="button" tabindex="0">
+        <span class="nav-item-icon">${item.icon}</span>
+        <span class="nav-item-label">${item.label}</span>
+      </div>`;
+    }
+  });
+
+  nav.innerHTML = html;
+
+  nav.querySelectorAll('.nav-item').forEach(el => {
+    el.addEventListener('click', () => navigate(el.dataset.page));
+    el.addEventListener('keydown', e => e.key === 'Enter' && navigate(el.dataset.page));
+  });
+}
+
+
+// ── WIDGET DE COTAÇÃO BRL ─────────────────────────────────
+function renderCotacaoWidget() {
+  console.log('renderCotacaoWidget chamada');
+  const actions = document.getElementById('topbar-actions');
+  console.log('topbar-actions:', actions);
+  if (!actions) return;
+  // Evita duplicar
+   if (document.getElementById('cotacao-widget')) {
+    console.log('Widget já existe');
+    return;
+  }
+
+  const widget = document.createElement('div');
+  widget.id = 'cotacao-widget';
+  widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs)';
+  widget.innerHTML = `
+    <span style="color:var(--c-text-3);white-space:nowrap">🇧🇷 R$1 =</span>
+    <input type="number" id="input-cotacao"
+      value="${APP_CONFIG.cotacaoBRL}"
+      step="10" min="100" max="9999"
+      style="width:70px;background:var(--c-bg);border:1.5px solid var(--c-border);border-radius:6px;padding:4px 6px;color:var(--c-text);font-size:var(--t-xs);font-family:var(--font-mono,monospace);font-weight:700;text-align:center"
+      title="Cotação do Real em Guaranis"
+    />
+    <span style="color:var(--c-text-3);white-space:nowrap">₲</span>
+    <button onclick="salvarCotacao()" style="background:var(--c-primary);color:#fff;border:none;border-radius:5px;padding:3px 8px;font-size:10px;font-weight:600;cursor:pointer">OK</button>
+  `;
+  // Insere ANTES do primeiro filho (topbar-actions normalmente vazio no load)
+   console.log('Widget criado');
+  actions.prepend(widget);
+}
+
+window.salvarCotacao = async function() {
+  const val = parseFloat(document.getElementById('input-cotacao')?.value);
+  if (!val || val < 100) { toast('Cotação inválida', 'warning'); return; }
+
+  // Atualiza no localStorage
+  setCotacao(val);
+
+  // Atualiza no banco
+  const { data: empresa } = await sb.from('empresa').select('id, config').single();
+  if (empresa) {
+    const config = empresa.config || {};
+    config.cotacao_brl = val;
+    await sb.from('empresa').update({ config }).eq('id', empresa.id);
+  }
+
+  toast(`Cotação atualizada: R$1 = ₲${val.toLocaleString('es-PY')}`, 'success');
+};
+
+// ── ROUTER ────────────────────────────────────────────────
+async function navigate(pageId) {
+  State.currentPage = pageId;
+  document.querySelectorAll('.nav-item').forEach(el =>
+    el.classList.toggle('active', el.dataset.page === pageId)
+  );
+  const item = NAV.find(n => n.id === pageId);
+  if (!item) return;
+
+  const userRole = State.userProfile?.role || 'funcionario';
+  if (item.roles && !item.roles.includes(userRole)) {
+    toast('Acesso negado. Você não tem permissão para acessar esta página.', 'error');
+    return navigate('dashboard');
+  }
+
+  // Topbar title
+  document.getElementById('page-title').textContent = item.label;
+  document.getElementById('topbar-actions').innerHTML = '';
+  // Recria o widget
+  renderCotacaoWidget();
+  // Render
+  const content = document.getElementById('page-content');
+  content.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
+
+  if (item.pdv) {
+    content.classList.add('pdv-mode');
+  } else {
+    content.classList.remove('pdv-mode');
+  }
+
+  try {
+    await item.page(content);
+  } catch (err) {
+    content.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">⚠️</div>
+      <div class="empty-state-title">Erro ao carregar</div>
+      <div class="empty-state-sub">${err.message}</div>
+    </div>`;
+    console.error(err);
+  }
+}
+
+async function isCaixaTravado() {
+  const { data, error } = await sb
+    .from('caixa_sessoes')
+    .select('travado')
+    .eq('fechado_em', null)
+    .maybeSingle(); // ← use maybeSingle() para não gerar erro
+
+  if (error) {
+    console.error('Erro ao verificar caixa:', error);
+    return false;
+  }
+  return data?.travado || false;
+}
+
+// ── MODAL ─────────────────────────────────────────────────
+function openModal(title, bodyHTML, size = '') {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHTML;
+  const inner = document.getElementById('global-modal-inner');
+  inner.className = `modal ${size}`;
+  document.getElementById('global-modal').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('global-modal').classList.remove('open');
+}
+window.openModal = openModal;
+window.closeModal = closeModal;
+
+// ============================================================
+// ── MÓDULO: DASHBOARD ─────────────────────────────────────
+// ============================================================
+async function renderDashboard(el) {
+  const hoje = new Date();
+  const inicioHoje = new Date(hoje.setHours(0,0,0,0)).toISOString();
+  const fimHoje = new Date(hoje.setHours(23,59,59,999)).toISOString();
+  const inicioMes = new Date(hoje.getFullYear(), hoje.getMonth(), 1).toISOString();
+
+  const [
+    { data: copiasHoje },
+    { data: copiasMes },
+    { data: vendasHoje },
+    { data: contasVencer },
+    { data: estoqueCritico },
+  ] = await Promise.all([
+    sb.from('pedidos_copia').select('total').eq('status','concluido').gte('created_at', inicioHoje),
+    sb.from('pedidos_copia').select('total').eq('status','concluido').gte('created_at', inicioMes),
+    sb.from('vendas').select('total').eq('status','concluido').gte('created_at', inicioHoje),
+    sb.from('contas').select('id').eq('status','pendente').lte('vencimento', new Date(Date.now()+7*86400000).toISOString().split('T')[0]),
+    sb.from('vw_estoque_critico').select('id'),
+  ]);
+
+  const sumTotal = arr => (arr||[]).reduce((a,b) => a + (b.total||0), 0);
+  const totalCopiasHoje = sumTotal(copiasHoje);
+  const totalCopiasMes  = sumTotal(copiasMes);
+  const totalVendasHoje = sumTotal(vendasHoje);
+
+  // Últimos pedidos de cópia
+  const { data: ultimosPedidos } = await sb.from('pedidos_copia')
+    .select('*, impressoras(nome)')
+    .order('created_at', { ascending: false })
+    .limit(8);
+
+  el.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-card stat-card--primary">
+        <div class="stat-card-header">
+          <span class="stat-card-label">Cópias Hoje</span>
+          <span class="stat-card-icon">🖨️</span>
+        </div>
+        <div class="stat-card-value">${formatMoney(totalCopiasHoje)}</div>
+        <div class="stat-card-sub">${(copiasHoje||[]).length} pedidos realizados</div>
+      </div>
+      <div class="stat-card stat-card--success">
+        <div class="stat-card-header">
+          <span class="stat-card-label">Vendas Hoje</span>
+          <span class="stat-card-icon">🛍️</span>
+        </div>
+        <div class="stat-card-value">${formatMoney(totalVendasHoje)}</div>
+        <div class="stat-card-sub">Produtos da loja</div>
+      </div>
+      <div class="stat-card stat-card--accent">
+        <div class="stat-card-header">
+          <span class="stat-card-label">Cópias no Mês</span>
+          <span class="stat-card-icon">📅</span>
+        </div>
+        <div class="stat-card-value">${formatMoney(totalCopiasMes)}</div>
+        <div class="stat-card-sub">${(copiasMes||[]).length} pedidos este mês</div>
+      </div>
+      <div class="stat-card stat-card--danger">
+        <div class="stat-card-header">
+          <span class="stat-card-label">Alertas</span>
+          <span class="stat-card-icon">⚠️</span>
+        </div>
+        <div class="stat-card-value">${(contasVencer||[]).length + (estoqueCritico||[]).length}</div>
+        <div class="stat-card-sub">${(contasVencer||[]).length} contas · ${(estoqueCritico||[]).length} estoque crítico</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 280px;gap:var(--sp-4)">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Últimos Pedidos de Cópia</span>
+          <button class="btn btn--ghost btn--sm" onclick="navigate('copias')">Ver PDV →</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th><th>Tipo</th><th>Qtd</th><th>Impressora</th><th>Total</th><th>Status</th><th>Hora</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(ultimosPedidos||[]).length === 0
+                ? `<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-icon">📄</div><div class="empty-state-sub">Nenhum pedido ainda hoje</div></div></td></tr>`
+                : (ultimosPedidos||[]).map(p => `
+                  <tr>
+                    <td class="td-mono">#${p.numero_pedido}</td>
+                    <td>${labelTipoCopia(p.tipo)}</td>
+                    <td>${p.quantidade}</td>
+                    <td>${p.impressoras?.nome || '—'}</td>
+                    <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.total)}</td>
+                    <td>${badgeStatus(p.status)}</td>
+                    <td class="td-mono">${formatDateTime(p.created_at)}</td>
+                  </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Impressoras</span></div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--sp-3)">
+            ${State.impressoras.map(imp => `
+              <div style="display:flex;align-items:center;gap:var(--sp-3)">
+                <div class="printer-status-dot ${imp.status}"></div>
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:var(--t-sm);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${imp.nome}</div>
+                  <div style="font-size:var(--t-xs);color:var(--c-text-3)">${imp.modelo||''}</div>
+                </div>
+                <span class="badge badge--${imp.status === 'online' ? 'success' : imp.status === 'offline' ? 'danger' : 'warning'}">${imp.status}</span>
+              </div>
+            `).join('') || '<div class="empty-state" style="padding:var(--sp-4)"><div class="empty-state-sub">Nenhuma impressora cadastrada</div></div>'}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><span class="card-title">Ações Rápidas</span></div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--sp-2)">
+            <button class="btn btn--primary" style="width:100%;justify-content:center" onclick="navigate('copias')">🖨️ Registrar Cópias</button>
+            <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('vendas')">🛍️ Nova Venda</button>
+            <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('caixa')">💰 Ver Caixa</button>
+            <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('contas')">📋 Contas a Pagar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// ── MÓDULO: CÓPIAS / PDV ──────────────────────────────────
+// ============================================================
+const PdvState = {
+  impressoraSelecionada: null,
+  tipoCopia: null,
+  quantidade: 1,
+  frenteVerso: false,
+  carrinho: [],
+  pagamento: 'dinheiro',
+  clienteId: null,
+  step: 1, 
+  paginasPorDocumento: 1,
+};
+
+async function renderCopias(el) {
+  await loadImpressoras();
+  await loadPrecosCopia();
+
+  // Garante que o step seja 1 ao entrar
+  PdvState.step = 1;
+
+  // HTML base: painel esquerdo com stepper + painel direito fixo
+  el.innerHTML = `
+    <div class="pdv-layout">
+      <!-- ESQUERDA: Stepper -->
+      <div class="pdv-left">
+        <div class="stepper-header">
+          <div class="step-indicators">
+            <span class="step-dot ${PdvState.step === 1 ? 'active' : ''}" data-step="1">1</span>
+            <span class="step-line"></span>
+            <span class="step-dot ${PdvState.step === 2 ? 'active' : ''}" data-step="2">2</span>
+            <span class="step-line"></span>
+            <span class="step-dot ${PdvState.step === 3 ? 'active' : ''}" data-step="3">3</span>
+          </div>
+          <div class="step-label">${getStepLabel(PdvState.step)}</div>
+        </div>
+
+        <div id="step-content">
+          <!-- Renderizado dinamicamente -->
+        </div>
+
+        <!-- Navegação entre passos -->
+        <div class="step-nav">
+          <button class="btn btn--ghost" id="step-back" style="${PdvState.step === 1 ? 'display:none' : ''}">
+            ← Voltar
+          </button>
+          <button class="btn btn--primary" id="step-next">
+            ${PdvState.step === 3 ? '➕ Adicionar ao Carrinho' : 'Avançar →'}
+          </button>
+        </div>
+      </div>
+
+      <!-- DIREITA: Painel do carrinho (igual ao anterior) -->
+      <div class="pdv-right">
+        <div class="pdv-panel-header">
+          <div style="font-size:var(--t-md);font-weight:700">🧾 Carrinho</div>
+          <div style="font-size:var(--t-xs);color:var(--c-text-3)" id="carrinho-count">0 itens</div>
+        </div>
+        <div class="pdv-panel-items" id="pdv-items">
+          <div class="empty-state">
+            <div class="empty-state-icon">🖨️</div>
+            <div class="empty-state-sub">Selecione uma impressora e tipo de cópia para começar</div>
+          </div>
+        </div>
+        <div class="pdv-panel-footer">
+          <div class="pdv-total-row">
+            <span class="pdv-total-label">Total</span>
+            <span class="pdv-total-value" id="pdv-total-value">${formatMoney(0)}</span>
+          </div>
+          <div id="pdv-total-brl" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
+            🇧🇷 ≈ <span id="pdv-total-brl-value">R$ 0,00</span>
+          </div>
+          <div class="field">
+            <label>Forma de Pagamento</label>
+            <div class="payment-methods" id="payment-methods">
+              ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
+                <button class="payment-btn ${PdvState.pagamento===p?'selected':''}"
+                        onclick="selecionarPagamento('${p}')" data-pag="${p}">
+                  ${labelPagamento(p)}
+                </button>
+              `).join('')}
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:var(--sp-2)">
+            <label>Cliente / Identificação</label>
+            <input type="text" class="input" id="input-cliente-nome-pdv"
+                   placeholder="Nome para identificar o pedido (opcional)" />
+          </div>
+          <div id="troco-row" style="display:none">...</div>
+          <div id="pix-brl-row" style="display:none">...</div>
+          <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" id="btn-finalizar-venda" onclick="finalizarVenda()">
+            📋 Enviar para Fila — <span id="btn-total">${formatMoney(0)}</span>
+          </button>
+          <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinho()">
+            🗑️ Limpar carrinho
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Renderiza o conteúdo do passo atual
+  renderStep(PdvState.step);
+
+  // Eventos dos botões de navegação
+  document.getElementById('step-back')?.addEventListener('click', () => {
+    if (PdvState.step > 1) {
+      PdvState.step--;
+      renderStep(PdvState.step);
+      updateStepUI();
+    }
+  });
+
+  document.getElementById('step-next')?.addEventListener('click', () => {
+    if (PdvState.step === 1 && !PdvState.impressoraSelecionada) {
+      toast('Selecione uma impressora', 'warning');
+      return;
+    }
+    if (PdvState.step === 2 && !PdvState.tipoCopia) {
+      toast('Selecione o tipo de cópia', 'warning');
+      return;
+    }
+    if (PdvState.step === 3) {
+      // Adiciona ao carrinho
+      adicionarAoCarrinho();
+      // Opcional: volta para o passo 1 após adicionar
+      // PdvState.step = 1;
+      // renderStep(1);
+      // updateStepUI();
+      return;
+    }
+    if (PdvState.step < 3) {
+      PdvState.step++;
+      renderStep(PdvState.step);
+      updateStepUI();
+    }
+  });
+
+  // Atualiza carrinho
+  atualizarCarrinhoUI();
+}
+
+function getStepLabel(step) {
+  const labels = {
+    1: 'Selecionar Impressora',
+    2: 'Tipo de Cópia',
+    3: 'Quantidade e Opções'
+  };
+  return labels[step] || '';
+}
+
+function updateStepUI() {
+  // Atualiza indicadores de passo
+  document.querySelectorAll('.step-dot').forEach(dot => {
+    const num = parseInt(dot.dataset.step);
+    dot.classList.toggle('active', num === PdvState.step);
+  });
+  const label = document.querySelector('.step-label');
+  if (label) label.textContent = getStepLabel(PdvState.step);
+
+  // Mostra/esconde botão voltar
+  const backBtn = document.getElementById('step-back');
+  if (backBtn) backBtn.style.display = PdvState.step === 1 ? 'none' : '';
+
+  // Muda texto do botão avançar
+  const nextBtn = document.getElementById('step-next');
+  if (nextBtn) {
+    nextBtn.textContent = PdvState.step === 3 ? '➕ Adicionar ao Carrinho' : 'Avançar →';
+  }
+}
+
+function renderStep(step) {
+  const container = document.getElementById('step-content');
+  if (!container) return;
+
+  switch (step) {
+    case 1:
+      container.innerHTML = renderStepImpressoras();
+      break;
+    case 2:
+      container.innerHTML = renderStepTipoCopia();
+      break;
+    case 3:
+      container.innerHTML = renderStepQuantidade();
+      break;
+  }
+}
+
+// ── PDV Helpers ───────────────────────────────────────────
+window.selecionarImpressora = function(id) {
+  PdvState.impressoraSelecionada = id;
+  // Atualiza visualmente os cards
+  document.querySelectorAll('.printer-card').forEach(c => {
+    c.classList.toggle('selected', c.dataset.id === id);
+  });
+  // Avança para passo 2 automaticamente
+  if (PdvState.step === 1) {
+    PdvState.step = 2;
+    renderStep(2);
+    updateStepUI();
+  }
+};
+
+window.selecionarTipoCopia = function(tipo) {
+  PdvState.tipoCopia = tipo;
+  document.querySelectorAll('.tipo-copia-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.tipo === tipo);
+  });
+  // Avança para passo 3 automaticamente
+  if (PdvState.step === 2) {
+    PdvState.step = 3;
+    renderStep(3);
+    updateStepUI();
+  }
+  // Atualiza preview
+  atualizarPreviewPdv();
+};
+
+window.ajustarQtd = function(delta) {
+  PdvState.quantidade = Math.max(1, (PdvState.quantidade||1) + delta);
+  const input = document.getElementById('input-qtd');
+  if (input) input.value = PdvState.quantidade;
+  atualizarPreviewPdv();
+};
+
+function getPrecoAtual() {
+  if (!PdvState.tipoCopia) return 0;
+  const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
+  if (!preco) return 0;
+  if (preco.preco_desconto && PdvState.quantidade >= preco.qtd_desconto) {
+    return preco.preco_desconto;
+  }
+  return preco.preco_unitario;
+}
+
+function atualizarPreviewPdv() {
+  const preview = document.getElementById('preview-pdv');
+  if (!preview) return;
+  if (!PdvState.tipoCopia || !PdvState.impressoraSelecionada) { preview.innerHTML=''; return; }
+
+  const precoUnit = getPrecoAtual();
+  const total = precoUnit * PdvState.quantidade;
+  const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
+  const paginasPorDoc = PdvState.paginasPorDocumento || 1;
+  const totalPaginas = PdvState.quantidade * paginasPorDoc;
+  const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
+
+  // Atualiza os campos de preview de páginas e folhas
+  const totalPagEl = document.getElementById('total-paginas-preview');
+  const folhasEl = document.getElementById('folhas-preview');
+  if (totalPagEl) totalPagEl.value = totalPaginas;
+  if (folhasEl) folhasEl.value = folhas;
+
+  preview.innerHTML = `
+    <div style="background:var(--c-bg);border:1.5px solid var(--c-primary);border-radius:var(--r-md);padding:var(--sp-4);display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div style="font-size:var(--t-sm);color:var(--c-text-2)">${preco?.descricao||''}</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">${PdvState.quantidade} × ${formatMoney(precoUnit)}</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">📄 ${totalPaginas} páginas · ${folhas} folhas</div>
+        ${PdvState.frenteVerso ? '<div style="font-size:10px;color:var(--c-accent)">✓ Frente e Verso</div>' : ''}
+      </div>
+      <div style="font-size:var(--t-2xl);font-weight:800;color:var(--c-success)">${formatMoney(total)}</div>
+    </div>
+  `;
+}
+
+window.adicionarAoCarrinho = function() {
+  if (!PdvState.impressoraSelecionada) { toast('Selecione uma impressora', 'warning'); return; }
+  if (!PdvState.tipoCopia) { toast('Selecione o tipo de cópia', 'warning'); return; }
+  if (!PdvState.quantidade || PdvState.quantidade < 1) { toast('Informe a quantidade', 'warning'); return; }
+
+  const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
+  const impressora = State.impressoras.find(i => i.id === PdvState.impressoraSelecionada);
+  const precoUnit = getPrecoAtual();
+  const total = precoUnit * PdvState.quantidade;
+  const paginasPorDoc = PdvState.paginasPorDocumento || 1;
+  const totalPaginas = PdvState.quantidade * paginasPorDoc;
+  const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
+
+  PdvState.carrinho.push({
+    id: uuid(),
+    impressora_id: PdvState.impressoraSelecionada,
+    impressora_nome: impressora?.nome || '—',
+    tipo: PdvState.tipoCopia,
+    tipo_label: preco?.descricao || PdvState.tipoCopia,
+    quantidade: PdvState.quantidade,
+    frente_verso: PdvState.frenteVerso,
+    preco_unitario: precoUnit,
+    total,
+    paginas_por_documento: paginasPorDoc,   // guarda no carrinho
+    total_folhas: folhas,                   // guarda no carrinho
+  });
+
+  atualizarCarrinhoUI();
+  toast(`${PdvState.quantidade} cópias adicionadas`, 'success');
+};
+
+function atualizarCarrinhoUI() {
+  const itemsEl = document.getElementById('pdv-items');
+  const countEl = document.getElementById('carrinho-count');
+  const totalEl = document.getElementById('pdv-total-value');
+  const btnTotalEl = document.getElementById('btn-total');
+  if (!itemsEl) return;
+
+  const total = Math.round(PdvState.carrinho.reduce((a,b) => a+b.total, 0));
+  if (countEl) countEl.textContent = `${PdvState.carrinho.length} ite${PdvState.carrinho.length===1?'m':'ns'}`;
+  if (totalEl) totalEl.textContent = formatMoney(total);
+  if (btnTotalEl) btnTotalEl.textContent = formatMoney(total);
+
+  if (PdvState.carrinho.length === 0) {
+    itemsEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🖨️</div><div class="empty-state-sub">Carrinho vazio</div></div>`;
+    return;
+  }
+
+  const brlEl = document.getElementById('pdv-total-brl');
+  const brlValEl = document.getElementById('pdv-total-brl-value');
+  if (brlEl && brlValEl) {
+    const isPix = PdvState.pagamento === 'pix' || PdvState.pagamento === 'pix_brl';
+    brlEl.style.display = isPix ? 'block' : 'none';
+    if (isPix) {
+      const valorBRL = gsToBRL(total);
+      brlValEl.textContent = formatBRL(valorBRL);
+    }
+  }
+
+
+  itemsEl.innerHTML = PdvState.carrinho.map(item => `
+    <div class="pdv-item">
+      <div class="pdv-item-info">
+        <div class="pdv-item-name">${item.tipo_label}</div>
+        <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
+        <div class="pdv-item-sub">${formatMoney(item.preco_unitario)}/un</div>
+      </div>
+      <div class="pdv-item-price">${formatMoney(item.total)}</div>
+      <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
+    </div>
+  `).join('');
+}
+
+window.removerDoCarrinho = function(id) {
+  PdvState.carrinho = PdvState.carrinho.filter(i => i.id !== id);
+  atualizarCarrinhoUI();
+};
+
+window.limparCarrinho = function() {
+  PdvState.carrinho = [];
+  PdvState.tipoCopia = null;
+  PdvState.quantidade = 1;
+  atualizarCarrinhoUI();
+};
+
+window.selecionarPagamento = function(pag) {
+  PdvState.pagamento = pag;
+  document.querySelectorAll('.payment-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.pag === pag);
+  });
+  const trocoRow  = document.getElementById('troco-row');
+  const pixBrlRow = document.getElementById('pix-brl-row');
+  const cotEl     = document.getElementById('cotacao-atual-pdv');
+  const total = Math.round(PdvState.carrinho.reduce((a,b) => a+b.total, 0));
+  const brlEl = document.getElementById('pdv-total-brl');
+  const brlValEl = document.getElementById('pdv-total-brl-value');
+  if (brlEl && brlValEl) {
+    const isPix = pag === 'pix' || pag === 'pix_brl';
+    brlEl.style.display = isPix ? 'block' : 'none';
+    if (isPix) {
+      const valorBRL = gsToBRL(total);
+      brlValEl.textContent = formatBRL(valorBRL);
+    }
+  }
+  if (trocoRow)  trocoRow.style.display  = pag === 'dinheiro' ? 'block' : 'none';
+  if (pixBrlRow) pixBrlRow.style.display = pag === 'pix_brl'  ? 'block' : 'none';
+  if (cotEl)     cotEl.textContent = APP_CONFIG.cotacaoBRL.toLocaleString('es-PY');
+};
+
+window.calcularPixBRL = function() {
+  const brl = parseFloat(document.getElementById('input-brl-pix')?.value || 0);
+  const gs  = brlToGs(brl);
+  const el  = document.getElementById('pix-gs-equiv');
+  if (el) el.textContent = formatMoney(gs);
+};
+
+window.calcularTroco = function() {
+  const total    = PdvState.carrinho.reduce((a,b) => a + b.total, 0);
+  const recebido = Math.round(parseFloat(document.getElementById('input-valor-recebido')?.value || 0));
+  const troco    = Math.max(0, recebido - total);
+  const el = document.getElementById('troco-value');
+  if (el) el.textContent = formatMoney(troco);
+};
+
+window.finalizarVenda = async function() {
+   if (await isCaixaTravado()) {
+    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
+    return;
+  }
+
+  if (PdvState.carrinho.length === 0) { toast('Carrinho vazio', 'warning'); return; }
+  const btn = document.getElementById('btn-finalizar-venda');
+  if (btn) { btn.disabled = true; btn.textContent = 'Enviando para fila...'; }
+
+  // Coleta nome do cliente (campo opcional no PDV)
+  const clienteNomePDV = document.getElementById('input-cliente-nome-pdv')?.value?.trim() || null;
+  const pagamentoDb = PdvState.pagamento === 'pix_brl' ? 'pix' : PdvState.pagamento;
+  let obsExtra = '';
+  if (PdvState.pagamento === 'pix_brl') {
+    const brlVal = parseFloat(document.getElementById('input-brl-pix')?.value || 0);
+    obsExtra = `Pix BRL: R$ ${brlVal.toFixed(2)} @ ₲${APP_CONFIG.cotacaoBRL}/R$`;
+  }
+
+  try {
+    let numPedidos = 0;
+    for (const item of PdvState.carrinho) {
+      // ★ STATUS = 'na_fila' — pedido entra na produção, NÃO finalizado
+      const { error } = await sb.from('pedidos_copia').insert({
+        impressora_id:   item.impressora_id,
+        tipo:            item.tipo,
+        quantidade:      item.quantidade,
+        frente_verso:    item.frente_verso,
+        preco_unitario:  Math.round(item.preco_unitario),
+        desconto:        0,
+        total:           Math.round(item.total),
+        status:          'na_fila',       // ← Mudança central da nova arquitetura
+        forma_pagamento: pagamentoDb,
+        cliente_nome_pdv: clienteNomePDV, // campo de texto livre no PDV
+        observacoes:     obsExtra || null,
+        paginas_por_documento: item.paginas_por_documento || 1,   // ← novo
+        total_folhas:    item.total_folhas,                       // ← novo
+      });
+      if (error) throw error;
+      numPedidos++;
+    }
+
+    toast(`✅ ${numPedidos} pedido(s) enviado(s) para a fila de produção!`, 'success', 4000);
+    limparCarrinho();
+
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `✅ Enviar para Fila — <span id="btn-total">${formatMoney(0)}</span>`;
+    }
+  } catch (err) {
+    toast('Erro ao enviar: ' + err.message, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `✅ Enviar para Fila — <span id="btn-total">—</span>`;
+    }
+  }
+};
+
+// ============================================================
+// ── MÓDULO: VENDAS (PDV Produtos) ─────────────────────────
+// ============================================================
+async function renderVendas(el) {
+  const { data: vendas } = await sb.from('vendas')
+    .select('*, clientes(nome)')
+    .order('created_at', { ascending: false })
+    .limit(30);
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">Vendas de Produtos</div>
+        <div class="section-sub">PDV da loja — materiais, papelaria e serviços</div>
+      </div>
+      <button class="btn btn--primary" onclick="abrirModalNovaVenda()">+ Nova Venda</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>#</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${(vendas||[]).length === 0
+              ? `<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">🛍️</div><div class="empty-state-sub">Nenhuma venda registrada</div></div></td></tr>`
+              : (vendas||[]).map(v => `
+                <tr>
+                  <td class="td-mono">#${v.numero_venda}</td>
+                  <td>${v.clientes?.nome || 'Consumidor'}</td>
+                  <td><span class="badge badge--primary">${labelPagamento(v.forma_pagamento)}</span></td>
+                  <td style="color:var(--c-success);font-weight:600">${formatMoney(v.total)}</td>
+                  <td>${badgeStatus(v.status)}</td>
+                  <td class="td-mono">${formatDateTime(v.created_at)}</td>
+                  <td><button class="btn btn--ghost btn--sm" onclick="verVenda('${v.id}')">Ver</button></td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  // Adiciona botão no topbar
+  document.getElementById('topbar-actions').innerHTML = '';
+}
+
+window.abrirModalNovaVenda = async function() {
+  const { data: produtos } = await sb.from('produtos').select('*').eq('ativo', true).order('nome');
+
+  openModal('Nova Venda', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Buscar produto</label>
+        <input type="text" class="input" id="venda-produto-busca" placeholder="Nome ou código..." oninput="filtrarProdutosVenda(this.value)" />
+      </div>
+      <div id="venda-lista-produtos" style="max-height:200px;overflow-y:auto;border:1px solid var(--c-border);border-radius:var(--r-md)">
+        ${(produtos||[]).map(p => `
+          <div class="pdv-item" style="cursor:pointer;padding:var(--sp-3) var(--sp-4)" onclick="adicionarProdutoVenda('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.preco_venda||0})">
+            <div class="pdv-item-info">
+              <div class="pdv-item-name">${p.nome}</div>
+              <div class="pdv-item-sub">${p.categoria} · Estoque: ${p.estoque_atual} ${p.unidade}</div>
+            </div>
+            <div class="pdv-item-price">${formatMoney(p.preco_venda||0)}</div>
+          </div>
+        `).join('') || '<div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+      </div>
+      <div id="venda-carrinho" style="display:none">
+        <div class="divider-text">Itens do carrinho</div>
+        <div id="venda-itens-lista"></div>
+        <div style="display:flex;justify-content:space-between;font-weight:700;padding:var(--sp-3) 0">
+          <span>Total</span><span id="venda-total-modal">${formatMoney(0)}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-weight:700; padding:var(--sp-3) 0">
+          <span>Total</span>
+          <span id="venda-total-modal">${formatMoney(0)}</span>
+        </div>
+        <div id="venda-total-brl-modal" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
+          🇧🇷 ≈ <span id="venda-total-brl-value-modal">R$ 0,00</span>
+        </div>
+        <div class="field">
+          <label>Forma de pagamento</label>
+          <select class="input" id="venda-pagamento">
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado','cheque'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+          </select>
+        </div>
+        <button class="btn btn--success btn--lg" style="width:100%;justify-content:center;margin-top:var(--sp-3)" onclick="salvarVenda()">
+          ✅ Confirmar Venda
+        </button>
+      </div>
+    </div>
+  `, 'modal--lg');
+
+  window._vendaItens = [];
+  document.getElementById('venda-pagamento')?.addEventListener('change', function() {
+  atualizarCarrinhoVendaModal();
+  });
+
+};
+
+window._vendaItens = [];
+window.adicionarProdutoVenda = function(id, nome, preco) {
+  const existing = window._vendaItens.find(i => i.produto_id === id);
+  if (existing) { existing.quantidade++; existing.total = existing.quantidade * existing.preco_unitario; }
+  else { window._vendaItens.push({ produto_id: id, nome, quantidade: 1, preco_unitario: preco, total: preco }); }
+  atualizarCarrinhoVendaModal();
+};
+
+function atualizarCarrinhoVendaModal() {
+  const carrinhoDiv = document.getElementById('venda-carrinho');
+  const listaEl = document.getElementById('venda-itens-lista');
+  const totalEl = document.getElementById('venda-total-modal');
+  const brlDiv = document.getElementById('venda-total-brl-modal');
+  const brlVal = document.getElementById('venda-total-brl-value-modal');
+
+  if (!carrinhoDiv) return;
+
+  const total = window._vendaItens.reduce((a, b) => a + b.total, 0);
+  carrinhoDiv.style.display = window._vendaItens.length > 0 ? 'block' : 'none';
+  if (totalEl) totalEl.textContent = formatMoney(total);
+
+  // Atualiza BRL com base no pagamento selecionado
+  const pagamentoSelect = document.getElementById('venda-pagamento');
+  const pagamento = pagamentoSelect ? pagamentoSelect.value : 'dinheiro';
+  const isPix = pagamento === 'pix' || pagamento === 'pix_brl';
+  if (brlDiv && brlVal) {
+    brlDiv.style.display = isPix ? 'block' : 'none';
+    if (isPix) {
+      const valorBRL = gsToBRL(total);
+      brlVal.textContent = formatBRL(valorBRL);
+    }
+  }
+
+  if (!listaEl) return;
+  listaEl.innerHTML = window._vendaItens.map((item, idx) => `
+    <div class="pdv-item" style="padding:var(--sp-2) 0">
+      <div class="pdv-item-info">
+        <div class="pdv-item-name">${item.nome}</div>
+        <div class="pdv-item-sub">${item.quantidade} × ${formatMoney(item.preco_unitario)}</div>
+      </div>
+      <div class="pdv-item-price">${formatMoney(item.total)}</div>
+      <button class="pdv-remove-btn" onclick="window._vendaItens.splice(${idx},1);atualizarCarrinhoVendaModal()">✕</button>
+    </div>
+  `).join('');
+}
+
+window.salvarVenda = async function() {
+  if (await isCaixaTravado()) {
+    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
+    return;
+  }
+
+  if (!window._vendaItens.length) { toast('Adicione itens', 'warning'); return; }
+  const pagamento = document.getElementById('venda-pagamento')?.addEventListener('change', function() {
+    atualizarCarrinhoVendaModal();
+  });
+  const subtotal = window._vendaItens.reduce((a,b)=>a+b.total,0);
+
+  const { data: venda, error } = await sb.from('vendas').insert({
+    subtotal, total: subtotal, forma_pagamento: pagamento, status: 'concluido',
+  }).select().single();
+
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+
+  const itens = window._vendaItens.map(i => ({
+    venda_id: venda.id,
+    produto_id: i.produto_id,
+    quantidade: i.quantidade,
+    preco_unitario: i.preco_unitario,
+    total: i.total,
+  }));
+  await sb.from('venda_itens').insert(itens);
+
+  // Baixa no estoque
+  for (const i of window._vendaItens) {
+  // Buscar estoque atual
+  const { data: produto } = await sb.from('produtos')
+    .select('estoque_atual')
+    .eq('id', i.produto_id)
+    .single();
+
+  if (produto) {
+    const novoEstoque = Math.max(0, produto.estoque_atual - i.quantidade);
+    await sb.from('produtos')
+      .update({ estoque_atual: novoEstoque })
+      .eq('id', i.produto_id);
+  }
+}
+
+  toast('Venda registrada!','success');
+  closeModal();
+  navigate('vendas');
+};
+
+// ============================================================
+// ── MÓDULO: CAIXA (VERSÃO COMPLETA) ──────────────────────
+// ============================================================
+
+async function renderCaixa(el) {
+  // Carrega sessões e dados da empresa
+  const [{ data: sessoes }, { data: empresa }] = await Promise.all([
+    sb.from('caixa_sessoes').select('*, funcionarios(nome)').order('aberto_em', { ascending: false }).limit(10),
+    sb.from('empresa').select('config').single()
+  ]);
+
+  const sessaoAberta = sessoes?.find(s => !s.fechado_em);
+  const limiteSangria = empresa?.config?.limite_sangria || 1000000;
+
+  // Se houver sessão aberta, busca os movimentos e calcula saldo
+  let movimentos = [];
+  let saldoAtual = 0;
+  let totalVendasDinheiro = 0;
+  let totalSuprimentos = 0;
+  let totalRetiradas = 0;
+  let totalDespesas = 0;
+  let totalSangrias = 0;
+
+  if (sessaoAberta) {
+    // Buscar movimentos
+    const { data: mov } = await sb.from('caixa_movimentos')
+      .select('*')
+      .eq('sessao_id', sessaoAberta.id)
+      .order('created_at', { ascending: false });
+    movimentos = mov || [];
+
+    // Calcular totais via view ou diretamente
+    const { data: totals } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoAberta.id });
+    saldoAtual = totals || 0;
+
+    // Buscar totais por tipo (usando a view)
+    const { data: viewData } = await sb.from('vw_caixa_sessao_atual').select('*').eq('id', sessaoAberta.id).single();
+    if (viewData) {
+      totalSuprimentos = viewData.total_suprimentos || 0;
+      totalRetiradas = viewData.total_retiradas || 0;
+      totalDespesas = viewData.total_despesas || 0;
+      totalSangrias = viewData.total_sangrias || 0;
+      totalVendasDinheiro = (viewData.total_vendas_copias_dinheiro || 0) + (viewData.total_vendas_produtos_dinheiro || 0);
+    }
+  }
+
+  // HTML
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">💰 Controle de Caixa</div>
+        <div class="section-sub">Abertura, movimentações e fechamento</div>
+      </div>
+      <div>
+        ${sessaoAberta 
+          ? `<button class="btn btn--danger" onclick="fecharCaixa('${sessaoAberta.id}')">🔒 Fechar Caixa</button>`
+          : `<button class="btn btn--success" onclick="abrirCaixa()">🔓 Abrir Caixa</button>`
+        }
+        <button class="btn btn--ghost" onclick="irConfiguracoes()">⚙️ Configurações</button>
+      </div>
+    </div>
+
+    <!-- Status da sessão atual -->
+    <div class="card" style="border-color:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; margin-bottom: var(--sp-4)">
+      <div class="card-body">
+        <div style="display:flex; align-items:center; gap: var(--sp-4); flex-wrap:wrap">
+          <div style="display:flex; align-items:center; gap: var(--sp-3)">
+            <div style="width:12px;height:12px;border-radius:50%;background:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; ${sessaoAberta ? 'animation: pulse 1.5s infinite' : ''}"></div>
+            <span style="font-weight:700; font-size:var(--t-lg)">${sessaoAberta ? '🟢 Caixa Aberto' : '🔴 Caixa Fechado'}</span>
+          </div>
+          ${sessaoAberta ? `
+            <div style="display:flex; gap: var(--sp-6); flex-wrap:wrap">
+              <div><span style="color:var(--c-text-3)">Abertura:</span> ${formatMoney(sessaoAberta.valor_abertura)}</div>
+              <div><span style="color:var(--c-text-3)">Saldo atual:</span> <strong style="color:var(--c-accent)">${formatMoney(saldoAtual)}</strong></div>
+              <div><span style="color:var(--c-text-3)">Limite sangria:</span> ${formatMoney(limiteSangria)}</div>
+              ${sessaoAberta.travado ? `<span class="badge badge--danger" style="font-weight:700">🔒 TRAVADO</span>` : ''}
+            </div>
+          ` : ''}
+          ${sessaoAberta?.travado ? `<button class="btn btn--warning" onclick="liberarCaixa('${sessaoAberta.id}')">🔓 Liberar (Admin)</button>` : ''}
+        </div>
+      </div>
+    </div>
+
+    <!-- Botões de ação (apenas se caixa aberto) -->
+    ${sessaoAberta && !sessaoAberta.travado ? `
+    <div style="display:flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-4)">
+      <button class="btn btn--primary" onclick="abrirModalSuprimento('${sessaoAberta.id}')">💰 Suprimento</button>
+      <button class="btn btn--ghost" onclick="abrirModalRetirada('${sessaoAberta.id}')">💸 Retirada</button>
+      <button class="btn btn--danger" onclick="abrirModalDespesa('${sessaoAberta.id}')">📋 Despesa</button>
+      <button class="btn btn--accent" onclick="abrirModalSangria('${sessaoAberta.id}')">🏦 Sangria</button>
+    </div>
+    ` : ''}
+
+    <!-- Movimentos do dia (se houver sessão aberta) -->
+    ${sessaoAberta ? `
+    <div class="card" style="margin-bottom: var(--sp-4)">
+      <div class="card-header"><span class="card-title">📋 Movimentações do Dia</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Tipo</th><th>Valor</th><th>Descrição</th><th>Hora</th></tr>
+          </thead>
+          <tbody>
+            ${movimentos.length === 0 
+              ? `<tr><td colspan="4"><div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhuma movimentação ainda</div></div></td></tr>`
+              : movimentos.map(m => `
+                <tr>
+                  <td><span class="badge ${m.tipo === 'suprimento' ? 'badge--success' : m.tipo === 'retirada' ? 'badge--warning' : m.tipo === 'despesa' ? 'badge--danger' : 'badge--accent'}">${m.tipo}</span></td>
+                  <td style="color:${m.tipo === 'suprimento' ? 'var(--c-success)' : 'var(--c-danger)'}">${formatMoney(m.valor)}</td>
+                  <td>${m.descricao || '—'}</td>
+                  <td class="td-mono">${formatDateTime(m.created_at)}</td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Histórico de caixas (já existente) -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">Histórico de Caixas</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
+          <tbody>
+            ${(sessoes||[]).map(s => `
+              <tr>
+                <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
+                <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
+                <td>${formatMoney(s.valor_abertura)}</td>
+                <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
+                <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
+                <td style="color:${(s.quebra || 0) > 0 ? 'var(--c-success)' : (s.quebra || 0) < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(s.quebra || 0)}</td>
+                <td>${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}</td>
+              </tr>
+            `).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa registrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ── ABRIR CAIXA ───────────────────────────────────────────
+window.abrirCaixa = function() {
+  openModal('Abrir Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Fundo de Caixa (dinheiro inicial) *</label>
+        <input type="number" class="input" id="fundo-caixa" min="0" step="0.01" placeholder="0" required />
+      </div>
+      <div class="field">
+        <label>Observações (opcional)</label>
+        <input type="text" class="input" id="obs-abertura" placeholder="Ex: Início do expediente" />
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="confirmarAbrirCaixa()">
+        🔓 Confirmar Abertura
+      </button>
+    </div>
+  `);
+};
+
+window.confirmarAbrirCaixa = async function() {
+  const valorAbertura = parseFloat(document.getElementById('fundo-caixa').value) || 0;
+  if (valorAbertura <= 0) { toast('Informe um valor válido', 'warning'); return; }
+  const obs = document.getElementById('obs-abertura').value || null;
+  const { data, error } = await sb.from('caixa_sessoes').insert({
+    valor_abertura: valorAbertura,
+    observacoes: obs,
+    saldo_atual: valorAbertura // já define saldo inicial
+  }).select().single();
+  if (error) { toast('Erro: '+error.message, 'error'); return; }
+  toast('Caixa aberto com sucesso!', 'success');
+  closeModal();
+  navigate('caixa');
+};
+
+// ── MODAL SUPRIMENTO ──────────────────────────────────────
+window.abrirModalSuprimento = function(sessaoId) {
+  openModal('💰 Suprimento de Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Valor *</label>
+        <input type="number" class="input" id="mov-valor" min="0.01" step="0.01" placeholder="0,00" />
+      </div>
+      <div class="field">
+        <label>Descrição</label>
+        <input type="text" class="input" id="mov-desc" placeholder="Ex: Troco do banco" />
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="registrarMovimento('${sessaoId}','suprimento')">
+        ✅ Confirmar Suprimento
+      </button>
+    </div>
+  `);
+};
+
+// ── MODAL RETIRADA ────────────────────────────────────────
+window.abrirModalRetirada = function(sessaoId) {
+  openModal('💸 Retirada de Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Valor *</label>
+        <input type="number" class="input" id="mov-valor" min="0.01" step="0.01" placeholder="0,00" />
+      </div>
+      <div class="field">
+        <label>Descrição</label>
+        <input type="text" class="input" id="mov-desc" placeholder="Ex: Pagamento de fornecedor (avulso)" />
+      </div>
+      <button class="btn btn--warning btn--lg" style="width:100%;justify-content:center" onclick="registrarMovimento('${sessaoId}','retirada')">
+        ✅ Confirmar Retirada
+      </button>
+    </div>
+  `);
+};
+
+// ── MODAL DESPESA ─────────────────────────────────────────
+window.abrirModalDespesa = function(sessaoId) {
+  openModal('📋 Despesa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Valor *</label>
+        <input type="number" class="input" id="mov-valor" min="0.01" step="0.01" placeholder="0,00" />
+      </div>
+      <div class="field">
+        <label>Categoria</label>
+        <select class="input" id="mov-categoria">
+          <option value="aluguel">Aluguel</option>
+          <option value="fornecedor">Fornecedor</option>
+          <option value="funcionario">Funcionário</option>
+          <option value="pro-labore">Pró-labore</option>
+          <option value="diversos">Diversos</option>
+          <option value="outros">Outros</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Descrição</label>
+        <input type="text" class="input" id="mov-desc" placeholder="Ex: Conta de luz" />
+      </div>
+      <button class="btn btn--danger btn--lg" style="width:100%;justify-content:center" onclick="registrarMovimento('${sessaoId}','despesa')">
+        ✅ Confirmar Despesa
+      </button>
+    </div>
+  `);
+};
+
+// ── MODAL SANGRIA ──────────────────────────────────────────
+window.abrirModalSangria = function(sessaoId) {
+  openModal('🏦 Sangria (Retirada para Cofre)', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Valor *</label>
+        <input type="number" class="input" id="mov-valor" min="0.01" step="0.01" placeholder="0,00" />
+      </div>
+      <div class="field">
+        <label>Descrição</label>
+        <input type="text" class="input" id="mov-desc" placeholder="Ex: Sangria para cofre" />
+      </div>
+      <button class="btn btn--accent btn--lg" style="width:100%;justify-content:center" onclick="registrarMovimento('${sessaoId}','sangria')">
+        ✅ Confirmar Sangria
+      </button>
+    </div>
+  `);
+};
+
+// ── REGISTRAR MOVIMENTO E VERIFICAR TRAVA ──────────────
+window.registrarMovimento = async function(sessaoId, tipo) {
+  const valor = parseFloat(document.getElementById('mov-valor').value) || 0;
+  if (valor <= 0) { toast('Informe um valor válido', 'warning'); return; }
+  const descricao = document.getElementById('mov-desc')?.value || null;
+  const categoria = document.getElementById('mov-categoria')?.value || null;
+
+  const payload = {
+    sessao_id: sessaoId,
+    tipo,
+    valor,
+    descricao,
+    categoria_despesa: categoria,
+    forma_pagamento: 'dinheiro'
+  };
+
+  
+  const { error } = await sb.from('caixa_movimentos').insert(payload);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  
+  // Recalcular saldo e verificar trava
+  const { data: saldo } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
+  const { data: empresa } = await sb.from('empresa').select('config').single();
+  const limite = empresa?.config?.limite_sangria || 1000000;
+  
+  // Atualiza saldo na sessão
+  await sb.from('caixa_sessoes').update({ saldo_atual: saldo }).eq('id', sessaoId);
+  
+  // const saldo = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
+  console.log('Saldo atual:', saldo, 'Limite:', limite);
+
+  // Verifica se atingiu o limite (apenas se não for uma sangria, pois sangria reduz saldo)
+  if (tipo !== 'sangria' && saldo >= limite) {
+    await sb.from('caixa_sessoes').update({ travado: true }).eq('id', sessaoId);
+    toast('⚠️ Atingiu o limite de sangria! O caixa foi travado. Libere com senha de admin.', 'error');
+  } else if (tipo === 'sangria' && saldo < limite) {
+    // Após sangria, se saldo ficou abaixo do limite, desbloqueia automaticamente
+    await sb.from('caixa_sessoes').update({ travado: false }).eq('id', sessaoId);
+  }
+
+  toast('Movimento registrado!', 'success');
+  closeModal();
+  navigate('caixa');
+};
+
+// ── LIBERAR CAIXA (SENHA ADMIN) ─────────────────────────
+window.liberarCaixa = async function(sessaoId) {
+  openModal('🔓 Liberar Caixa - Senha Administrador', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-warning-s);padding:var(--sp-4);border-radius:var(--r-md);font-size:var(--t-sm)">
+        O caixa atingiu o valor de sangria. Para liberar, informe a senha do administrador.
+      </div>
+      <div class="field">
+        <label>Senha do Administrador *</label>
+        <input type="password" class="input" id="admin-senha" placeholder="••••••••" />
+      </div>
+      <button class="btn btn--warning btn--lg" style="width:100%;justify-content:center" onclick="confirmarLiberacao('${sessaoId}')">
+        🔓 Verificar e Liberar
+      </button>
+    </div>
+  `);
+};
+
+window.confirmarLiberacao = async function(sessaoId) {
+  const senha = document.getElementById('admin-senha').value;
+  if (!senha) { toast('Informe a senha', 'warning'); return; }
+
+  // Verifica se a senha corresponde à senha do admin logado
+  const { data, error } = await sb.auth.signInWithPassword({
+    email: State.user.email,
+    password: senha
+  });
+
+  if (error) {
+    toast('Senha incorreta!', 'error');
+    return;
+  }
+
+  // Libera caixa
+  await sb.from('caixa_sessoes').update({ travado: false }).eq('id', sessaoId);
+  toast('Caixa liberado!', 'success');
+  closeModal();
+  navigate('caixa');
+};
+
+// ── FECHAR CAIXA ──────────────────────────────────────────
+window.fecharCaixa = async function(sessaoId) {
+  // Calcula saldo esperado
+  const { data: saldoEsperado } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
+
+  // Busca totais de vendas em dinheiro
+  const { data: viewData } = await sb.from('vw_caixa_sessao_atual').select('*').eq('id', sessaoId).single();
+  const totalCopias = viewData?.total_vendas_copias_dinheiro || 0;
+  const totalVendas = viewData?.total_vendas_produtos_dinheiro || 0;
+  const totalGeral = totalCopias + totalVendas;
+
+  openModal('🔒 Fechar Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3)">Conferência final</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span>Saldo esperado (sistema)</span>
+          <span style="font-weight:700;color:var(--c-accent)">${formatMoney(saldoEsperado)}</span>
+        </div>
+        <div class="field">
+          <label>Valor real em dinheiro (conferido) *</label>
+          <input type="number" class="input" id="valor-conferido" value="${saldoEsperado}" step="0.01" min="0" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Observações do fechamento</label>
+        <textarea class="input" id="obs-fechamento" rows="3" placeholder="Ocorrências, divergências..."></textarea>
+      </div>
+
+      <button class="btn btn--danger btn--lg" style="width:100%;justify-content:center" onclick="confirmarFechamento('${sessaoId}', ${saldoEsperado}, ${totalCopias}, ${totalVendas})">
+        ✅ Confirmar Fechamento
+      </button>
+    </div>
+  `);
+};
+
+window.confirmarFechamento = async function(sessaoId, saldoEsperado, totalCopias, totalVendas) {
+  const valorConferido = parseFloat(document.getElementById('valor-conferido').value) || 0;
+  const quebra = saldoEsperado - valorConferido;
+  const obs = document.getElementById('obs-fechamento').value || '';
+
+  const { error } = await sb.from('caixa_sessoes').update({
+    fechado_em: new Date().toISOString(),
+    total_copias: totalCopias,
+    total_vendas: totalVendas,
+    valor_esperado: saldoEsperado,
+    valor_conferido: valorConferido,
+    quebra: quebra,
+    observacoes: obs,
+    saldo_atual: saldoEsperado
+  }).eq('id', sessaoId);
+
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+
+  if (quebra > 0) {
+    toast(`✅ Caixa fechado com sobra de ${formatMoney(quebra)}!`, 'success');
+  } else if (quebra < 0) {
+    toast(`⚠️ Caixa fechado com falta de ${formatMoney(Math.abs(quebra))}!`, 'error');
+  } else {
+    toast('✅ Caixa fechado com saldo exato!', 'success');
+  }
+  closeModal();
+  navigate('caixa');
+};
+
+// ── CONFIGURAÇÕES (limite de sangria) ────────────────────
+window.irConfiguracoes = async function() {
+  const { data: empresa } = await sb.from('empresa').select('config').single();
+  const limiteAtual = empresa?.config?.limite_sangria || 1000000;
+
+  openModal('⚙️ Configurações do Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-warning-s);padding:var(--sp-4);border-radius:var(--r-md);font-size:var(--t-sm)">
+        <strong>Limite de Sangria:</strong> Quando o saldo em caixa atingir este valor, o caixa será travado automaticamente.
+      </div>
+      <div class="field">
+        <label>Valor de Sangria (gatilho) ₲</label>
+        <input type="number" class="input" id="limite-sangria-input" value="${limiteAtual}" step="1000" min="1000" />
+      </div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarLimiteSangria()">
+        💾 Salvar Configuração
+      </button>
+    </div>
+  `);
+};
+
+window.salvarLimiteSangria = async function() {
+  const valor = parseFloat(document.getElementById('limite-sangria-input').value) || 1000000;
+  if (valor < 1000) { toast('Valor deve ser maior que 1000', 'warning'); return; }
+
+  const { data: empresa } = await sb.from('empresa').select('id, config').single();
+  const config = empresa?.config || {};
+  config.limite_sangria = valor;
+  const { error } = await sb.from('empresa').update({ config }).eq('id', empresa.id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Configuração salva!', 'success');
+  closeModal();
+  navigate('caixa');
+};
+
+window.fecharCaixa = async function(sessaoId) {
+  // Calcula totais do dia
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+  const [{ data: copias }, { data: vendas }] = await Promise.all([
+    sb.from('pedidos_copia').select('total,forma_pagamento').eq('status','concluido').gte('created_at', hoje.toISOString()),
+    sb.from('vendas').select('total,forma_pagamento').eq('status','concluido').gte('created_at', hoje.toISOString()),
+  ]);
+
+  const totalCopias = (copias||[]).reduce((a,b)=>a+b.total,0);
+  const totalVendas = (vendas||[]).reduce((a,b)=>a+b.total,0);
+  const totalGeral = totalCopias + totalVendas;
+
+  openModal('Fechar Caixa', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">Resumo do período</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span style="color:var(--c-text-3)">Total Cópias</span>
+          <span style="font-weight:600;color:var(--c-primary)">${formatMoney(totalCopias)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span style="color:var(--c-text-3)">Total Vendas</span>
+          <span style="font-weight:600;color:var(--c-success)">${formatMoney(totalVendas)}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="font-weight:700">Total Geral</span>
+          <span style="font-size:var(--t-xl);font-weight:800;color:var(--c-accent)">${formatMoney(totalGeral)}</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>Observações</label>
+        <textarea class="input" id="obs-fechamento" rows="3" placeholder="Ocorrências, divergências..."></textarea>
+      </div>
+      <button class="btn btn--danger btn--lg" style="width:100%;justify-content:center"
+        onclick="confirmarFecharCaixa('${sessaoId}',${totalCopias},${totalVendas})">
+        🔒 Confirmar Fechamento
+      </button>
+    </div>
+  `);
+};
+
+window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas) {
+  const obs = document.getElementById('obs-fechamento')?.value||'';
+  const { error } = await sb.from('caixa_sessoes').update({
+    fechado_em: new Date().toISOString(),
+    total_copias: totalCopias,
+    total_vendas: totalVendas,
+    observacoes: obs,
+  }).eq('id', sessaoId);
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  toast('Caixa fechado!','success');
+  closeModal();
+  navigate('caixa');
+};
+
+// ============================================================
+// ── MÓDULO: ESTOQUE ───────────────────────────────────────
+// ============================================================
+async function renderEstoque(el) {
+  const { data: produtos } = await sb.from('produtos')
+    .select('*, fornecedores(nome)')
+    .order('nome');
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">Estoque de Produtos</div>
+        <div class="section-sub">Papéis, toneres, tintas e materiais</div>
+      </div>
+      <button class="btn btn--primary" onclick="abrirModalProduto()">+ Cadastrar Produto</button>
+    </div>
+    <div class="card" style="margin-bottom:var(--sp-4); height: auto;">
+      <div class="card-body" style="padding:var(--sp-3) var(--sp-5)">
+        <div class="search-bar">
+          <span class="search-bar-icon">🔍</span>
+          <input type="text" class="input" placeholder="Buscar produto..." id="busca-produto"
+                 oninput="filtrarTabelaProdutos(this.value)" />
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table id="tabela-produtos">
+          <thead>
+            <tr><th>Produto</th><th>Categoria</th><th>Estoque</th><th>Mín.</th><th>Venda</th><th>Custo</th><th>Fornecedor</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${(produtos||[]).map(p => `
+              <tr>
+                <td style="font-weight:500">${p.nome}</td>
+                <td><span class="badge badge--primary">${p.categoria}</span></td>
+                <td>
+                  <span style="font-family:var(--font-mono);font-weight:600;color:${p.estoque_atual <= p.estoque_minimo ? 'var(--c-danger)' : 'var(--c-success)'}">
+                    ${p.estoque_atual} ${p.unidade}
+                  </span>
+                  ${p.estoque_atual <= p.estoque_minimo ? '<span class="badge badge--danger" style="margin-left:4px">Crítico</span>' : ''}
+                </td>
+                <td class="td-mono">${p.estoque_minimo} ${p.unidade}</td>
+                <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_venda)}</td>
+                <td class="td-mono">${formatMoney(p.preco_custo)}</td>
+                <td style="color:var(--c-text-3)">${p.fornecedores?.nome||'—'}</td>
+                <td>
+                  <div style="display:flex;gap:4px">
+                    <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
+                    <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}')">±</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('') || '<tr><td colspan="8"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📦</div><div class="empty-state-sub">Nenhum produto cadastrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// ── MÓDULO: CAIXA (UI MELHORADA E CORRIGIDA) ─────────────
+// ============================================================
+
+async function renderCaixa(el) {
+  const [{ data: sessoes }, { data: empresa }] = await Promise.all([
+    sb.from('caixa_sessoes')
+      .select('*, funcionarios(nome)')
+      .order('aberto_em', { ascending: false })
+      .limit(10),
+    sb.from('empresa').select('config').single()
+  ]);
+
+  const sessaoAberta = sessoes?.find(s => !s.fechado_em);
+  const limiteSangria = empresa?.config?.limite_sangria || 1000000;
+
+  let movimentos = [];
+  let saldoAtual = 0;
+  let totalVendasDinheiro = 0;
+  let totalSuprimentos = 0;
+  let totalRetiradas = 0;
+  let totalDespesas = 0;
+  let totalSangrias = 0;
+  let quebra = 0;
+
+  if (sessaoAberta) {
+    // Buscar movimentos
+    const { data: mov } = await sb.from('caixa_movimentos')
+      .select('*')
+      .eq('sessao_id', sessaoAberta.id)
+      .order('created_at', { ascending: false });
+    movimentos = mov || [];
+
+    // Calcular saldo esperado via RPC
+    const { data: saldo } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoAberta.id });
+    saldoAtual = saldo || 0;
+
+    // Atualizar saldo_atual na sessão (para manter consistência)
+    await sb.from('caixa_sessoes').update({ saldo_atual: saldoAtual }).eq('id', sessaoAberta.id);
+
+    // Buscar totais da view
+    const { data: viewData } = await sb.from('vw_caixa_sessao_atual').select('*').eq('id', sessaoAberta.id).single();
+    if (viewData) {
+      totalSuprimentos = viewData.total_suprimentos || 0;
+      totalRetiradas = viewData.total_retiradas || 0;
+      totalDespesas = viewData.total_despesas || 0;
+      totalSangrias = viewData.total_sangrias || 0;
+      totalVendasDinheiro = (viewData.total_vendas_copias_dinheiro || 0) + (viewData.total_vendas_produtos_dinheiro || 0);
+    }
+  }
+
+  // Montar HTML
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">💰 Controle de Caixa</div>
+        <div class="section-sub">Abertura, movimentações e fechamento</div>
+      </div>
+      <div style="display:flex; gap: var(--sp-2); flex-wrap: wrap">
+        ${sessaoAberta 
+          ? `<button class="btn btn--danger" onclick="fecharCaixa('${sessaoAberta.id}')">🔒 Fechar Caixa</button>`
+          : `<button class="btn btn--success" onclick="abrirCaixa()">🔓 Abrir Caixa</button>`
+        }
+        <button class="btn btn--ghost" onclick="irConfiguracoes()">⚙️ Configurações</button>
+      </div>
+    </div>
+
+    <!-- Card de Status da Sessão Atual -->
+    <div class="card" style="border-color:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; margin-bottom: var(--sp-4); height: auto;">
+      <div class="card-body">
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap: var(--sp-3)">
+          <div style="display:flex; align-items:center; gap: var(--sp-3)">
+            <div style="width:12px;height:12px;border-radius:50%;background:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; ${sessaoAberta ? 'animation: pulse 1.5s infinite' : ''}"></div>
+            <span style="font-weight:700; font-size:var(--t-lg)">${sessaoAberta ? '🟢 Caixa Aberto' : '🔴 Caixa Fechado'}</span>
+            ${sessaoAberta?.travado ? `<span class="badge badge--danger" style="font-weight:700">🔒 TRAVADO</span>` : ''}
+          </div>
+          ${sessaoAberta ? `
+            <div style="display:flex; gap: var(--sp-4); flex-wrap:wrap; font-size:var(--t-sm)">
+              <div><span style="color:var(--c-text-3)">Abertura:</span> <strong>${formatMoney(sessaoAberta.valor_abertura)}</strong></div>
+              <div><span style="color:var(--c-text-3)">Saldo atual:</span> <strong style="color:var(--c-accent)">${formatMoney(saldoAtual)}</strong></div>
+              <div><span style="color:var(--c-text-3)">Limite sangria:</span> ${formatMoney(limiteSangria)}</div>
+              ${sessaoAberta.travado ? `<button class="btn btn--warning btn--sm" onclick="liberarCaixa('${sessaoAberta.id}')">🔓 Liberar (Admin)</button>` : ''}
+            </div>
+          ` : ''}
+        </div>
+
+        ${sessaoAberta ? `
+        <!-- Resumo de movimentações (mini cards) -->
+        <div class="summary-grid" style="margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--c-border)">
+          <div class="summary-item">
+            <div class="summary-item-label">Vendas em Dinheiro</div>
+            <div class="summary-item-value" style="color:var(--c-success)">${formatMoney(totalVendasDinheiro)}</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-item-label">Suprimentos</div>
+            <div class="summary-item-value" style="color:var(--c-success)">${formatMoney(totalSuprimentos)}</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-item-label">Retiradas</div>
+            <div class="summary-item-value" style="color:var(--c-warning)">${formatMoney(totalRetiradas)}</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-item-label">Despesas</div>
+            <div class="summary-item-value" style="color:var(--c-danger)">${formatMoney(totalDespesas)}</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-item-label">Sangrias</div>
+            <div class="summary-item-value" style="color:var(--c-accent)">${formatMoney(totalSangrias)}</div>
+          </div>
+        </div>
+        ` : ''}
+      </div>
+    </div>
+
+    <!-- Botões de Ação (apenas se caixa aberto e NÃO travado) -->
+    ${sessaoAberta && !sessaoAberta.travado ? `
+    <div style="display:flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-4)">
+      <button class="btn btn--primary" onclick="abrirModalSuprimento('${sessaoAberta.id}')">💰 Suprimento</button>
+      <button class="btn btn--ghost" onclick="abrirModalRetirada('${sessaoAberta.id}')">💸 Retirada</button>
+      <button class="btn btn--danger" onclick="abrirModalDespesa('${sessaoAberta.id}')">📋 Despesa</button>
+      <button class="btn btn--accent" onclick="abrirModalSangria('${sessaoAberta.id}')">🏦 Sangria</button>
+    </div>
+    ` : ''}
+
+    <!-- Movimentações do Dia (se houver sessão aberta) -->
+    ${sessaoAberta ? `
+    <div class="card" style="margin-bottom: var(--sp-4)">
+      <div class="card-header"><span class="card-title">📋 Movimentações do Dia</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Tipo</th><th>Valor</th><th>Descrição</th><th>Hora</th></tr>
+          </thead>
+          <tbody>
+            ${movimentos.length === 0 
+              ? `<tr><td colspan="4"><div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhuma movimentação ainda</div></div></td></tr>`
+              : movimentos.map(m => `
+                <tr>
+                  <td><span class="badge ${m.tipo === 'suprimento' ? 'badge--success' : m.tipo === 'retirada' ? 'badge--warning' : m.tipo === 'despesa' ? 'badge--danger' : 'badge--accent'}">${m.tipo}</span></td>
+                  <td style="color:${m.tipo === 'suprimento' ? 'var(--c-success)' : 'var(--c-danger)'}">${formatMoney(m.valor)}</td>
+                  <td>${m.descricao || '—'}</td>
+                  <td class="td-mono">${formatDateTime(m.created_at)}</td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Histórico de Caixas -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">Histórico de Caixas</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
+          <tbody>
+            ${(sessoes||[]).map(s => `
+              <tr>
+                <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
+                <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
+                <td>${formatMoney(s.valor_abertura)}</td>
+                <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
+                <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
+                <td style="color:${(s.quebra || 0) > 0 ? 'var(--c-success)' : (s.quebra || 0) < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(s.quebra || 0)}</td>
+                <td>${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}</td>
+              </tr>
+            `).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa registrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+window.filtrarTabelaProdutos = debounce(function(q) {
+  document.querySelectorAll('#tabela-produtos tbody tr').forEach(tr => {
+    tr.style.display = tr.textContent.toLowerCase().includes(q.toLowerCase()) ? '' : 'none';
+  });
+}, 200);
+
+window.abrirModalProduto = async function(produtoId) {
+  const { data: fornecedores } = await sb.from('fornecedores').select('id,nome').eq('ativo',true).order('nome');
+  let p = {};
+  if (produtoId) {
+    const { data } = await sb.from('produtos').select('*').eq('id',produtoId).single();
+    p = data || {};
+  }
+
+  openModal(produtoId ? 'Editar Produto' : 'Novo Produto', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="form-row form-row--2">
+        <div class="field"><label>Nome *</label><input type="text" class="input" id="prod-nome" value="${p.nome||''}" placeholder="Ex: Papel A4 500fls" /></div>
+        <div class="field"><label>Código de Barras</label><input type="text" class="input" id="prod-barras" value="${p.codigo_barras||''}" placeholder="EAN-13..." /></div>
+      </div>
+      <div class="form-row form-row--3">
+        <div class="field"><label>Categoria</label>
+          <select class="input" id="prod-categoria">
+            ${['papel','toner','tinta','encadernacao','plastificacao','material_escritorio','escolar','limpeza','outros'].map(c=>`<option value="${c}" ${p.categoria===c?'selected':''}>${c}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Unidade</label><input type="text" class="input" id="prod-unidade" value="${p.unidade||'un'}" placeholder="un, kg, cx..." /></div>
+        <div class="field"><label>Fornecedor</label>
+          <select class="input" id="prod-fornecedor">
+            <option value="">— Nenhum —</option>
+            ${(fornecedores||[]).map(f=>`<option value="${f.id}" ${p.fornecedor_id===f.id?'selected':''}>${f.nome}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Preço de Venda</label><input type="number" class="input" id="prod-venda" value="${p.preco_venda||''}" step="0.01" min="0" placeholder="0,00" /></div>
+        <div class="field"><label>Preço de Custo</label><input type="number" class="input" id="prod-custo" value="${p.preco_custo||''}" step="0.01" min="0" placeholder="0,00" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Estoque Atual</label><input type="number" class="input" id="prod-estoque" value="${p.estoque_atual||0}" step="0.001" /></div>
+        <div class="field"><label>Estoque Mínimo</label><input type="number" class="input" id="prod-estoque-min" value="${p.estoque_minimo||0}" step="0.001" /></div>
+      </div>
+      <div class="field"><label>Descrição</label><textarea class="input" id="prod-desc" rows="2">${p.descricao||''}</textarea></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarProduto('${produtoId||''}')">
+        💾 Salvar Produto
+      </button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.editarProduto = function(id) { abrirModalProduto(id); };
+
+window.salvarProduto = async function(id) {
+  const payload = {
+    nome: document.getElementById('prod-nome').value.trim(),
+    codigo_barras: document.getElementById('prod-barras').value||null,
+    categoria: document.getElementById('prod-categoria').value,
+    unidade: document.getElementById('prod-unidade').value||'un',
+    fornecedor_id: document.getElementById('prod-fornecedor').value||null,
+    preco_venda: parseFloat(document.getElementById('prod-venda').value)||null,
+    preco_custo: parseFloat(document.getElementById('prod-custo').value)||null,
+    estoque_atual: parseFloat(document.getElementById('prod-estoque').value)||0,
+    estoque_minimo: parseFloat(document.getElementById('prod-estoque-min').value)||0,
+    descricao: document.getElementById('prod-desc').value||null,
+  };
+  if (!payload.nome) { toast('Nome obrigatório','warning'); return; }
+  const { error } = id
+    ? await sb.from('produtos').update(payload).eq('id',id)
+    : await sb.from('produtos').insert(payload);
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  toast('Produto salvo!','success');
+  closeModal();
+  navigate('estoque');
+};
+
+window.ajusteEstoque = function(id, nome, atual, unidade) {
+  openModal('Ajuste de Estoque', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-weight:600">${nome}</div>
+        <div style="color:var(--c-text-3);font-size:var(--t-sm)">Estoque atual: <strong style="color:var(--c-text)">${atual} ${unidade}</strong></div>
+      </div>
+      <div class="field">
+        <label>Tipo de ajuste</label>
+        <div class="tabs">
+          <button class="tab-btn active" id="tab-entrada" onclick="this.classList.add('active');document.getElementById('tab-saida').classList.remove('active')">+ Entrada</button>
+          <button class="tab-btn" id="tab-saida" onclick="this.classList.add('active');document.getElementById('tab-entrada').classList.remove('active')">− Saída</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Quantidade</label>
+        <input type="number" class="input" id="ajuste-qtd" step="0.001" min="0.001" placeholder="0" />
+      </div>
+      <div class="field"><label>Motivo</label><input type="text" class="input" id="ajuste-motivo" placeholder="Inventário, compra, dano..." /></div>
+      <button class="btn btn--primary" style="width:100%;justify-content:center" onclick="confirmarAjusteEstoque('${id}',${atual},'${unidade}')">Confirmar Ajuste</button>
+    </div>
+  `);
+};
+
+window.confirmarAjusteEstoque = async function(id, atual, unidade) {
+  const qtd = parseFloat(document.getElementById('ajuste-qtd').value)||0;
+  if (!qtd) { toast('Informe a quantidade','warning'); return; }
+  const isEntrada = document.getElementById('tab-entrada').classList.contains('active');
+  const novoEstoque = isEntrada ? atual + qtd : Math.max(0, atual - qtd);
+  const { error } = await sb.from('produtos').update({ estoque_atual: novoEstoque }).eq('id',id);
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  toast('Estoque ajustado!','success');
+  closeModal();
+  navigate('estoque');
+};
+
+// ============================================================
+// ── MÓDULO: CONTAS ────────────────────────────────────────
+// ============================================================
+async function renderContas(el) {
+  const { data: contas } = await sb.from('contas')
+    .select('*, fornecedores(nome), funcionarios(nome)')
+    .order('vencimento', { ascending: true });
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Contas a Pagar / Receber</div>
+      <div class="section-sub">Controle financeiro de obrigações</div></div>
+      <button class="btn btn--primary" onclick="abrirModalConta()">+ Nova Conta</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Descrição</th><th>Tipo</th><th>Valor</th><th>Vencimento</th><th>Status</th><th>Categoria</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${(contas||[]).map(c => {
+              const vencida = !c.pago_em && new Date(c.vencimento) < new Date();
+              const status = c.pago_em ? 'paga' : vencida ? 'vencida' : 'pendente';
+              return `<tr>
+                <td style="font-weight:500">${c.descricao}</td>
+                <td><span class="badge ${c.tipo==='receita'?'badge--success':'badge--danger'}">${c.tipo==='receita'?'Receita':'Despesa'}</span></td>
+                <td style="font-weight:600;color:${c.tipo==='receita'?'var(--c-success)':'var(--c-danger)'}">${formatMoney(c.valor)}</td>
+                <td class="td-mono" style="color:${vencida&&!c.pago_em?'var(--c-danger)':''}">${formatDate(c.vencimento)}</td>
+                <td><span class="badge badge--${status==='paga'?'success':status==='vencida'?'danger':'warning'}">${status}</span></td>
+                <td style="color:var(--c-text-3)">${c.categoria||'—'}</td>
+                <td>
+                  ${!c.pago_em ? `<button class="btn btn--success btn--sm" onclick="pagarConta('${c.id}',${c.valor})">✓ Pagar</button>` : ''}
+                </td>
+              </tr>`;
+            }).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📋</div><div class="empty-state-sub">Nenhuma conta cadastrada</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+window.abrirModalConta = function() {
+  openModal('Nova Conta', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="form-row form-row--2">
+        <div class="field"><label>Descrição *</label><input type="text" class="input" id="conta-desc" placeholder="Ex: Aluguel loja" /></div>
+        <div class="field"><label>Tipo</label>
+          <select class="input" id="conta-tipo"><option value="despesa">Despesa</option><option value="receita">Receita</option></select>
+        </div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Valor *</label><input type="number" class="input" id="conta-valor" step="0.01" min="0" placeholder="0,00" /></div>
+        <div class="field"><label>Vencimento *</label><input type="date" class="input" id="conta-vencimento" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Categoria</label><input type="text" class="input" id="conta-categoria" placeholder="Aluguel, água, luz, salário..." /></div>
+        <div class="field"><label>Forma de Pagamento</label>
+          <select class="input" id="conta-pagamento">
+            ${['dinheiro','pix','cartao_debito','cartao_credito','cheque','transferencia'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field"><label>Observações</label><textarea class="input" id="conta-obs" rows="2"></textarea></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarConta()">💾 Salvar Conta</button>
+    </div>
+  `);
+};
+
+window.salvarConta = async function() {
+  const payload = {
+    descricao: document.getElementById('conta-desc').value.trim(),
+    tipo: document.getElementById('conta-tipo').value,
+    valor: parseFloat(document.getElementById('conta-valor').value)||0,
+    vencimento: document.getElementById('conta-vencimento').value,
+    categoria: document.getElementById('conta-categoria').value||null,
+    forma_pagamento: document.getElementById('conta-pagamento').value,
+    observacoes: document.getElementById('conta-obs').value||null,
+  };
+  if (!payload.descricao || !payload.valor || !payload.vencimento) { toast('Preencha os campos obrigatórios','warning'); return; }
+  const { error } = await sb.from('contas').insert(payload);
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  toast('Conta salva!','success');
+  closeModal();
+  navigate('contas');
+};
+
+window.pagarConta = function(id, valor) {
+  openModal('Registrar Pagamento', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field"><label>Valor Pago</label><input type="number" class="input" id="pag-valor" value="${valor}" step="0.01" /></div>
+      <div class="field"><label>Data do Pagamento</label><input type="date" class="input" id="pag-data" value="${new Date().toISOString().split('T')[0]}" /></div>
+      <div class="field"><label>Forma de Pagamento</label>
+        <select class="input" id="pag-forma">
+          ${['dinheiro','pix','cartao_debito','cartao_credito','cheque','transferencia'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="confirmarPagamentoConta('${id}')">✅ Confirmar Pagamento</button>
+    </div>
+  `);
+};
+
+window.confirmarPagamentoConta = async function(id) {
+  const { error } = await sb.from('contas').update({
+    pago_em: document.getElementById('pag-data').value,
+    valor_pago: parseFloat(document.getElementById('pag-valor').value)||0,
+    forma_pagamento: document.getElementById('pag-forma').value,
+    status: 'paga',
+  }).eq('id', id);
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  toast('Pagamento registrado!','success');
+  closeModal();
+  navigate('contas');
+};
+
+// ============================================================
+// ── MÓDULO: COMPRAS ───────────────────────────────────────
+// ============================================================
+async function renderCompras(el) {
+  const { data: compras } = await sb.from('compras')
+    .select('*, fornecedores(nome)')
+    .order('data_compra', { ascending: false })
+    .limit(20);
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Compras de Insumos</div>
+      <div class="section-sub">Registro de compras para reabastecimento de estoque</div></div>
+      <button class="btn btn--primary" onclick="abrirModalCompra()">+ Nova Compra</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Data</th><th>Fornecedor</th><th>NF</th><th>Total</th><th>Pagamento</th></tr></thead>
+          <tbody>
+            ${(compras||[]).map(c=>`
+              <tr>
+                <td class="td-mono">${formatDateTime(c.data_compra)}</td>
+                <td>${c.fornecedores?.nome||'—'}</td>
+                <td class="td-mono">${c.nota_fiscal||'—'}</td>
+                <td style="font-weight:600;color:var(--c-accent)">${formatMoney(c.total)}</td>
+                <td><span class="badge badge--primary">${labelPagamento(c.forma_pagamento)}</span></td>
+              </tr>
+            `).join('')||'<tr><td colspan="5"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">🛒</div><div class="empty-state-sub">Nenhuma compra registrada</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+window.abrirModalCompra = async function() {
+  const [{ data: fornecedores }, { data: produtos }] = await Promise.all([
+    sb.from('fornecedores').select('id,nome').eq('ativo',true).order('nome'),
+    sb.from('produtos').select('id,nome,unidade,preco_custo').eq('ativo',true).order('nome'),
+  ]);
+  window._compraItens = [];
+
+  openModal('Nova Compra', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="form-row form-row--2">
+        <div class="field"><label>Fornecedor</label>
+          <select class="input" id="compra-forn">
+            <option value="">— Selecione —</option>
+            ${(fornecedores||[]).map(f=>`<option value="${f.id}">${f.nome}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Nota Fiscal</label><input type="text" class="input" id="compra-nf" placeholder="Número da NF..." /></div>
+      </div>
+      <div class="field"><label>Forma de Pagamento</label>
+        <select class="input" id="compra-pag">
+          ${['dinheiro','pix','pix_brl','cartao_credito','cheque','transferencia'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="divider-text">Itens da Compra</div>
+      <div style="display:flex;gap:var(--sp-2)">
+        <select class="input" id="compra-prod-sel" style="flex:1">
+          <option value="">Selecionar produto...</option>
+          ${(produtos||[]).map(p=>`<option value="${p.id}" data-custo="${p.preco_custo||0}" data-un="${p.unidade}">${p.nome} (${p.unidade})</option>`).join('')}
+        </select>
+        <button class="btn btn--ghost" onclick="adicionarItemCompra()">+ Add</button>
+      </div>
+      <div id="compra-itens-lista" style="display:flex;flex-direction:column;gap:var(--sp-2)"></div>
+      <div style="display:flex;justify-content:space-between;font-weight:700;padding:var(--sp-2) 0">
+        <span>Total</span><span id="compra-total">${formatMoney(0)}</span>
+      </div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarCompra()">💾 Registrar Compra</button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.adicionarItemCompra = function() {
+  const sel = document.getElementById('compra-prod-sel');
+  if (!sel.value) return;
+  const opt = sel.options[sel.selectedIndex];
+  window._compraItens.push({
+    produto_id: sel.value,
+    nome: opt.text.split(' (')[0],
+    quantidade: 1,
+    preco_unitario: parseFloat(opt.dataset.custo)||0,
+    unidade: opt.dataset.un,
+    total: parseFloat(opt.dataset.custo)||0,
+  });
+  renderCompraItens();
+};
+
+function renderCompraItens() {
+  const el = document.getElementById('compra-itens-lista');
+  const totalEl = document.getElementById('compra-total');
+  if (!el) return;
+  el.innerHTML = window._compraItens.map((item,i)=>`
+    <div style="display:flex;align-items:center;gap:var(--sp-2);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)">
+      <div style="flex:1;font-size:var(--t-sm);font-weight:500">${item.nome}</div>
+      <input type="number" value="${item.quantidade}" min="0.001" step="0.001" style="width:70px" class="input"
+             oninput="window._compraItens[${i}].quantidade=parseFloat(this.value)||0;window._compraItens[${i}].total=window._compraItens[${i}].quantidade*window._compraItens[${i}].preco_unitario;renderCompraItens()" />
+      <span style="color:var(--c-text-3);font-size:var(--t-xs)">×</span>
+      <input type="number" value="${item.preco_unitario}" min="0" step="0.01" style="width:80px" class="input"
+             oninput="window._compraItens[${i}].preco_unitario=parseFloat(this.value)||0;window._compraItens[${i}].total=window._compraItens[${i}].quantidade*window._compraItens[${i}].preco_unitario;renderCompraItens()" />
+      <span style="font-weight:600;color:var(--c-accent);min-width:70px;text-align:right">${formatMoney(item.total)}</span>
+      <button class="pdv-remove-btn" onclick="window._compraItens.splice(${i},1);renderCompraItens()">✕</button>
+    </div>
+  `).join('');
+  const total = window._compraItens.reduce((a,b)=>a+b.total,0);
+  if (totalEl) totalEl.textContent = formatMoney(total);
+}
+window.renderCompraItens = renderCompraItens;
+
+window.salvarCompra = async function() {
+  if (!window._compraItens.length) { toast('Adicione ao menos um item','warning'); return; }
+  const total = window._compraItens.reduce((a,b)=>a+b.total,0);
+  const { data: compra, error } = await sb.from('compras').insert({
+    fornecedor_id: document.getElementById('compra-forn').value||null,
+    nota_fiscal: document.getElementById('compra-nf').value||null,
+    forma_pagamento: document.getElementById('compra-pag').value,
+    total,
+  }).select().single();
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+  await sb.from('compra_itens').insert(
+    window._compraItens.map(i=>({ compra_id: compra.id, ...i }))
+  );
+  // Atualiza estoque
+  for (const i of window._compraItens) {
+    const { data: prod } = await sb.from('produtos').select('estoque_atual').eq('id',i.produto_id).single();
+    if (prod) await sb.from('produtos').update({ estoque_atual: (prod.estoque_atual||0)+i.quantidade }).eq('id',i.produto_id);
+  }
+  toast('Compra registrada e estoque atualizado!','success');
+  closeModal();
+  navigate('compras');
+};
+
+// ============================================================
+// ── MÓDULO: CLIENTES ──────────────────────────────────────
+// ============================================================
+async function renderClientes(el) {
+  const { data: clientes } = await sb.from('clientes').select('*').order('nome');
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Clientes</div></div>
+      <button class="btn btn--primary" onclick="abrirModalCliente()">+ Novo Cliente</button>
+    </div>
+    <div class="card" style="height: auto;">
+      <div class="card-body" style="padding:var(--sp-3) var(--sp-5)">
+        <div class="search-bar"><span class="search-bar-icon">🔍</span>
+          <input type="text" class="input" placeholder="Buscar cliente..." oninput="filtrarTabela(this.value,'tabela-clientes')" />
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:var(--sp-4)">
+      <div class="table-wrap">
+        <table id="tabela-clientes">
+          <thead><tr><th>Nome</th><th>CPF</th><th>Telefone</th><th>E-mail</th><th>Fiado</th><th></th></tr></thead>
+          <tbody>
+            ${(clientes||[]).map(c=>`
+              <tr>
+                <td style="font-weight:500">${c.nome}</td>
+                <td class="td-mono">${c.cpf||'—'}</td>
+                <td>${c.telefone||'—'}</td>
+                <td style="color:var(--c-text-3)">${c.email||'—'}</td>
+                <td style="color:${(c.saldo_fiado||0)>0?'var(--c-danger)':'var(--c-text-3)'};font-weight:600">${formatMoney(c.saldo_fiado||0)}</td>
+                <td><button class="btn btn--ghost btn--sm" onclick="editarCliente('${c.id}')">✏️</button></td>
+              </tr>
+            `).join('')||'<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">👥</div><div class="empty-state-sub">Nenhum cliente cadastrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+window.abrirModalCliente = function(c={}) {
+  openModal(c.id?'Editar Cliente':'Novo Cliente',`
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field"><label>Nome *</label><input type="text" class="input" id="cli-nome" value="${c.nome||''}" /></div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>CPF</label><input type="text" class="input" id="cli-cpf" value="${c.cpf||''}" /></div>
+        <div class="field"><label>Telefone</label><input type="text" class="input" id="cli-tel" value="${c.telefone||''}" /></div>
+      </div>
+      <div class="field"><label>E-mail</label><input type="email" class="input" id="cli-email" value="${c.email||''}" /></div>
+      <div class="field"><label>Endereço</label><input type="text" class="input" id="cli-end" value="${c.endereco||''}" /></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarCliente('${c.id||''}')">💾 Salvar</button>
+    </div>
+  `);
+};
+window.editarCliente = async function(id) {
+  const {data} = await sb.from('clientes').select('*').eq('id',id).single();
+  abrirModalCliente(data||{});
+};
+window.salvarCliente = async function(id) {
+  const p = {
+    nome: document.getElementById('cli-nome').value.trim(),
+    cpf: document.getElementById('cli-cpf').value||null,
+    telefone: document.getElementById('cli-tel').value||null,
+    email: document.getElementById('cli-email').value||null,
+    endereco: document.getElementById('cli-end').value||null,
+  };
+  if(!p.nome){toast('Nome obrigatório','warning');return;}
+  const {error} = id ? await sb.from('clientes').update(p).eq('id',id) : await sb.from('clientes').insert(p);
+  if(error){toast('Erro: '+error.message,'error');return;}
+  toast('Cliente salvo!','success');closeModal();navigate('clientes');
+};
+
+// ============================================================
+// ── MÓDULO: FUNCIONÁRIOS ──────────────────────────────────
+// ============================================================
+async function renderFuncionarios(el) {
+  const {data: funcs} = await sb.from('funcionarios').select('*').order('nome');
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Funcionários</div></div>
+      <button class="btn btn--primary" onclick="abrirModalFuncionario()">+ Novo Funcionário</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Nome</th><th>Cargo</th><th>Salário</th><th>Admissão</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            ${(funcs||[]).map(f=>`
+              <tr>
+                <td style="font-weight:500">${f.nome}</td>
+                <td>${f.cargo||'—'}</td>
+                <td style="color:var(--c-success);font-weight:600">${formatMoney(f.salario)}</td>
+                <td class="td-mono">${formatDate(f.data_admissao)}</td>
+                <td><span class="badge badge--${f.ativo?'success':'danger'}">${f.ativo?'Ativo':'Inativo'}</span></td>
+                <td><button class="btn btn--ghost btn--sm" onclick="editarFuncionario('${f.id}')">✏️</button></td>
+              </tr>
+            `).join('')||'<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">👔</div><div class="empty-state-sub">Nenhum funcionário cadastrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+window.abrirModalFuncionario = function(f={}) {
+  openModal(f.id?'Editar Funcionário':'Novo Funcionário',`
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field"><label>Nome *</label><input type="text" class="input" id="func-nome" value="${f.nome||''}" /></div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Cargo</label><input type="text" class="input" id="func-cargo" value="${f.cargo||''}" /></div>
+        <div class="field"><label>Salário</label><input type="number" class="input" id="func-salario" value="${f.salario||''}" step="0.01" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>CPF</label><input type="text" class="input" id="func-cpf" value="${f.cpf||''}" /></div>
+        <div class="field"><label>Telefone</label><input type="text" class="input" id="func-tel" value="${f.telefone||''}" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>E-mail</label><input type="email" class="input" id="func-email" value="${f.email||''}" /></div>
+        <div class="field"><label>Admissão</label><input type="date" class="input" id="func-admissao" value="${f.data_admissao||''}" /></div>
+      </div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarFuncionario('${f.id||''}')">💾 Salvar</button>
+    </div>
+  `);
+};
+window.editarFuncionario = async function(id) {
+  const {data} = await sb.from('funcionarios').select('*').eq('id',id).single();
+  abrirModalFuncionario(data||{});
+};
+window.salvarFuncionario = async function(id) {
+  const p = {
+    nome: document.getElementById('func-nome').value.trim(),
+    cargo: document.getElementById('func-cargo').value||null,
+    salario: parseFloat(document.getElementById('func-salario').value)||null,
+    cpf: document.getElementById('func-cpf').value||null,
+    telefone: document.getElementById('func-tel').value||null,
+    email: document.getElementById('func-email').value||null,
+    data_admissao: document.getElementById('func-admissao').value||null,
+  };
+  if(!p.nome){toast('Nome obrigatório','warning');return;}
+  const {error} = id ? await sb.from('funcionarios').update(p).eq('id',id) : await sb.from('funcionarios').insert(p);
+  if(error){toast('Erro: '+error.message,'error');return;}
+  toast('Funcionário salvo!','success');closeModal();navigate('funcionarios');
+};
+
+// ============================================================
+// ── MÓDULO: FORNECEDORES ──────────────────────────────────
+// ============================================================
+async function renderFornecedores(el) {
+  const {data: forns} = await sb.from('fornecedores').select('*').order('nome');
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Fornecedores</div></div>
+      <button class="btn btn--primary" onclick="abrirModalFornecedor()">+ Novo Fornecedor</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Nome</th><th>CNPJ</th><th>Contato</th><th>Telefone</th><th>Tipo</th><th></th></tr></thead>
+          <tbody>
+            ${(forns||[]).map(f=>`
+              <tr>
+                <td style="font-weight:500">${f.nome}</td>
+                <td class="td-mono">${f.cnpj||'—'}</td>
+                <td>${f.contato||'—'}</td>
+                <td>${f.telefone||'—'}</td>
+                <td><span class="badge badge--primary">${f.tipo}</span></td>
+                <td><button class="btn btn--ghost btn--sm" onclick="editarFornecedor('${f.id}')">✏️</button></td>
+              </tr>
+            `).join('')||'<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">🏭</div><div class="empty-state-sub">Nenhum fornecedor cadastrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+window.abrirModalFornecedor = function(f={}) {
+  openModal(f.id?'Editar Fornecedor':'Novo Fornecedor',`
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field"><label>Nome *</label><input type="text" class="input" id="forn-nome" value="${f.nome||''}" /></div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>CNPJ</label><input type="text" class="input" id="forn-cnpj" value="${f.cnpj||''}" /></div>
+        <div class="field"><label>Tipo</label>
+          <select class="input" id="forn-tipo">
+            ${['produto','servico','ambos'].map(t=>`<option value="${t}" ${f.tipo===t?'selected':''}>${t}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Contato (pessoa)</label><input type="text" class="input" id="forn-contato" value="${f.contato||''}" /></div>
+        <div class="field"><label>Telefone</label><input type="text" class="input" id="forn-tel" value="${f.telefone||''}" /></div>
+      </div>
+      <div class="field"><label>E-mail</label><input type="email" class="input" id="forn-email" value="${f.email||''}" /></div>
+      <div class="field"><label>Endereço</label><input type="text" class="input" id="forn-end" value="${f.endereco||''}" /></div>
+      <div class="field"><label>Observações</label><textarea class="input" id="forn-obs" rows="2">${f.observacoes||''}</textarea></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarFornecedor('${f.id||''}')">💾 Salvar</button>
+    </div>
+  `);
+};
+window.editarFornecedor = async function(id) {
+  const {data} = await sb.from('fornecedores').select('*').eq('id',id).single();
+  abrirModalFornecedor(data||{});
+};
+window.salvarFornecedor = async function(id) {
+  const p = {
+    nome: document.getElementById('forn-nome').value.trim(),
+    cnpj: document.getElementById('forn-cnpj').value||null,
+    tipo: document.getElementById('forn-tipo').value,
+    contato: document.getElementById('forn-contato').value||null,
+    telefone: document.getElementById('forn-tel').value||null,
+    email: document.getElementById('forn-email').value||null,
+    endereco: document.getElementById('forn-end').value||null,
+    observacoes: document.getElementById('forn-obs').value||null,
+  };
+  if(!p.nome){toast('Nome obrigatório','warning');return;}
+  const {error} = id ? await sb.from('fornecedores').update(p).eq('id',id) : await sb.from('fornecedores').insert(p);
+  if(error){toast('Erro: '+error.message,'error');return;}
+  toast('Fornecedor salvo!','success');closeModal();navigate('fornecedores');
+};
+
+// ============================================================
+// ── MÓDULO: IMPRESSORAS ───────────────────────────────────
+// ============================================================
+function renderStepImpressoras() {
+  return `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Escolha a impressora</span>
+        <button class="btn btn--ghost btn--sm" onclick="loadImpressoras().then(()=>renderStep(1))">↻</button>
+      </div>
+      <div class="card-body">
+        <div class="printer-grid" id="printer-grid">
+          ${State.impressoras.map(imp => `
+            <div class="printer-card ${imp.status !== 'online' ? 'opacity-half' : ''} ${PdvState.impressoraSelecionada === imp.id ? 'selected' : ''}"
+                 data-id="${imp.id}"
+                 onclick="selecionarImpressora('${imp.id}')">
+              <div style="display:flex;align-items:center;gap:var(--sp-2)">
+                <div class="printer-status-dot ${imp.status}"></div>
+                <span class="badge badge--${imp.status === 'online' ? 'success' : 'danger'}">${imp.status}</span>
+                ${imp.colorida ? '<span class="badge badge--accent">Colorida</span>' : '<span class="badge">P&B</span>'}
+              </div>
+              <div class="printer-card-name">${imp.nome}</div>
+              <div class="printer-card-model">${imp.marca||''} ${imp.modelo||''}</div>
+              <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">📍 ${imp.localizacao||'—'} · IP: ${imp.ip_rede||'—'}</div>
+              <div class="printer-counters">
+                <div class="printer-counter">
+                  <div class="printer-counter-val">${(imp.contador_pb_sesssao||0).toLocaleString()}</div>
+                  <div class="printer-counter-label">P&B hoje</div>
+                </div>
+                <div class="printer-counter">
+                  <div class="printer-counter-val">${(imp.contador_cor_sessao||0).toLocaleString()}</div>
+                  <div class="printer-counter-label">Cor hoje</div>
+                </div>
+                <div class="printer-counter">
+                  <div class="printer-counter-val">${((imp.contador_pb_total||0)+(imp.contador_cor_total||0)).toLocaleString()}</div>
+                  <div class="printer-counter-label">Total geral</div>
+                </div>
+              </div>
+            </div>
+          `).join('') || '<div class="empty-state"><div class="empty-state-icon">🖥️</div><div class="empty-state-sub">Cadastre impressoras em Impressoras</div></div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderStepTipoCopia() {
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Escolha o tipo de cópia</span></div>
+      <div class="card-body">
+        <div class="tipo-copia-grid" id="tipo-copia-grid">
+          ${State.precosCopia.map(p => `
+            <div class="tipo-copia-btn ${PdvState.tipoCopia === p.tipo ? 'selected' : ''}"
+                 data-tipo="${p.tipo}"
+                 onclick="selecionarTipoCopia('${p.tipo}')">
+              <div class="tipo-copia-btn-icon">${iconeTipoCopia(p.tipo)}</div>
+              <div class="tipo-copia-btn-name">${p.descricao}</div>
+              <div class="tipo-copia-btn-price">${formatMoney(p.preco_unitario)} /cópia</div>
+              ${p.preco_desconto ? `<div style="font-size:10px;color:var(--c-text-3)">≥${p.qtd_desconto} pçs: ${formatMoney(p.preco_desconto)}</div>` : ''}
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderStepQuantidade() {
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Quantidade e Opções</span></div>
+      <div class="card-body">
+        <div class="form-row form-row--3" style="align-items:end">
+          <div class="field">
+            <label>Quantidade de Cópias</label>
+            <div class="qty-control">
+              <button class="qty-btn" onclick="ajustarQtd(-10)">−10</button>
+              <button class="qty-btn" onclick="ajustarQtd(-1)">−</button>
+              <input type="number" id="input-qtd" class="input qty-input" value="${PdvState.quantidade}" min="1" max="9999"
+                     onchange="PdvState.quantidade = parseInt(this.value)||1; atualizarPreviewPdv()" />
+              <button class="qty-btn" onclick="ajustarQtd(1)">+</button>
+              <button class="qty-btn" onclick="ajustarQtd(10)">+10</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Frente e Verso?</label>
+            <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-border);border-radius:var(--r-md);background:var(--c-bg)">
+              <input type="checkbox" id="chk-frente-verso" ${PdvState.frenteVerso?'checked':''}
+                     onchange="PdvState.frenteVerso=this.checked;atualizarPreviewPdv()">
+              <span>Sim (2 lados)</span>
+            </label>
+          </div>
+          <div class="field">
+            <label>Cliente (opcional)</label>
+            <input type="text" class="input" id="input-cliente-busca" placeholder="Buscar cliente..." />
+          </div>
+        </div>
+
+        <!-- NOVO CAMPO: Páginas por documento -->
+        <div class="form-row form-row--3" style="margin-top:var(--sp-4)">
+          <div class="field">
+            <label>Páginas por documento</label>
+            <input type="number" id="input-paginas-doc" class="input"
+                   value="${PdvState.paginasPorDocumento}" min="1" max="9999"
+                   onchange="PdvState.paginasPorDocumento = parseInt(this.value)||1; atualizarPreviewPdv()" />
+          </div>
+          <div class="field">
+            <label>Total de páginas</label>
+            <input type="text" class="input" id="total-paginas-preview" value="—" disabled style="background:var(--c-bg);opacity:.7" />
+          </div>
+          <div class="field">
+            <label>Folhas estimadas</label>
+            <input type="text" class="input" id="folhas-preview" value="—" disabled style="background:var(--c-bg);opacity:.7" />
+          </div>
+        </div>
+
+        <div style="margin-top:var(--sp-4)" id="preview-pdv">
+          <!-- Atualizado dinamicamente -->
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function renderImpressoras(el) {
+  await loadImpressoras();
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Gerenciar Impressoras</div>
+      <div class="section-sub">Monitoramento de status e contadores em rede</div></div>
+      <button class="btn btn--primary" onclick="abrirModalImpressora()">+ Cadastrar Impressora</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-surface);border:1px solid var(--c-border);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-3);margin-bottom:var(--sp-2)">ℹ️ Sobre integração em rede</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);line-height:1.7">
+          As impressoras são cadastradas com IP de rede. O sistema registra contadores manualmente via PDV.
+          Para integração com contadores reais via SNMP/JMX, é necessário um proxy local (Node.js) rodando na mesma rede.
+          <a href="#" onclick="verInstrucoesSNMP()" style="color:var(--c-primary)">Ver instruções →</a>
+        </div>
+      </div>
+      <div class="printer-grid">
+        ${State.impressoras.map(imp=>`
+          <div class="printer-card">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <div style="display:flex;align-items:center;gap:var(--sp-2)">
+                <div class="printer-status-dot ${imp.status}"></div>
+                <span class="badge badge--${imp.status==='online'?'success':imp.status==='offline'?'danger':'warning'}">${imp.status}</span>
+              </div>
+              <div style="display:flex;gap:4px">
+                <button class="btn btn--ghost btn--sm" onclick="editarImpressora('${imp.id}')">✏️</button>
+                <button class="btn btn--ghost btn--sm" onclick="mudarStatusImpressora('${imp.id}')">⚡</button>
+              </div>
+            </div>
+            <div class="printer-card-name">${imp.nome}</div>
+            <div class="printer-card-model">${imp.marca||''} ${imp.modelo||''}</div>
+            <div style="margin-top:var(--sp-2);font-size:var(--t-xs);color:var(--c-text-3)">
+              📍 ${imp.localizacao||'—'}<br>
+              🌐 IP: <span style="font-family:var(--font-mono)">${imp.ip_rede||'—'}</span><br>
+              🖨️ ${imp.tipo} · ${imp.colorida?'Colorida':'Preto e Branco'}
+            </div>
+            <div class="printer-counters">
+              <div class="printer-counter">
+                <div class="printer-counter-val">${(imp.contador_pb_total||0).toLocaleString()}</div>
+                <div class="printer-counter-label">P&B Total</div>
+              </div>
+              <div class="printer-counter">
+                <div class="printer-counter-val">${(imp.contador_cor_total||0).toLocaleString()}</div>
+                <div class="printer-counter-label">Cor Total</div>
+              </div>
+            </div>
+          </div>
+        `).join('')||'<div class="empty-state" style="grid-column:1/-1;padding:var(--sp-10)"><div class="empty-state-icon">🖥️</div><div class="empty-state-sub">Nenhuma impressora cadastrada</div></div>'}
+      </div>
+    </div>
+  `;
+}
+
+window.abrirModalImpressora = function(imp={}) {
+  openModal(imp.id?'Editar Impressora':'Nova Impressora',`
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="form-row form-row--2">
+        <div class="field"><label>Nome *</label><input type="text" class="input" id="imp-nome" value="${imp.nome||''}" placeholder="Ex: Impressora 1" /></div>
+        <div class="field"><label>Localização</label><input type="text" class="input" id="imp-local" value="${imp.localizacao||''}" placeholder="Balcão, fundo..." /></div>
+      </div>
+      <div class="form-row form-row--3">
+        <div class="field"><label>Marca</label><input type="text" class="input" id="imp-marca" value="${imp.marca||''}" placeholder="HP, Epson..." /></div>
+        <div class="field"><label>Modelo</label><input type="text" class="input" id="imp-modelo" value="${imp.modelo||''}" /></div>
+        <div class="field"><label>IP da Rede</label><input type="text" class="input" id="imp-ip" value="${imp.ip_rede||''}" placeholder="192.168.1.10" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Tipo</label>
+          <select class="input" id="imp-tipo">
+            <option value="laser" ${imp.tipo==='laser'?'selected':''}>Laser</option>
+            <option value="tinta" ${imp.tipo==='tinta'?'selected':''}>Jato de Tinta</option>
+          </select>
+        </div>
+        <div class="field"><label>Impressão Colorida?</label>
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-border);border-radius:var(--r-md);background:var(--c-bg)">
+            <input type="checkbox" id="imp-colorida" ${imp.colorida?'checked':''}>
+            <span>Sim, imprime colorido</span>
+          </label>
+        </div>
+      </div>
+      <div class="field"><label>Observações / Último serviço</label><textarea class="input" id="imp-obs" rows="2">${imp.observacoes||''}</textarea></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarImpressora('${imp.id||''}')">💾 Salvar Impressora</button>
+    </div>
+  `);
+};
+window.editarImpressora = async function(id) {
+  const imp = State.impressoras.find(i=>i.id===id)||{};
+  abrirModalImpressora(imp);
+};
+window.salvarImpressora = async function(id) {
+  const p = {
+    nome: document.getElementById('imp-nome').value.trim(),
+    localizacao: document.getElementById('imp-local').value||null,
+    marca: document.getElementById('imp-marca').value||null,
+    modelo: document.getElementById('imp-modelo').value||null,
+    ip_rede: document.getElementById('imp-ip').value||null,
+    tipo: document.getElementById('imp-tipo').value,
+    colorida: document.getElementById('imp-colorida').checked,
+    observacoes: document.getElementById('imp-obs').value||null,
+  };
+  if(!p.nome){toast('Nome obrigatório','warning');return;}
+  const {error} = id ? await sb.from('impressoras').update(p).eq('id',id) : await sb.from('impressoras').insert(p);
+  if(error){toast('Erro: '+error.message,'error');return;}
+  toast('Impressora salva!','success');
+  await loadImpressoras();
+  closeModal();navigate('impressoras');
+};
+window.mudarStatusImpressora = async function(id) {
+  const imp = State.impressoras.find(i=>i.id===id);
+  if(!imp) return;
+  const statuses = ['online','offline','manutencao','sem_papel','sem_toner'];
+  const next = statuses[(statuses.indexOf(imp.status)+1) % statuses.length];
+  await sb.from('impressoras').update({status:next}).eq('id',id);
+  await loadImpressoras();
+  navigate('impressoras');
+};
+window.verInstrucoesSNMP = function() {
+  openModal('Integração SNMP / Contadores', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4);font-size:var(--t-sm);line-height:1.7;color:var(--c-text-2)">
+      <p>Para leitura automática de contadores das impressoras via rede, você precisa de um <strong>proxy local em Node.js</strong> rodando na mesma rede local da loja.</p>
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4);font-family:var(--font-mono);font-size:var(--t-xs)">
+        npm install net-snmp express cors<br>
+        node snmp-proxy.js
+      </div>
+      <p>O proxy faz requisições SNMP para cada impressora via OID padrão <code>1.3.6.1.2.1.43.10.2.1.4</code> (contador de páginas) e expõe via HTTP para este sistema.</p>
+      <p><strong>Impressoras HP, Epson, Brother e Canon</strong> geralmente suportam SNMP v1/v2 nativamente quando conectadas à rede.</p>
+      <p>Por enquanto, os contadores são atualizados automaticamente a cada pedido registrado no PDV de Cópias.</p>
+    </div>
+  `, 'modal--lg');
+};
+
+// ============================================================
+// ── MÓDULO: PREÇOS DE CÓPIA ───────────────────────────────
+// ============================================================
+async function renderPrecos(el) {
+  const {data: precos} = await sb.from('precos_copia').select('*').order('tipo');
+  el.innerHTML = `
+    <div class="section-header">
+      <div><div class="section-title">Tabela de Preços de Cópias</div>
+      <div class="section-sub">Configure os preços por tipo de cópia e desconto por volume</div></div>
+    </div>
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>Ativo</th><th></th></tr></thead>
+          <tbody>
+            ${(precos||[]).map(p=>`
+              <tr>
+                <td class="td-mono">${p.tipo}</td>
+                <td>${p.descricao}</td>
+                <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_unitario)}</td>
+                <td>${p.preco_desconto ? formatMoney(p.preco_desconto) : '—'}</td>
+                <td>${p.qtd_desconto||'—'} cópias</td>
+                <td><span class="badge badge--${p.ativo?'success':'danger'}">${p.ativo?'Sim':'Não'}</span></td>
+                <td><button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️ Editar</button></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+window.editarPreco = async function(id) {
+  const {data} = await sb.from('precos_copia').select('*').eq('id',id).single();
+  if(!data) return;
+  openModal('Editar Preço — '+data.descricao,`
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field"><label>Descrição</label><input type="text" class="input" id="preco-desc" value="${data.descricao}" /></div>
+      <div class="form-row form-row--3">
+        <div class="field"><label>Preço Unitário *</label><input type="number" class="input" id="preco-unit" value="${data.preco_unitario}" step="0.01" min="0" /></div>
+        <div class="field"><label>Preço c/ Desconto</label><input type="number" class="input" id="preco-desc-val" value="${data.preco_desconto||''}" step="0.01" min="0" /></div>
+        <div class="field"><label>A partir de (qtd)</label><input type="number" class="input" id="preco-qtd" value="${data.qtd_desconto||100}" min="1" /></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
+        <input type="checkbox" id="preco-ativo" ${data.ativo?'checked':''}> <span>Ativo no PDV</span>
+      </label>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarPreco('${id}')">💾 Salvar Preço</button>
+    </div>
+  `);
+};
+window.salvarPreco = async function(id) {
+  const p = {
+    descricao: document.getElementById('preco-desc').value.trim(),
+    preco_unitario: parseFloat(document.getElementById('preco-unit').value)||0,
+    preco_desconto: parseFloat(document.getElementById('preco-desc-val').value)||null,
+    qtd_desconto: parseInt(document.getElementById('preco-qtd').value)||100,
+    ativo: document.getElementById('preco-ativo').checked,
+  };
+  const {error} = await sb.from('precos_copia').update(p).eq('id',id);
+  if(error){toast('Erro: '+error.message,'error');return;}
+  await loadPrecosCopia();
+  toast('Preço atualizado!','success');closeModal();navigate('precos');
+};
+
+// ============================================================
+// ── HELPERS GLOBAIS ───────────────────────────────────────
+// ============================================================
+function labelPagamento(p) {
+  const m = {
+    dinheiro:      '💵 Efectivo',
+    pix:           '☑ QR (₲)',
+    pix_brl:       '🇧🇷 Pix (R$)',
+    cartao_debito: '💳 Débito',
+    cartao_credito:'💳 Crédito',
+    // fiado:         '📒 Fiado',
+    // cheque:        '📄 Cheque',
+    transferencia: '🔄 Transfer.',
+  };
+  return m[p] || p;
+}
+function labelTipoCopia(tipo) {
+  const m = { pb_laser:'P&B Laser', pb_tinta:'P&B Tinta', colorida_laser:'Colorida Laser', colorida_tinta:'Colorida Tinta', foto_laser:'Foto Laser', foto_tinta:'Foto Tinta', a3_pb:'A3 P&B', a3_colorida:'A3 Colorida' };
+  return m[tipo] || tipo;
+}
+function iconeTipoCopia(tipo) {
+  if (tipo.startsWith('colorida') || tipo === 'a3_colorida') return '🎨';
+  if (tipo.startsWith('foto')) return '📷';
+  if (tipo.startsWith('a3')) return '📐';
+  return '📄';
+}
+function badgeStatus(status) {
+  const m = {
+    aguardando:  'badge--warning',
+    processando: 'badge--info',
+    concluido:   'badge--success',
+    cancelado:   'badge--danger',
+    erro:        'badge--danger',
+    vendida:     'badge--primary',
+    embarcada:   'badge--success',
+  };
+  const labels = {
+    vendida:'Vendida', embarcada:'Embarcada', cancelada:'Cancelada',
+    concluido:'Concluído', aguardando:'Aguardando', cancelado:'Cancelado',
+  };
+  return `<span class="badge ${m[status]||'badge--primary'}">${labels[status]||status}</span>`;
+}
+window.filtrarTabela = debounce(function(q, tableId) {
+  document.querySelectorAll(`#${tableId} tbody tr`).forEach(tr => {
+    tr.style.display = tr.textContent.toLowerCase().includes(q.toLowerCase()) ? '' : 'none';
+  });
+}, 200);
+
+
+// ============================================================
+// ── MÓDULO: PASSAGENS DE ÔNIBUS (NSA) ────────────────────
+// ============================================================
+
+// ============================================================
+// ── MÓDULO: PASSAGENS (REFATORADO) ──────────────────────
+// ============================================================
+
+async function renderPassagens(el) {
+  // Roles de visibilidades
+  const userRole = State.userProfile?.role || 'funcionario';
+  const isAdmin = userRole === 'admin'
+  
+  // Carrega configurações de comissão
+  const { data: comissoes } = await sb.from('config_comissoes').select('*');
+  const mapComissao = {};
+  (comissoes || []).forEach(c => mapComissao[c.forma_pagamento] = c.percentual_comissao);
+
+  // Busca passagens
+  const { data: passagens, error } = await sb.from('passagens_onibus')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (error) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-sub">Erro ao carregar passagens</div></div>`;
+    return;
+  }
+
+  // Filtro de período (inicial: todos)
+  let periodo = 'todos';
+
+  // Monta HTML
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">🚌 Passagens NSA</div>
+        <div class="section-sub">Registro de venda de passagens — agência credenciada NSA</div>
+      </div>
+      <div style="display:flex;gap:var(--sp-3)">
+        ${isAdmin ? `<button class="btn btn--ghost" onclick="abrirConfigComissoes()">⚙️ Configurar Comissões</button>` : ''}
+        <button class="btn btn--primary" onclick="abrirModalPassagem()">+ Nova Passagem</button>
+      </div>
+    </div>
+
+    <!-- Cards de resumo (calculados em tempo real) -->
+    <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr));margin-bottom:var(--sp-5)">
+      <div class="stat-card stat-card--primary">
+        <div class="stat-card-header"><span class="stat-card-label">Vendas (total)</span><span class="stat-card-icon">🎫</span></div>
+        <div class="stat-card-value" id="total-vendido">${formatMoney(0)}</div>
+        <div class="stat-card-sub" id="total-vendido-count">0 passagens</div>
+      </div>
+      <div class="stat-card stat-card--danger">
+        <div class="stat-card-header"><span class="stat-card-label">Repasse Pendente</span><span class="stat-card-icon">⏳</span></div>
+        <div class="stat-card-value" id="total-repasse-pendente">${formatMoney(0)}</div>
+        <div class="stat-card-sub" id="total-repasse-count">0 passagens</div>
+      </div>
+      <div class="stat-card stat-card--success">
+        <div class="stat-card-header"><span class="stat-card-label">Comissão Confirmada</span><span class="stat-card-icon">✅</span></div>
+        <div class="stat-card-value" id="total-comissao-confirmada">${formatMoney(0)}</div>
+        <div class="stat-card-sub" id="total-comissao-count">0 passagens</div>
+      </div>
+    </div>
+
+    <!-- Filtros e ações em lote -->
+    <div style="display:flex;gap:var(--sp-3);margin-bottom:var(--sp-4);flex-wrap:wrap;align-items:center">
+      <div class="chip-row">
+        <span class="chip active" onclick="filtrarPassagensPeriodo(this,'todos')">Todas</span>
+        <span class="chip" onclick="filtrarPassagensPeriodo(this,'hoje')">Hoje</span>
+        <span class="chip" onclick="filtrarPassagensPeriodo(this,'semana')">Esta semana</span>
+        <span class="chip" onclick="filtrarPassagensPeriodo(this,'mes')">Este mês</span>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:var(--sp-2)">
+        <button class="btn btn--success btn--sm" onclick="confirmarRepasseLote()">✅ Confirmar Repasse (selecionados)</button>
+        <button class="btn btn--danger btn--sm" onclick="cancelarPassagensLote()">✕ Cancelar (selecionados)</button>
+      </div>
+    </div>
+
+    <!-- Tabela -->
+    <div class="card">
+      <div class="table-wrap">
+        <table id="tabela-passagens">
+          <thead>
+            <tr>
+              <th style="width:32px"><input type="checkbox" id="select-all-passagens" onchange="toggleSelectAllPassagens()" /></th>
+              <th>#</th>
+              <th>Origem</th>
+              <th>Destino</th>
+              <th>Data da Compra</th>
+              <th>Valor Total</th>
+              <th>Forma de Pagamento</th>
+              <th>Comissão</th>
+              <th>Repasse</th>
+              <th>Status</th>
+              <th>Repasse Confirmado</th>
+            </tr>
+          </thead>
+          <tbody id="tbody-passagens">
+            <!-- Preenchido via JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  // Função para renderizar linhas com base no período
+  window._renderLinhasPassagens = function(passagens, periodo) {
+    const tbody = document.getElementById('tbody-passagens');
+    if (!tbody) return;
+
+    const now = new Date();
+    const hoje = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const inicioSemana = new Date(hoje);
+    inicioSemana.setDate(hoje.getDate() - hoje.getDay()); // domingo
+    const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const filtradas = passagens.filter(p => {
+      const data = new Date(p.created_at);
+      if (periodo === 'hoje') return data >= hoje;
+      if (periodo === 'semana') return data >= inicioSemana;
+      if (periodo === 'mes') return data >= inicioMes;
+      return true;
+    });
+
+    // Atualiza cards de resumo
+    const totalVendido = filtradas.reduce((s, p) => s + p.valor_total, 0);
+    const totalRepassePendente = filtradas.filter(p => p.status !== 'cancelada' && !p.repasse_confirmado).reduce((s, p) => s + p.valor_repasse, 0);
+    const totalComissaoConfirmada = filtradas.filter(p => p.repasse_confirmado).reduce((s, p) => s + p.valor_comissao, 0);
+
+    document.getElementById('total-vendido').textContent = formatMoney(totalVendido);
+    document.getElementById('total-vendido-count').textContent = `${filtradas.length} passagens`;
+    document.getElementById('total-repasse-pendente').textContent = formatMoney(totalRepassePendente);
+    document.getElementById('total-repasse-count').textContent = `${filtradas.filter(p => p.status !== 'cancelada' && !p.repasse_confirmado).length} passagens`;
+    document.getElementById('total-comissao-confirmada').textContent = formatMoney(totalComissaoConfirmada);
+    document.getElementById('total-comissao-count').textContent = `${filtradas.filter(p => p.repasse_confirmado).length} passagens`;
+
+    if (filtradas.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma passagem encontrada</div></div></td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtradas.map(p => {
+      const isCancelada = p.status === 'cancelada';
+      return `
+        <tr data-id="${p.id}" data-status="${p.status}" data-repasse="${p.repasse_confirmado}" style="${isCancelada ? 'opacity:0.5' : ''}">
+          <td><input type="checkbox" class="checkbox-passagem" data-id="${p.id}" ${isCancelada ? 'disabled' : ''} /></td>
+          <td class="td-mono">#${p.numero_venda}</td>
+          <td>${p.origem || '—'}</td>
+          <td>${p.destino || '—'}</td>
+          <td class="td-mono">${formatDateTime(p.created_at)}</td>
+          <td style="font-weight:700">${formatMoney(p.valor_total)}</td>
+          <td><span class="badge badge--primary">${labelPagamento(p.forma_pagamento)}</span></td>
+          <td style="color:${p.repasse_confirmado ? 'var(--c-success)' : 'var(--c-warning)'}">${formatMoney(p.valor_comissao)}</td>
+          <td style="color:var(--c-danger)">${formatMoney(p.valor_repasse)}</td>
+          <td>${badgeStatus(p.status)}</td>
+          <td>${p.repasse_confirmado ? '<span class="badge badge--success">✓</span>' : '<span class="badge badge--warning">⏳</span>'}</td>
+        </tr>
+      `;
+    }).join('');
+  };
+
+  // Renderiza inicial
+  window._renderLinhasPassagens(passagens, 'todos');
+
+  // Guarda dados globalmente para filtros
+  window._passagensData = passagens;
+
+  // Função de filtro
+  window.filtrarPassagensPeriodo = function(chip, periodo) {
+    document.querySelectorAll('.chip-row .chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    window._renderLinhasPassagens(window._passagensData, periodo);
+  };
+}
+
+// ── Selecionar todos ──────────────────────────────────────
+window.toggleSelectAllPassagens = function() {
+  const checked = document.getElementById('select-all-passagens').checked;
+  document.querySelectorAll('.checkbox-passagem').forEach(cb => {
+    if (!cb.disabled) cb.checked = checked;
+  });
+};
+
+// ── Obter IDs selecionados ───────────────────────────────
+function getIdsSelecionados() {
+  const ids = [];
+  document.querySelectorAll('.checkbox-passagem:checked').forEach(cb => {
+    ids.push(cb.dataset.id);
+  });
+  return ids;
+}
+
+// ── Confirmar Repasse em Lote ────────────────────────────
+window.confirmarRepasseLote = async function() {
+  const ids = getIdsSelecionados();
+  if (ids.length === 0) { toast('Selecione ao menos uma passagem', 'warning'); return; }
+
+  if (!confirm(`Confirmar repasse de ${ids.length} passagem(ns)?`)) return;
+
+  try {
+    for (const id of ids) {
+      // Buscar dados da passagem
+      const { data: p } = await sb.from('passagens_onibus').select('*').eq('id', id).single();
+      if (!p || p.repasse_confirmado || p.status === 'cancelada') continue;
+
+      // Marcar repasse confirmado
+      await sb.from('passagens_onibus').update({
+        repasse_confirmado: true,
+        repasse_confirmado_em: new Date().toISOString()
+      }).eq('id', id);
+
+      // Marcar conta de repasse como paga (se existir)
+      if (p.conta_repasse_id) {
+        await sb.from('contas').update({
+          pago_em: new Date().toISOString().split('T')[0],
+          valor_pago: p.valor_repasse,
+          status: 'paga'
+        }).eq('id', p.conta_repasse_id);
+      }
+
+      // Registrar comissão como receita (se ainda não registrada)
+      // Evitar duplicidade verificando se já existe conta com passagem_id
+      const { data: existing } = await sb.from('contas')
+        .select('id')
+        .eq('passagem_id', id)
+        .eq('tipo_interno', 'comissao_nsa')
+        .maybeSingle();
+      if (!existing) {
+        await sb.from('contas').insert({
+          descricao: `Comissão NSA — Passagem #${p.numero_venda}`,
+          tipo: 'receita',
+          valor: p.valor_comissao,
+          vencimento: new Date().toISOString().split('T')[0],
+          pago_em: new Date().toISOString().split('T')[0],
+          valor_pago: p.valor_comissao,
+          categoria: 'Comissão NSA',
+          tipo_interno: 'comissao_nsa',
+          passagem_id: id,
+          status: 'paga'
+        });
+      }
+    }
+    toast(`✅ ${ids.length} repasse(s) confirmado(s)!`, 'success');
+    navigate('passagens');
+  } catch (err) {
+    toast('Erro ao confirmar repasses: ' + err.message, 'error');
+  }
+};
+
+// ── Cancelar em Lote ──────────────────────────────────────
+window.cancelarPassagensLote = async function() {
+  const ids = getIdsSelecionados();
+  if (ids.length === 0) { toast('Selecione ao menos uma passagem', 'warning'); return; }
+
+  if (!confirm(`Cancelar ${ids.length} passagem(ns)? Esta ação não pode ser desfeita.`)) return;
+
+  try {
+    for (const id of ids) {
+      const { data: p } = await sb.from('passagens_onibus').select('conta_repasse_id').eq('id', id).single();
+      await sb.from('passagens_onibus').update({ status: 'cancelada' }).eq('id', id);
+      if (p?.conta_repasse_id) {
+        await sb.from('contas').update({ status: 'cancelada' }).eq('id', p.conta_repasse_id);
+      }
+    }
+    toast(`🚫 ${ids.length} passagem(ns) cancelada(s)!`, 'info');
+    navigate('passagens');
+  } catch (err) {
+    toast('Erro ao cancelar: ' + err.message, 'error');
+  }
+};
+
+window.abrirModalPassagem = async function() {
+  const { data: comissoes } = await sb.from('config_comissoes').select('forma_pagamento, percentual_comissao');
+
+  openModal('🚌 Nova Venda de Passagem NSA', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="divider-text">Dados da Passagem</div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Origem *</label><input type="text" class="input" id="pas-origem" placeholder="Ex: Asunción" /></div>
+        <div class="field"><label>Destino *</label><input type="text" class="input" id="pas-destino" placeholder="Ex: Ciudad del Este" /></div>
+      </div>
+      <div class="field">
+        <label>Valor Total (₲) *</label>
+        <input type="number" class="input" id="pas-valor-total" placeholder="0" step="500" min="0" oninput="atualizarBRLPassagem()" />
+      </div>
+      <div class="field">
+        <label>Forma de Pagamento</label>
+        <select class="input" id="pas-pagamento" onchange="atualizarBRLPassagem()">
+          ${(comissoes||[]).map(c => `
+            <option value="${c.forma_pagamento}">${labelPagamento(c.forma_pagamento)}</option>
+          `).join('')}
+        </select>
+      </div>
+      <!-- Exibição do BRL -->
+      <div id="pas-total-brl" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:4px">
+        🇧🇷 ≈ <span id="pas-total-brl-value">R$ 0,00</span>
+      </div>
+      <div class="field">
+        <label>Observações</label>
+        <textarea class="input" id="pas-obs" rows="2" placeholder="Informações adicionais..."></textarea>
+      </div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarPassagem()">
+        🎫 Registrar Venda de Passagem
+      </button>
+    </div>
+  `, 'modal--lg');
+
+  // Define a função global para atualizar o BRL (e também a comissão, se quiser)
+  window.atualizarBRLPassagem = function() {
+    const total = parseFloat(document.getElementById('pas-valor-total')?.value || 0);
+    const pagamento = document.getElementById('pas-pagamento')?.value;
+    const isPix = pagamento === 'pix' || pagamento === 'pix_brl';
+
+    const brlDiv = document.getElementById('pas-total-brl');
+    const brlVal = document.getElementById('pas-total-brl-value');
+    if (brlDiv && brlVal) {
+      brlDiv.style.display = isPix ? 'block' : 'none';
+      if (isPix) {
+        const valorBRL = gsToBRL(total);
+        brlVal.textContent = formatBRL(valorBRL);
+      }
+    }
+  };
+
+  // Inicializa o estado
+  setTimeout(atualizarBRLPassagem, 100);
+};
+
+
+
+// ── Filtro por status ─────────────────────────────────────
+window.filtrarPassagemStatus = function(chip, filtro) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  chip.classList.add('active');
+  document.querySelectorAll('#tabela-passagens tbody tr').forEach(tr => {
+    if (!filtro) { tr.style.display = ''; return; }
+    const status  = tr.dataset.status || '';
+    const repasse = tr.dataset.repasse === 'false';
+    if (filtro === 'repasse_pendente') {
+      tr.style.display = (status !== 'cancelada' && repasse) ? '' : 'none';
+    } else {
+      tr.style.display = status === filtro ? '' : 'none';
+    }
+  });
+};
+
+
+// ── Toggle ida/volta ──────────────────────────────────────
+window.toggleIdaVolta = function() {
+  const tipo = document.getElementById('pas-tipo-trecho')?.value;
+  const campos = document.getElementById('campos-volta');
+  if (campos) campos.style.display = tipo === 'ida_volta' ? 'block' : 'none';
+};
+
+// ── Toggle Pix BRL na passagem ────────────────────────────
+window.togglePixBrlPassagem = function() {
+  const pag = document.getElementById('pas-pagamento')?.value;
+  const campo = document.getElementById('campo-brl-passagem');
+  if (campo) campo.style.display = pag === 'pix_brl' ? 'block' : 'none';
+};
+
+window.mostrarEquivBRLPassagem = function() {
+  const brl = parseFloat(document.getElementById('pas-valor-brl')?.value || 0);
+  const gs  = brlToGs(brl);
+  const el  = document.getElementById('equiv-brl-passagem');
+  if (el) el.textContent = `≈ ${formatMoney(gs)} (cotação ₲${APP_CONFIG.cotacaoBRL.toLocaleString('es-PY')}/R$)`;
+};
+
+// ── Calcular preview financeiro ───────────────────────────
+window.calcularComissaoPassagem = function() {
+  const total = Math.round(parseFloat(document.getElementById('pas-valor-total')?.value || 0));
+  const perc  = parseFloat(document.getElementById('pas-perc-comissao')?.value || 0);
+  const preview = document.getElementById('preview-financeiro-passagem');
+
+  if (!total || total <= 0) { if (preview) preview.style.display = 'none'; return; }
+
+  const comissao = Math.round(total * perc / 100);
+  const repasse  = total - comissao;
+
+  const elTotal    = document.getElementById('prev-total');
+  const elRepasse  = document.getElementById('prev-repasse');
+  const elComissao = document.getElementById('prev-comissao');
+
+  if (elTotal)    elTotal.textContent    = formatMoney(total);
+  if (elRepasse)  elRepasse.textContent  = formatMoney(repasse);
+  if (elComissao) elComissao.textContent = formatMoney(comissao);
+  if (preview)    preview.style.display  = 'block';
+};
+
+// ── Salvar passagem ───────────────────────────────────────
+window.salvarPassagem = async function() {
+  const origem = document.getElementById('pas-origem')?.value.trim();
+  const destino = document.getElementById('pas-destino')?.value.trim();
+  const valorTotal = Math.round(parseFloat(document.getElementById('pas-valor-total')?.value || 0));
+  const formaPagamento = document.getElementById('pas-pagamento')?.value;
+
+  if (!origem || !destino) { toast('Informe origem e destino', 'warning'); return; }
+  if (!valorTotal) { toast('Informe o valor total', 'warning'); return; }
+
+  // Busca a comissão configurada para a forma de pagamento escolhida
+  const { data: config } = await sb.from('config_comissoes')
+    .select('percentual_comissao')
+    .eq('forma_pagamento', formaPagamento)
+    .single();
+
+  const percComissao = config?.percentual_comissao || 0;
+  const valorComissao = Math.round(valorTotal * percComissao / 100);
+  const valorRepasse = valorTotal - valorComissao;
+
+  const payload = {
+    origem,
+    destino,
+    valor_total: valorTotal,
+    valor_repasse: valorRepasse,
+    valor_comissao: valorComissao,
+    percentual_comissao: percComissao,
+    forma_pagamento: formaPagamento,
+    status: 'vendida',
+    repasse_confirmado: false,
+    observacoes: document.getElementById('pas-obs')?.value || null,
+    // Campos não mais usados, mas mantidos para compatibilidade
+    cliente_nome: null,
+    numero_passagem: null,
+    data_viagem: null,
+    horario_saida: null,
+    tipo_trecho: 'ida',
+    numero_assento: null,
+  };
+
+  const { data: passagem, error } = await sb.from('passagens_onibus').insert(payload).select().single();
+  if (error) { toast('Erro ao registrar: ' + error.message, 'error'); return; }
+
+  // Criar conta a pagar (repasse NSA)
+  const vencRepasse = new Date();
+  vencRepasse.setDate(vencRepasse.getDate() + 7);
+  await sb.from('contas').insert({
+    descricao: `Repasse NSA — Passagem #${passagem.numero_venda}`,
+    tipo: 'despesa',
+    valor: valorRepasse,
+    vencimento: vencRepasse.toISOString().split('T')[0],
+    categoria: 'Repasse NSA',
+    tipo_interno: 'repasse_nsa',
+    passagem_id: passagem.id,
+    status: 'pendente'
+  });
+
+  toast('✅ Passagem registrada!', 'success', 4000);
+  closeModal();
+  navigate('passagens');
+};
+
+window.abrirConfigComissoes = async function() {
+  const { data: comissoes } = await sb.from('config_comissoes').select('*').order('forma_pagamento');
+
+  openModal('⚙️ Configurar Comissões por Forma de Pagamento', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="font-size:var(--t-sm);color:var(--c-text-3)">Ajuste o percentual de comissão para cada forma de pagamento. O valor é aplicado sobre o total da passagem.</div>
+      ${(comissoes||[]).map(c => `
+        <div style="display:flex;align-items:center;gap:var(--sp-3);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)">
+          <span style="flex:1;font-weight:600">${labelPagamento(c.forma_pagamento)}</span>
+          <input type="number" class="input" id="comissao-${c.id}" value="${c.percentual_comissao}" step="0.5" min="0" max="100" style="width:100px" />
+          <span>%</span>
+        </div>
+      `).join('')}
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarConfigComissoes()">💾 Salvar Configurações</button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.salvarConfigComissoes = async function() {
+  const inputs = document.querySelectorAll('[id^="comissao-"]');
+  const updates = [];
+  inputs.forEach(input => {
+    const id = input.id.replace('comissao-', '');
+    const valor = parseFloat(input.value);
+    if (!isNaN(valor) && valor >= 0) {
+      updates.push({ id, percentual_comissao: valor });
+    }
+  });
+  for (const u of updates) {
+    await sb.from('config_comissoes').update({ percentual_comissao: u.percentual_comissao }).eq('id', u.id);
+  }
+  toast('Configurações salvas!', 'success');
+  closeModal();
+  navigate('passagens');
+};
+
+window.salvarConfigComissoes = async function() {
+  const inputs = document.querySelectorAll('[id^="comissao-"]');
+  const updates = [];
+  inputs.forEach(input => {
+    const id = input.id.replace('comissao-', '');
+    const valor = parseFloat(input.value);
+    if (!isNaN(valor) && valor >= 0) {
+      updates.push({ id, percentual_comissao: valor });
+    }
+  });
+  for (const u of updates) {
+    await sb.from('config_comissoes').update({ percentual_comissao: u.percentual_comissao }).eq('id', u.id);
+  }
+  toast('Configurações salvas!', 'success');
+  closeModal();
+  navigate('passagens');
+};
+
+// ── Confirmar Repasse NSA ─────────────────────────────────
+window.confirmarRepasseNSA = function(id, clienteNome, valorRepasse, valorComissao) {
+  openModal('Confirmar Repasse NSA', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">
+          Passageiro: <strong>${clienteNome}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span style="color:var(--c-text-3)">Repasse para NSA</span>
+          <span style="font-weight:700;color:var(--c-danger)">${formatMoney(valorRepasse)}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="font-weight:600">Comissão que fica na loja</span>
+          <span style="font-size:var(--t-xl);font-weight:800;color:var(--c-success)">${formatMoney(valorComissao)}</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Data do Repasse</label>
+        <input type="date" class="input" id="repasse-data" value="${new Date().toISOString().split('T')[0]}" />
+      </div>
+      <div class="field">
+        <label>Forma de Pagamento do Repasse</label>
+        <select class="input" id="repasse-forma">
+          ${['dinheiro','pix','transferencia','cheque'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label>Observações</label>
+        <input type="text" class="input" id="repasse-obs" placeholder="Comprovante, referência..." />
+      </div>
+
+      <div style="background:var(--c-success-s);border:1px solid var(--c-success);border-radius:var(--r-md);padding:var(--sp-3);font-size:var(--t-sm);color:var(--c-success)">
+        ✅ Ao confirmar, a comissão <strong>${formatMoney(valorComissao)}</strong> será registrada como lucro realizado
+        e a conta de repasse será marcada como paga.
+      </div>
+
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center"
+              onclick="executarConfirmacaoRepasse('${id}', ${valorRepasse}, ${valorComissao})">
+        ✅ Confirmar Pagamento do Repasse
+      </button>
+    </div>
+  `);
+};
+
+window.executarConfirmacaoRepasse = async function(passagemId, valorRepasse, valorComissao) {
+  const dataRepasse = document.getElementById('repasse-data')?.value;
+  const formaRepasse = document.getElementById('repasse-forma')?.value;
+  const obsRepasse   = document.getElementById('repasse-obs')?.value;
+
+  // 1. Marca a passagem como repasse confirmado
+  const { error: e1 } = await sb.from('passagens_onibus').update({
+    repasse_confirmado:    true,
+    repasse_confirmado_em: new Date().toISOString(),
+  }).eq('id', passagemId);
+  if (e1) { toast('Erro: ' + e1.message, 'error'); return; }
+
+  // 2. Busca a conta de repasse vinculada e marca como paga
+  const { data: passagem } = await sb.from('passagens_onibus')
+    .select('conta_repasse_id, numero_venda').eq('id', passagemId).single();
+
+  if (passagem?.conta_repasse_id) {
+    await sb.from('contas').update({
+      pago_em:         dataRepasse,
+      valor_pago:      valorRepasse,
+      forma_pagamento: formaRepasse,
+      status:          'paga',
+      observacoes:     obsRepasse || null,
+    }).eq('id', passagem.conta_repasse_id);
+  }
+
+  // 3. Registra a comissão como receita confirmada
+  await sb.from('contas').insert({
+    descricao:    `Comissão NSA — Passagem #${passagem?.numero_venda || '?'}`,
+    tipo:         'receita',
+    valor:        valorComissao,
+    vencimento:   dataRepasse,
+    pago_em:      dataRepasse,
+    valor_pago:   valorComissao,
+    categoria:    'Comissão NSA',
+    tipo_interno: 'comissao_nsa',
+    passagem_id:  passagemId,
+    status:       'paga',
+  });
+
+  toast('🎉 Repasse confirmado! Comissão registrada como receita.', 'success', 5000);
+  closeModal();
+  navigate('passagens');
+};
+
+// ── Ver detalhe da passagem ───────────────────────────────
+window.verDetalhePassagem = async function(id) {
+  const { data: p } = await sb.from('passagens_onibus').select('*').eq('id', id).single();
+  if (!p) return;
+
+  openModal(`Passagem #${p.numero_venda} — ${p.numero_passagem}`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4);font-size:var(--t-sm)">
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-4)">
+        <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+          <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3);font-weight:600;text-transform:uppercase;letter-spacing:.06em">Passageiro</div>
+          <div style="font-weight:700;font-size:var(--t-md)">${p.cliente_nome}</div>
+          ${p.cliente_cpf ? `<div style="color:var(--c-text-3)">${p.cliente_cpf}</div>` : ''}
+          ${p.cliente_telefone ? `<div style="color:var(--c-text-3)">${p.cliente_telefone}</div>` : ''}
+        </div>
+        <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+          <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3);font-weight:600;text-transform:uppercase;letter-spacing:.06em">Passagem</div>
+          <div style="font-weight:700;color:var(--c-primary);font-family:var(--font-mono)">${p.numero_passagem}</div>
+          <div style="margin-top:4px">${badgeStatus(p.status)}</div>
+        </div>
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3);font-weight:600;text-transform:uppercase;letter-spacing:.06em">Trajeto</div>
+        <div style="font-size:var(--t-lg);font-weight:700">${p.origem} → ${p.destino}</div>
+        <div style="display:flex;gap:var(--sp-6);margin-top:var(--sp-3)">
+          <div>
+            <div style="color:var(--c-text-3);font-size:var(--t-xs)">Ida</div>
+            <div style="font-weight:600">${formatDate(p.data_viagem)} às ${p.horario_saida?.slice(0,5)}</div>
+            <div style="color:var(--c-text-3)">Assento: <strong>${p.numero_assento||'—'}</strong></div>
+          </div>
+          ${p.tipo_trecho === 'ida_volta' ? `
+          <div style="border-left:1px solid var(--c-border);padding-left:var(--sp-6)">
+            <div style="color:var(--c-text-3);font-size:var(--t-xs)">Volta</div>
+            <div style="font-weight:600">${formatDate(p.data_retorno)||'—'} às ${p.horario_retorno?.slice(0,5)||'—'}</div>
+            <div style="color:var(--c-text-3)">Assento: <strong>${p.numero_assento_volta||'—'}</strong></div>
+          </div>` : ''}
+        </div>
+        <div style="margin-top:var(--sp-3)">
+          <span class="badge ${p.tipo_trecho==='ida_volta'?'badge--accent':'badge--info'}">
+            ${p.tipo_trecho==='ida_volta'?'↔ Ida e Volta':'→ Somente Ida'}
+          </span>
+        </div>
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3);font-weight:600;text-transform:uppercase;letter-spacing:.06em">Financeiro</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-3);text-align:center">
+          <div>
+            <div style="font-size:var(--t-xs);color:var(--c-text-3)">Valor Total</div>
+            <div style="font-weight:700;font-size:var(--t-lg)">${formatMoney(p.valor_total)}</div>
+          </div>
+          <div>
+            <div style="font-size:var(--t-xs);color:var(--c-text-3)">Repasse NSA</div>
+            <div style="font-weight:700;font-size:var(--t-lg);color:var(--c-danger)">${formatMoney(p.valor_repasse)}</div>
+          </div>
+          <div>
+            <div style="font-size:var(--t-xs);color:var(--c-text-3)">Comissão (${p.percentual_comissao||'—'}%)</div>
+            <div style="font-weight:700;font-size:var(--t-lg);color:${p.repasse_confirmado?'var(--c-success)':'var(--c-warning)'}">${formatMoney(p.valor_comissao)}</div>
+          </div>
+        </div>
+        <div style="margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--c-border);display:flex;justify-content:space-between">
+          <span>Pagamento: <span class="badge badge--primary">${labelPagamento(p.forma_pagamento)}</span></span>
+          <span>Repasse: ${p.repasse_confirmado
+            ? `<span class="badge badge--success">✓ Confirmado em ${formatDate(p.repasse_confirmado_em)}</span>`
+            : '<span class="badge badge--warning">⏳ Pendente</span>'
+          }</span>
+        </div>
+        ${p.valor_brl ? `<div style="margin-top:var(--sp-2);font-size:var(--t-xs);color:var(--c-text-3)">🇧🇷 Pago em R$ ${p.valor_brl.toFixed(2)} @ ₲${p.cotacao_brl?.toLocaleString('es-PY')}/R$</div>` : ''}
+      </div>
+
+      ${p.observacoes ? `
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-2)">Observações</div>
+        <div>${p.observacoes}</div>
+      </div>` : ''}
+
+      <div style="display:flex;gap:var(--sp-3)">
+        ${p.status === 'vendida' && !p.repasse_confirmado
+          ? `<button class="btn btn--success" style="flex:1;justify-content:center"
+                     onclick="closeModal();confirmarRepasseNSA('${p.id}','${p.cliente_nome.replace(/'/g,"\'")}',${p.valor_repasse},${p.valor_comissao})">
+               ⏳ Confirmar Repasse
+             </button>`
+          : ''}
+        ${p.status === 'vendida'
+          ? `<button class="btn btn--ghost" style="justify-content:center"
+                     onclick="marcarEmbarcada('${p.id}')">✈️ Marcar como Embarcado</button>` : ''}
+      </div>
+    </div>
+  `, 'modal--lg');
+};
+
+// ── Marcar como embarcado ─────────────────────────────────
+window.marcarEmbarcada = async function(id) {
+  const { error } = await sb.from('passagens_onibus').update({ status: 'embarcada' }).eq('id', id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Passagem marcada como embarcada!', 'success');
+  closeModal();
+  navigate('passagens');
+};
+
+// ── Cancelar passagem ─────────────────────────────────────
+window.cancelarPassagem = async function(id) {
+  if (!confirm('Cancelar esta passagem? Esta ação não pode ser desfeita.')) return;
+  const { error } = await sb.from('passagens_onibus').update({ status: 'cancelada' }).eq('id', id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  // Cancela também a conta de repasse vinculada
+  const { data: p } = await sb.from('passagens_onibus').select('conta_repasse_id').eq('id', id).single();
+  if (p?.conta_repasse_id) {
+    await sb.from('contas').update({ status: 'cancelada' }).eq('id', p.conta_repasse_id);
+  }
+  toast('Passagem cancelada.', 'info');
+  navigate('passagens');
+};
+
+// ── Configurar comissão padrão ────────────────────────────
+window.abrirConfigPassagens = async function() {
+  const { data: config } = await sb.from('config_passagens').select('*').eq('ativo', true).single();
+  openModal('⚙️ Configuração de Comissão NSA', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4);font-size:var(--t-sm);color:var(--c-text-3);line-height:1.7">
+        O percentual de comissão é o quanto <strong style="color:var(--c-success)">fica para a sua loja</strong>.
+        O restante é o repasse que você deve fazer para a NSA.
+        Por exemplo: se a comissão é 10% e a passagem vale ₲100.000,
+        você repassa ₲90.000 para a NSA e fica com ₲10.000 de lucro.
+      </div>
+      <div class="field">
+        <label>% de Comissão da Loja (padrão para novas vendas)</label>
+        <input type="number" class="input" id="cfg-perc"
+               value="${config?.percentual_comissao || 10}"
+               step="0.5" min="0" max="50" />
+      </div>
+      <div class="field">
+        <label>Nome da Empresa de Ônibus</label>
+        <input type="text" class="input" id="cfg-empresa" value="${config?.empresa_onibus || 'NSA'}" />
+      </div>
+      <div class="field">
+        <label>Observações</label>
+        <textarea class="input" id="cfg-obs" rows="2">${config?.observacoes || ''}</textarea>
+      </div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center"
+              onclick="salvarConfigPassagens('${config?.id || ''}')">
+        💾 Salvar Configuração
+      </button>
+    </div>
+  `);
+};
+
+window.salvarConfigPassagens = async function(id) {
+  const payload = {
+    percentual_comissao: parseFloat(document.getElementById('cfg-perc')?.value || 10),
+    empresa_onibus:      document.getElementById('cfg-empresa')?.value || 'NSA',
+    observacoes:         document.getElementById('cfg-obs')?.value || null,
+  };
+  const { error } = id
+    ? await sb.from('config_passagens').update(payload).eq('id', id)
+    : await sb.from('config_passagens').insert(payload);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Configuração salva!', 'success');
+  closeModal();
+};
+
+
+// ============================================================
+// ── MÓDULO: FILA DE PRODUÇÃO ─────────────────────────────
+// ============================================================
+// Arquitetura de estados:
+//   na_fila      → pedido registrado no PDV, aguardando operador iniciar
+//   imprimindo   → operador iniciou a impressão
+//   conferencia  → impressão terminou, aguardando conferência física
+//   concluido    → conferido e entregue (contadores e caixa atualizados)
+//   erro         → falha durante impressão, aguardando reprocessamento
+//   cancelado    → pedido cancelado
+// ============================================================
+
+// Intervalo de auto-refresh da fila (ms)
+const FILA_REFRESH_MS = 8000;
+let _filaRefreshTimer = null;
+
+async function renderFilaProducao(el) {
+  // Limpa timer anterior se existir
+  if (_filaRefreshTimer) { clearInterval(_filaRefreshTimer); _filaRefreshTimer = null; }
+
+  await loadImpressoras();
+
+  el.innerHTML = `
+    <div class="fila-layout">
+
+      <!-- Topbar da fila -->
+      <div class="fila-topbar">
+        <div class="live-dot" title="Atualização automática a cada ${FILA_REFRESH_MS/1000}s"></div>
+        <span style="font-size:var(--t-sm);font-weight:600">Fila de Produção</span>
+        <span style="font-size:var(--t-xs);color:var(--c-text-3)" id="fila-ultima-atualizacao"></span>
+
+        <div style="margin-left:auto;display:flex;gap:var(--sp-2);flex-wrap:wrap">
+          <!-- Filtro de status -->
+          <div class="chip-row" id="fila-filtros">
+            <span class="chip active" onclick="filtrarFila(this,'todos')">Todos</span>
+            <span class="chip" onclick="filtrarFila(this,'na_fila')">🟡 Na Fila</span>
+            <span class="chip" onclick="filtrarFila(this,'imprimindo')">🔵 Imprimindo</span>
+            <span class="chip" onclick="filtrarFila(this,'conferencia')">🟠 Conferência</span>
+            <span class="chip" onclick="filtrarFila(this,'concluido')">🟢 Concluídos</span>
+          </div>
+          <button class="btn btn--ghost btn--sm" onclick="refreshFila()" id="btn-refresh-fila">↻ Atualizar</button>
+        </div>
+      </div>
+
+      <!-- Colunas por impressora -->
+      <div class="fila-body" id="fila-body">
+        <div style="display:flex;align-items:center;justify-content:center;flex:1;color:var(--c-text-3)">
+          <div class="spinner"></div>
+        </div>
+      </div>
+
+    </div>
+  `;
+
+  // Carrega pedidos e renderiza
+  await refreshFila();
+
+  // Auto-refresh
+  _filaRefreshTimer = setInterval(async () => {
+    if (State.currentPage === 'fila') await refreshFila();
+    else { clearInterval(_filaRefreshTimer); _filaRefreshTimer = null; }
+  }, FILA_REFRESH_MS);
+}
+
+// ── Carrega e renderiza pedidos por impressora ─────────────
+window.refreshFila = async function() {
+  const btn = document.getElementById('btn-refresh-fila');
+  if (btn) btn.disabled = true;
+
+  // Busca pedidos ativos (exclui cancelados muito antigos)
+  const { data: pedidos, error } = await sb
+    .from('pedidos_copia')
+    .select('*, impressoras(nome, status, colorida, tipo)')
+    .in('status', ['na_fila', 'imprimindo', 'conferencia', 'concluido', 'erro'])
+    .order('created_at', { ascending: true })
+    .limit(200);
+
+  if (error) { toast('Erro ao carregar fila: ' + error.message, 'error'); return; }
+
+  const filaBody = document.getElementById('fila-body');
+  if (!filaBody) return;
+
+  // Agrupa por impressora
+  const porImpressora = {};
+
+  // Inicializa com todas as impressoras cadastradas (mesmo sem pedidos)
+  State.impressoras.forEach(imp => { porImpressora[imp.id] = { impressora: imp, pedidos: [] }; });
+
+  // Distribui pedidos
+  (pedidos || []).forEach(p => {
+    const key = p.impressora_id || '__sem_impressora__';
+    if (!porImpressora[key]) {
+      porImpressora[key] = { impressora: p.impressoras || { nome: 'Impressora removida', status: 'offline' }, pedidos: [] };
+    }
+    porImpressora[key].pedidos.push(p);
+  });
+
+  // Filtro ativo
+  const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
+
+  // Renderiza colunas
+  filaBody.innerHTML = Object.values(porImpressora).map(({ impressora, pedidos: peds }) => {
+    const pedidosFiltrados = filtroAtivo === 'todos'
+      ? peds
+      : peds.filter(p => p.status === filtroAtivo);
+
+    const counts = {
+      na_fila:     peds.filter(p => p.status === 'na_fila').length,
+      imprimindo:  peds.filter(p => p.status === 'imprimindo').length,
+      conferencia: peds.filter(p => p.status === 'conferencia').length,
+      erro:        peds.filter(p => p.status === 'erro').length,
+    };
+    const totalAtivos = counts.na_fila + counts.imprimindo + counts.conferencia + counts.erro;
+
+    return `
+      <div class="fila-coluna">
+        <div class="fila-coluna-header">
+          <div class="printer-status-dot ${impressora.status || 'offline'}"></div>
+          <div class="fila-coluna-nome">${impressora.nome}</div>
+          ${totalAtivos > 0 ? `<span class="badge badge--warning">${totalAtivos} ativo${totalAtivos>1?'s':''}</span>` : ''}
+          ${counts.imprimindo > 0 ? `<span class="badge badge--primary">⚡ Imprimindo</span>` : ''}
+        </div>
+        <div class="fila-coluna-body">
+          ${pedidosFiltrados.length === 0
+            ? `<div class="fila-empty">
+                <div class="fila-empty-icon">✅</div>
+                <div class="fila-empty-text">${filtroAtivo === 'todos' ? 'Fila livre' : 'Nenhum pedido'}</div>
+               </div>`
+            : pedidosFiltrados.map(p => renderPedidoCard(p)).join('')
+          }
+        </div>
+      </div>
+    `;
+  }).join('') || `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">🖥️</div><div class="fila-empty-text">Nenhuma impressora cadastrada</div></div>`;
+
+  // Atualiza timestamp
+  const tsEl = document.getElementById('fila-ultima-atualizacao');
+  if (tsEl) tsEl.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })}`;
+
+  if (btn) btn.disabled = false;
+};
+
+// ── Renderiza um card de pedido ───────────────────────────
+function renderPedidoCard(p) {
+  const folhasEsperadas = p.paginas_por_documento
+  ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+  : calcularFolhas(p.quantidade, p.frente_verso);
+  const clienteLabel    = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+
+  const acoes = {
+    na_fila:     `<button class="btn btn--primary btn--sm" onclick="acaoFila('iniciar','${p.id}')">▶ Iniciar Impressão</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>`,
+
+    imprimindo:  `<button class="btn btn--accent btn--sm" onclick="acaoFila('conferir','${p.id}')">📋 Concluiu? Conferir</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('erro','${p.id}')">⚠ Erro</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('pausar','${p.id}')">⏸ Pausar</button>`,
+
+    conferencia: `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar Entrega</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reimprimir</button>`,
+
+    erro:        `<button class="btn btn--warning btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reprocessar</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕ Cancelar</button>`,
+
+    concluido:   `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
+  };
+
+  return `
+    <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}">
+      <div class="pedido-card-header">
+        <span class="pedido-card-num">#${p.numero_pedido}</span>
+        <span class="pedido-card-cliente">${clienteLabel}</span>
+        <span class="status-fila status-fila--${p.status}">${labelStatusFila(p.status)}</span>
+      </div>
+      <div class="pedido-card-body">
+        <div><strong>${p.quantidade}</strong> cópias · ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
+        <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
+        ${p.observacoes ? `<div style="color:var(--c-text-3);font-style:italic">${p.observacoes}</div>` : ''}
+        <div style="color:var(--c-text-3);font-size:10px;margin-top:2px">
+          Recebido: ${formatDateTime(p.created_at)}
+          ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
+        </div>
+        <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
+      </div>
+      <div class="pedido-card-footer">
+        ${acoes[p.status] || ''}
+        <span class="pedido-card-valor">${formatMoney(p.total)}</span>
+      </div>
+      ${p.status === 'imprimindo' && p.folhas_usadas !== null ? `
+      <div style="font-size:10px;color:var(--c-text-3)">
+        ⏳ ${p.folhas_usadas || 0} / ${p.total_folhas_esperadas} folhas
+      </div>
+    ` : ''}
+    </div>
+  `;
+}
+
+// ── Calcula folhas esperadas ──────────────────────────────
+function calcularFolhas(quantidade, frenteVerso) {
+  // Frente/verso = 2 páginas por folha
+  return frenteVerso ? Math.ceil(quantidade / 2) : quantidade;
+}
+
+// ── Labels de status ──────────────────────────────────────
+function labelStatusFila(status) {
+  const m = {
+    na_fila:     '🟡 Na Fila',
+    imprimindo:  '🔵 Imprimindo',
+    conferencia: '🟠 Conferência',
+    concluido:   '🟢 Concluído',
+    erro:        '🔴 Erro',
+    cancelado:   '⚫ Cancelado',
+  };
+  return m[status] || status;
+}
+
+
+// ── Ações simples de estado ───────────────────────────────
+window.acaoFila = async function(acao, pedidoId) {
+  const transicoes = {
+    iniciar:    { status: 'imprimindo',  msg: '▶ Impressão iniciada!' },
+    pausar:     { status: 'na_fila',     msg: '⏸ Pedido pausado — voltou para a fila.' },
+    conferir:   { status: 'conferencia', msg: '📋 Pedido em conferência.' },
+    erro:       { status: 'erro',        msg: '⚠ Erro registrado.' },
+  };
+
+  if (acao === 'cancelar') {
+    if (!confirm('Cancelar este pedido? O cliente deverá ser informado.')) return;
+    await sb.from('pedidos_copia').update({ status: 'cancelado' }).eq('id', pedidoId);
+    toast('Pedido cancelado.', 'info');
+    await refreshFila();
+    return;
+  }
+
+  if (acao === 'reimprimir') {
+    await sb.from('pedidos_copia').update({ status: 'na_fila' }).eq('id', pedidoId);
+    toast('↺ Pedido reinserido na fila.', 'info');
+    await refreshFila();
+    return;
+  }
+
+  // --- LÓGICA ESPECIAL PARA 'iniciar' ---
+  if (acao === 'iniciar') {
+    // Busca os dados do pedido (incluindo IP da impressora)
+    const { data: pedido, error: errPed } = await sb
+      .from('pedidos_copia')
+      .select('impressoras(ip_rede), quantidade, frente_verso')
+      .eq('id', pedidoId)
+      .single();
+
+    if (errPed || !pedido) {
+      toast('Erro ao buscar dados do pedido.', 'error');
+      return;
+    }
+
+    const ip = pedido.impressoras?.ip_rede;
+    if (!ip) {
+      toast('Impressora não tem IP cadastrado. Inicie manualmente.', 'warning');
+      // Mesmo sem IP, podemos iniciar a impressão (sem contador automático)
+      const { error } = await sb.from('pedidos_copia').update({ status: 'imprimindo' }).eq('id', pedidoId);
+      if (error) { toast('Erro: ' + error.message, 'error'); return; }
+      toast('▶ Impressão iniciada (sem monitoramento automático).', 'success');
+      await refreshFila();
+      return;
+    }
+
+    try {
+      // 1. Consulta o proxy SNMP
+      const proxyURL = 'http://localhost:3333'; // ajuste se necessário
+      const resp = await fetch(`${proxyURL}/api/contador/${ip}`);
+      if (!resp.ok) throw new Error('Falha ao ler contador da impressora');
+      const data = await resp.json();
+      if (data.contador === undefined) throw new Error('Contador não retornado');
+
+      // 2. Calcula as folhas esperadas
+      const paginasPorDoc = pedido.paginas_por_documento || 1;
+      const totalPaginas = pedido.quantidade * paginasPorDoc;
+      const folhasEsperadas = Math.ceil(totalPaginas / (pedido.frente_verso ? 2 : 1));
+
+      // 3. Atualiza o pedido com contador inicial e status
+      await sb.from('pedidos_copia').update({
+        contador_inicial: data.contador,
+        total_folhas_esperadas: folhasEsperadas,
+        status: 'imprimindo'
+      }).eq('id', pedidoId);
+
+      toast('▶ Impressão iniciada com monitoramento SNMP!', 'success');
+      await refreshFila();
+      return;
+    } catch (err) {
+      console.error('Erro no SNMP:', err);
+      toast('Erro ao ler contador, iniciando sem monitoramento: ' + err.message, 'warning');
+      // Fallback: inicia sem contador automático
+      await sb.from('pedidos_copia').update({ status: 'imprimindo' }).eq('id', pedidoId);
+      await refreshFila();
+      return;
+    }
+  }
+
+  // --- Demais ações (pausar, conferir, erro) ---
+  const t = transicoes[acao];
+  if (!t) return;
+
+  const { error } = await sb.from('pedidos_copia').update({ status: t.status }).eq('id', pedidoId);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast(t.msg, 'success');
+  await refreshFila();
+};
+
+// ── Modal de Conferência e Entrega ────────────────────────
+window.abrirModalConferencia = async function(pedidoId) {
+  const { data: p } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
+  if (!p) return;
+
+  const paginasPorDoc = p.paginas_por_documento || 1;
+  const totalPaginas = p.quantidade * paginasPorDoc;
+  const folhasEsperadas = Math.ceil(totalPaginas / (p.frente_verso ? 2 : 1));
+  const clienteLabel     = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+
+  openModal('✅ Conferência e Entrega', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+
+      <!-- Resumo do pedido -->
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:var(--sp-3)">Pedido #${p.numero_pedido}</div>
+        <div style="font-size:var(--t-lg);font-weight:700;margin-bottom:var(--sp-1)">${clienteLabel}</div>
+        <div style="color:var(--c-text-2)">${p.quantidade} cópias · ${labelTipoCopia(p.tipo)}${p.frente_verso?' · Frente/Verso':''}</div>
+      </div>
+
+      <!-- Stats esperado vs real -->
+      <div class="conferencia-grid">
+        <div class="conf-stat">
+          <div class="conf-stat-val" style="color:var(--c-primary)">${p.quantidade}</div>
+          <div class="conf-stat-label">Cópias solicitadas</div>
+        </div>
+        <div class="conf-stat">
+          <div class="conf-stat-val" style="color:var(--c-accent)">${folhasEsperadas}</div>
+          <div class="conf-stat-label">Folhas esperadas</div>
+        </div>
+      </div>
+
+      <!-- Conferência real -->
+      <div style="background:var(--c-warning-s);border:1.5px solid var(--c-warning);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);font-weight:600;color:var(--c-warning);margin-bottom:var(--sp-3)">
+          ⚠ Confira antes de entregar
+        </div>
+        <div class="form-row form-row--2">
+          <div class="field">
+            <label>Cópias realmente impressas</label>
+            <input type="number" class="input" id="conf-qtd-real"
+                   value="${p.quantidade}" min="0" max="${p.quantidade * 2}"
+                   oninput="calcularFolhasConferencia(${p.frente_verso?1:0})" />
+          </div>
+          <div class="field">
+            <label>Folhas usadas (real)</label>
+            <input type="number" class="input" id="conf-folhas-real"
+                   value="${folhasEsperadas}" min="0" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Resultado da conferência -->
+      <div>
+        <label style="font-size:var(--t-xs);font-weight:600;color:var(--c-text-2);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:var(--sp-2)">
+          Resultado da Conferência
+        </label>
+        <div style="display:flex;flex-direction:column;gap:var(--sp-2)">
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:var(--sp-3);background:var(--c-success-s);border:1.5px solid var(--c-success);border-radius:var(--r-md)">
+            <input type="radio" name="conf-resultado" value="ok" checked />
+            <div>
+              <div style="font-weight:600;color:var(--c-success)">✅ Tudo certo — entregar ao cliente</div>
+              <div style="font-size:var(--t-xs);color:var(--c-text-3)">Quantidade e qualidade conferidas</div>
+            </div>
+          </label>
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:var(--sp-3);background:var(--c-danger-s);border:1.5px solid var(--c-border);border-radius:var(--r-md)">
+            <input type="radio" name="conf-resultado" value="parcial" />
+            <div>
+              <div style="font-weight:600;color:var(--c-warning)">↺ Precisa reimprimir parte</div>
+              <div style="font-size:var(--t-xs);color:var(--c-text-3)">Informe quantas precisam ser refeitas</div>
+            </div>
+          </label>
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:var(--sp-3);background:var(--c-danger-s);border:1.5px solid var(--c-border);border-radius:var(--r-md)">
+            <input type="radio" name="conf-resultado" value="refazer" />
+            <div>
+              <div style="font-weight:600;color:var(--c-danger)">🔴 Refazer tudo</div>
+              <div style="font-size:var(--t-xs);color:var(--c-text-3)">Todo o lote saiu com defeito</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Quantidade a reimprimir (se parcial)</label>
+        <input type="number" class="input" id="conf-qtd-reimp" value="0" min="0" placeholder="0 = nenhuma" />
+      </div>
+
+      <div class="field">
+        <label>Observações de qualidade</label>
+        <textarea class="input" id="conf-obs" rows="2" placeholder="Mancha, papel preso, cor falhando..."></textarea>
+      </div>
+
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center"
+              onclick="confirmarConferencia('${pedidoId}', ${p.quantidade}, ${folhasEsperadas}, '${p.impressora_id}', ${p.tipo.startsWith('colorida')||p.tipo.startsWith('foto')||p.tipo==='a3_colorida'?'true':'false'})">
+        ✅ Confirmar e Finalizar Pedido
+      </button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.calcularFolhasConferencia = function(frenteVerso) {
+  const qtd = parseInt(document.getElementById('conf-qtd-real')?.value || 0);
+  const folhas = frenteVerso ? Math.ceil(qtd / 2) : qtd;
+  const el = document.getElementById('conf-folhas-real');
+  if (el) el.value = folhas;
+};
+
+// ── Confirmar conferência e finalizar pedido ──────────────
+window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEsperadas, impressoraId, isColor) {
+  const resultado    = document.querySelector('input[name="conf-resultado"]:checked')?.value || 'ok';
+  const qtdReal      = parseInt(document.getElementById('conf-qtd-real')?.value || qtdOriginal);
+  const folhasReal   = parseInt(document.getElementById('conf-folhas-real')?.value || folhasEsperadas);
+  const qtdReimp     = parseInt(document.getElementById('conf-qtd-reimp')?.value || 0);
+  const obs          = document.getElementById('conf-obs')?.value || null;
+
+  if (resultado === 'refazer') {
+    // Volta tudo para a fila
+    await sb.from('pedidos_copia').update({
+      status: 'na_fila',
+      observacoes: `[REIMPRESSÃO TOTAL] ${obs || ''}`.trim(),
+    }).eq('id', pedidoId);
+    toast('↺ Pedido voltou para a fila para reimpressão total.', 'warning');
+    closeModal();
+    await refreshFila();
+    return;
+  }
+
+  if (resultado === 'parcial' && qtdReimp > 0) {
+    // Cria um novo pedido de reimpressão para as páginas ruins
+    const { data: pedidoOriginal } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
+    if (pedidoOriginal) {
+      await sb.from('pedidos_copia').insert({
+        impressora_id:    pedidoOriginal.impressora_id,
+        tipo:             pedidoOriginal.tipo,
+        quantidade:       qtdReimp,
+        frente_verso:     pedidoOriginal.frente_verso,
+        preco_unitario:   0,          // reimpressão sem custo extra
+        total:            0,
+        status:           'na_fila',
+        cliente_nome_pdv: pedidoOriginal.cliente_nome_pdv,
+        observacoes:      `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
+        forma_pagamento:  pedidoOriginal.forma_pagamento,
+      });
+    }
+  }
+
+  // ★ FINALIZAÇÃO: aqui sim atualiza contadores e conclui
+  const campo      = isColor ? 'contador_cor_sessao' : 'contador_pb_sesssao';
+  const campoTotal = isColor ? 'contador_cor_total'  : 'contador_pb_total';
+  const imp        = State.impressoras.find(i => i.id === impressoraId);
+
+  if (imp) {
+    await sb.from('impressoras').update({
+      [campo]:      (imp[campo]      || 0) + folhasReal,
+      [campoTotal]: (imp[campoTotal] || 0) + folhasReal,
+    }).eq('id', impressoraId);
+    // Atualiza state local também
+    if (imp[campo]      !== undefined) imp[campo]      += folhasReal;
+    if (imp[campoTotal] !== undefined) imp[campoTotal] += folhasReal;
+  }
+
+  // Marca pedido como concluído
+  await sb.from('pedidos_copia').update({
+    status:        'concluido',
+    concluido_at:  new Date().toISOString(),
+    observacoes:   obs ? `[Conferência] ${obs}` : null,
+  }).eq('id', pedidoId);
+
+  toast('🎉 Pedido entregue e finalizado! Estoque de folhas atualizado.', 'success', 4000);
+  closeModal();
+  await refreshFila();
+};
+
+// ── Filtro de status ──────────────────────────────────────
+window.filtrarFila = function(chip, filtro) {
+  document.querySelectorAll('#fila-filtros .chip').forEach(c => {
+    c.classList.remove('active');
+    c.dataset.filtro = c.onclick?.toString()?.match(/'([^']+)'\)/)?.[1] || '';
+  });
+  chip.classList.add('active');
+  chip.dataset.filtro = filtro;
+  refreshFila();
+};
+
+window.navigate = navigate;
+async function renderUsuarios(el) {
+  // Carrega lista de usuários via RPC (função segura)
+  const { data: usuarios, error } = await sb.rpc('get_usuarios');
+  if (error) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-sub">Erro ao carregar usuários: ${error.message}</div></div>`;
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">Gerenciar Usuários</div>
+        <div class="section-sub">Crie, edite, bloqueie ou exclua funcionários</div>
+      </div>
+      <button class="btn btn--primary" onclick="abrirModalUsuario()">+ Novo Usuário</button>
+    </div>
+
+    <div class="card">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Status</th><th>Criado em</th><th>Ações</th></tr>
+          </thead>
+          <tbody>
+            ${(usuarios||[]).map(u => `
+              <tr>
+                <td><strong>${u.nome || '—'}</strong></td>
+                <td>${u.email || '—'}</td>
+                <td><span class="badge ${u.role === 'admin' ? 'badge--primary' : 'badge--info'}">${u.role === 'admin' ? 'Admin' : 'Funcionário'}</span></td>
+                <td>
+                  <span class="badge ${u.ativo ? 'badge--success' : 'badge--danger'}">
+                    ${u.ativo ? 'Ativo' : 'Bloqueado'}
+                  </span>
+                </td>
+                <td class="td-mono">${formatDate(u.created_at)}</td>
+                <td>
+                  <div style="display:flex;gap:4px;flex-wrap:wrap">
+                    <button class="btn btn--ghost btn--sm" onclick="editarUsuario('${u.id}')" title="Editar">✏️</button>
+                    ${u.ativo 
+                      ? `<button class="btn btn--ghost btn--sm" onclick="bloquearUsuario('${u.id}')" title="Bloquear">🔒</button>`
+                      : `<button class="btn btn--ghost btn--sm" onclick="desbloquearUsuario('${u.id}')" title="Desbloquear">🔓</button>`
+                    }
+                    ${u.role !== 'admin' ? `<button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="excluirUsuario('${u.id}')" title="Excluir">🗑️</button>` : ''}
+                  </div>
+                </td>
+              </tr>
+            `).join('') || '<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum usuário cadastrado</div></div></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+window.abrirModalUsuario = function(usuarioId) {
+  const isEdit = !!usuarioId;
+  let userData = {};
+
+  if (isEdit) {
+    // Buscar dados do usuário para edição
+    // Precisamos buscar da view ou da tabela profiles
+    sb.from('profiles').select('*, auth_users!inner(email)').eq('id', usuarioId).single()
+      .then(({ data }) => {
+        if (data) {
+          userData = data;
+          abrirModalUsuarioForm(isEdit, userData);
+        }
+      });
+  } else {
+    abrirModalUsuarioForm(isEdit, { nome: '', role: 'funcionario', email: '', senha: '' });
+  }
+};
+
+function abrirModalUsuarioForm(isEdit, data) {
+  openModal(
+    isEdit ? 'Editar Usuário' : 'Novo Usuário',
+    `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Nome *</label>
+        <input type="text" class="input" id="user-nome" value="${data.nome || ''}" placeholder="Nome completo" />
+      </div>
+      <div class="field">
+        <label>E-mail</label>
+        <input type="email" class="input" id="user-email" value="${data.email || ''}" placeholder="email@exemplo.com" ${isEdit ? 'disabled' : ''} />
+        ${isEdit ? '<div style="font-size:var(--t-xs);color:var(--c-text-3)">O e-mail não pode ser alterado</div>' : ''}
+      </div>
+      ${!isEdit ? `
+      <div class="field">
+        <label>Senha *</label>
+        <input type="password" class="input" id="user-password" placeholder="Mínimo 6 caracteres" />
+      </div>
+      ` : ''}
+      <div class="field">
+        <label>Perfil</label>
+        <select class="input" id="user-role">
+          <option value="funcionario" ${data.role === 'funcionario' ? 'selected' : ''}>Funcionário</option>
+          <option value="admin" ${data.role === 'admin' ? 'selected' : ''}>Administrador</option>
+        </select>
+      </div>
+      ${isEdit ? `
+      <div class="field">
+        <label>Status</label>
+        <select class="input" id="user-ativo">
+          <option value="true" ${data.ativo ? 'selected' : ''}>Ativo</option>
+          <option value="false" ${!data.ativo ? 'selected' : ''}>Bloqueado</option>
+        </select>
+      </div>
+      ` : ''}
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarUsuario('${isEdit ? data.id : ''}')">
+        💾 ${isEdit ? 'Salvar Alterações' : 'Criar Usuário'}
+      </button>
+    </div>
+    `,
+    'modal--lg'
+  );
+}
+window.abrirModalUsuario = abrirModalUsuario;
+
+window.salvarUsuario = async function(id) {
+  const nome = document.getElementById('user-nome').value.trim();
+  const role = document.getElementById('user-role').value;
+  const ativo = document.getElementById('user-ativo')?.value === 'true';
+
+  if (!nome) { toast('Nome é obrigatório', 'warning'); return; }
+
+  if (id) {
+    // Editar perfil existente
+    const { error } = await sb.from('profiles').update({ nome, role, ativo }).eq('id', id);
+    if (error) { toast('Erro: ' + error.message, 'error'); return; }
+    toast('Usuário atualizado!', 'success');
+    closeModal();
+    navigate('usuarios');
+    return;
+  }
+
+  // Criar novo usuário
+  const email = document.getElementById('user-email').value.trim();
+  const password = document.getElementById('user-password').value;
+  if (!email) { toast('E-mail é obrigatório', 'warning'); return; }
+  if (!password || password.length < 6) { toast('Senha deve ter pelo menos 6 caracteres', 'warning'); return; }
+
+  // Criar no Auth (usando signUp com autoConfirm)
+  const { data: authData, error: authError } = await sb.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { nome },
+  });
+
+  if (authError) {
+    toast('Erro ao criar usuário: ' + authError.message, 'error');
+    return;
+  }
+
+  // O perfil será criado automaticamente pela trigger, mas vamos atualizar role se necessário
+  if (authData.user) {
+    await sb.from('profiles').update({ role }).eq('id', authData.user.id);
+  }
+
+  toast('Usuário criado com sucesso!', 'success');
+  closeModal();
+  navigate('usuarios');
+};
+window.salvarUsuario = salvarUsuario;
+
+window.bloquearUsuario = async function(id) {
+  if (!confirm('Bloquear este usuário? Ele não poderá mais acessar o sistema.')) return;
+  const { error } = await sb.from('profiles').update({ ativo: false }).eq('id', id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Usuário bloqueado!', 'success');
+  navigate('usuarios');
+};
+
+window.desbloquearUsuario = async function(id) {
+  const { error } = await sb.from('profiles').update({ ativo: true }).eq('id', id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Usuário desbloqueado!', 'success');
+  navigate('usuarios');
+};
+
+window.excluirUsuario = async function(id) {
+  if (!confirm('Excluir este usuário permanentemente? Esta ação não pode ser desfeita.')) return;
+  // Excluir perfil (o usuário ainda existirá no Auth, mas sem perfil)
+  const { error } = await sb.from('profiles').delete().eq('id', id);
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  // Opcional: desabilitar usuário no Auth (requer admin API)
+  toast('Usuário excluído!', 'success');
+  navigate('usuarios');
+};
+

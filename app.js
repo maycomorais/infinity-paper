@@ -120,6 +120,7 @@ async function initApp() {
 }
   
   // Sidebar
+  buildBottomNav();
   buildSidebar();
   document.getElementById('user-name-sidebar').textContent = State.user?.email?.split('@')[0] || 'Operador';
   document.getElementById('user-role-sidebar').textContent = State.userProfile?.role || 'Operador';
@@ -129,15 +130,21 @@ async function initApp() {
 
   // Rota inicial
   navigate('dashboard');
-
+  
   // Sidebar collapse
-  document.getElementById('sidebar-collapse-btn').addEventListener('click', () => {
+  const collapseBtn = document.getElementById('sidebar-collapse-btn');
+if (collapseBtn) {
+  collapseBtn.addEventListener('click', function(e) {
+    e.preventDefault();
     const sb = document.getElementById('sidebar');
     sb.classList.toggle('collapsed');
     const collapsed = sb.classList.contains('collapsed');
     document.getElementById('sidebar-toggle-icon').textContent = collapsed ? '▶' : '◀';
     document.getElementById('sidebar-toggle-label').textContent = collapsed ? 'Expandir' : 'Recolher';
   });
+} else {
+  console.error('❌ Botão de recolher não encontrado no DOM');
+}
 
   // Modal close
   document.getElementById('modal-close-btn').addEventListener('click', closeModal);
@@ -204,23 +211,21 @@ async function loadPrecosCopia() {
 // ── SIDEBAR ───────────────────────────────────────────────
 function buildSidebar() {
   const nav = document.getElementById('sidebar-nav');
-  const userRole = State.userProfile?.role || 'funcionario';
+  const items = getVisibleNavItems();
 
-  // Filtra os itens que o usuário pode ver
-  const visibleItems = NAV.filter(item => {
-    if (item.group) return true; // grupos sempre visíveis, mas podemos esconder se não houver itens filhos visíveis
-    return !item.roles || item.roles.includes(userRole);
-  });
-
-  // Para grupos, verifica se há pelo menos um item visível abaixo
-  const grupos = {};
   let html = '';
   let currentGroup = null;
+  const grupos = {};
 
-  visibleItems.forEach(item => {
+  // Precisamos dos grupos também, então vamos filtrar separadamente
+  const allItems = NAV.filter(item => {
+    if (item.group) return true;
+    return !item.roles || item.roles.includes(State.userProfile?.role || 'funcionario');
+  });
+
+  allItems.forEach(item => {
     if (item.group) {
       currentGroup = item.group;
-      // Se o grupo já foi adicionado, não repete
       if (!grupos[currentGroup]) {
         grupos[currentGroup] = true;
         html += `<div class="nav-group-label">${item.group}</div>`;
@@ -238,6 +243,58 @@ function buildSidebar() {
   nav.querySelectorAll('.nav-item').forEach(el => {
     el.addEventListener('click', () => navigate(el.dataset.page));
     el.addEventListener('keydown', e => e.key === 'Enter' && navigate(el.dataset.page));
+  });
+
+  // Marca o item ativo após construir
+  if (State.currentPage) updateActiveNav(State.currentPage);
+}
+
+function buildBottomNav() {
+  const container = document.getElementById('bottom-nav');
+  if (!container) return;
+
+  const items = getVisibleNavItems();
+
+  if (items.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+
+  // Limita a, no máximo, 6 itens (opcional, para não poluir)
+  // Mas vamos mostrar todos; em telas muito pequenas pode rolar,
+  // mas com `justify-content: space-around` ele se ajusta.
+
+  let html = '';
+  items.forEach(item => {
+    html += `
+      <button class="bottom-nav-item" data-page="${item.id}" role="button" tabindex="0">
+        <span class="bottom-nav-icon">${item.icon}</span>
+        <!-- Se quiser um label pequeno, descomente a linha abaixo -->
+        <!-- <span class="bottom-nav-label">${item.label}</span> -->
+      </button>
+    `;
+  });
+
+  container.innerHTML = html;
+
+  container.querySelectorAll('.bottom-nav-item').forEach(el => {
+    el.addEventListener('click', () => navigate(el.dataset.page));
+    el.addEventListener('keydown', e => e.key === 'Enter' && navigate(el.dataset.page));
+  });
+
+  // Atualiza estado ativo
+  if (State.currentPage) updateActiveNav(State.currentPage);
+}
+
+function updateActiveNav(pageId) {
+  // Sidebar
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.page === pageId);
+  });
+
+  // Bottom nav
+  document.querySelectorAll('.bottom-nav-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.page === pageId);
   });
 }
 
@@ -294,11 +351,12 @@ window.salvarCotacao = async function() {
 // ── ROUTER ────────────────────────────────────────────────
 async function navigate(pageId) {
   State.currentPage = pageId;
-  document.querySelectorAll('.nav-item').forEach(el =>
-    el.classList.toggle('active', el.dataset.page === pageId)
-  );
+
+  updateActiveNav(pageId);
+
   const item = NAV.find(n => n.id === pageId);
   if (!item) return;
+
 
   const userRole = State.userProfile?.role || 'funcionario';
   if (item.roles && !item.roles.includes(userRole)) {
@@ -942,6 +1000,15 @@ window.finalizarVenda = async function() {
     }
   }
 };
+
+// ── ITENS VISÍVEIS POR PERFIL ────────────────────────────
+function getVisibleNavItems() {
+  const userRole = State.userProfile?.role || 'funcionario';
+  return NAV.filter(item => {
+    if (item.group) return false; // não incluir grupos
+    return !item.roles || item.roles.includes(userRole);
+  });
+}
 
 // ============================================================
 // ── MÓDULO: VENDAS (PDV Produtos) ─────────────────────────

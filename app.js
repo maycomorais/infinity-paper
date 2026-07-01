@@ -66,6 +66,7 @@ const NAV = [
   }
 
   sb.auth.onAuthStateChange(async (_event, session) => {
+    console.log('Auth event:', _event, session?.user?.email);
     if (session) {
       State.user = session.user;
       await initApp();
@@ -103,11 +104,13 @@ document.getElementById('btn-logout').addEventListener('click', async () => {
 
 // ── INIT APP ──────────────────────────────────────────────
 async function initApp() {
+  console.log('🔵 initApp iniciado');
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app-screen').style.display = 'flex';
 
   // Carrega dados base
   await Promise.all([loadEmpresa(), loadImpressoras(), loadPrecosCopia()]);
+   console.log('✅ Dados base carregados');
 
   if (State.empresa?.config?.cotacao_brl) {
     setCotacao(State.empresa.config.cotacao_brl);
@@ -117,10 +120,21 @@ async function initApp() {
   }
 
   if (State.user) {
+    console.log('👤 Usuário encontrado:', State.user.email);
     State.userProfile = await loadUserProfile(State.user.id);
+    console.log('📦 Perfil carregado:', State.userProfile);
   }
 
+  State.userProfile = await loadUserProfile(State.user.id);
+  if (!State.userProfile) {
+    // Caso extremo: cria um perfil em memória
+    State.userProfile = { id: State.user.id, role: 'funcionario', nome: 'Operador', ativo: true };
+  }
+
+  
+
   if (State.userProfile) {
+    console.log('🎯 Perfil OK, role:', State.userProfile.role);
   window.perfilUsuario = State.userProfile.role;
   window._operadorNome = State.user.email; // para registrar quem confirma pagamento
 
@@ -167,6 +181,7 @@ if (collapseBtn) {
   });
 } else {
   console.error('❌ Botão de recolher não encontrado no DOM');
+  console.warn('⚠️ Nenhum perfil carregado');
 }
 
   // Modal close
@@ -199,25 +214,51 @@ const CONFIG = {
 };
 
 async function loadUserProfile(userId) {
-  const { data, error } = await sb
-    .from('profiles')
-    .select('*')
-    .eq('id', userId)
-    .single();
-  if (error) {
-    console.error('Erro ao carregar perfil:', error);
-    // Se não existir perfil, cria um padrão (funcionario)
-    if (error.code === 'PGRST116') {
-      const { data: newProfile, error: insertError } = await sb
-        .from('profiles')
-        .insert({ id: userId, role: 'funcionario', nome: State.user?.email })
-        .select()
-        .single();
-      if (!insertError) return newProfile;
-    }
-    return { role: 'funcionario' };
+  if (!userId) {
+    console.warn('loadUserProfile chamado sem userId');
+    return { role: 'funcionario', nome: 'Anônimo', ativo: true };
   }
-  return data;
+  try {
+    const { data, error } = await sb
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle(); // use maybeSingle() em vez de single() para retornar null se não encontrado
+
+    if (error) {
+      console.error('Erro ao buscar perfil:', error);
+      throw error;
+    }
+
+    if (data) {
+      return data;
+    }
+
+    // Perfil não existe: criar
+    console.log('Perfil não encontrado, criando...');
+    const { data: newProfile, error: insertError } = await sb
+      .from('profiles')
+      .insert({
+        id: userId,
+        role: 'funcionario',
+        nome: State.user?.user_metadata?.nome || State.user?.email?.split('@')[0] || 'Usuário',
+        ativo: true,
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Erro ao criar perfil:', insertError);
+      // Fallback: retorna um perfil em memória para não travar o app
+      return { id: userId, role: 'funcionario', nome: 'Usuário', ativo: true };
+    }
+
+    return newProfile;
+  } catch (err) {
+    console.error('Falha crítica em loadUserProfile:', err);
+    // Retorna perfil mínimo para permitir uso, mas o usuário pode ter restrições
+    return { id: userId, role: 'funcionario', nome: 'Usuário', ativo: true };
+  }
 }
 
 async function loadEmpresa() {
@@ -274,6 +315,8 @@ function buildSidebar() {
     el.addEventListener('keydown', e => e.key === 'Enter' && navigate(el.dataset.page));
   });
 
+  console.log('allItems:', allItems.map(i => i.id));
+  
   // Marca o item ativo após construir
   if (State.currentPage) updateActiveNav(State.currentPage);
 }
@@ -3060,7 +3103,13 @@ window.salvarCliente = async function(id) {
 // ── MÓDULO: FUNCIONÁRIOS ──────────────────────────────────
 // ============================================================
 async function renderFuncionarios(el) {
-  const {data: funcs} = await sb.from('funcionarios').select('*').order('nome');
+  const { data: funcs, error } = await sb.rpc('get_usuarios');
+
+  const isAdminMaster = State.userProfile?.role === 'adminMaster';
+  const funcionariosFiltrados = isAdminMaster 
+    ? funcs 
+    : (funcs || []).filter(f => f.role !== 'adminMaster');
+
   el.innerHTML = `
     <div class="section-header">
       <div><div class="section-title">Funcionários</div></div>
@@ -4914,12 +4963,17 @@ async function renderAssinatura(el) {
 
 window.navigate = navigate;
 async function renderUsuarios(el) {
-  // Carrega lista de usuários via RPC (função segura)
+  // Carrega lista via RPC (função segura)
   const { data: usuarios, error } = await sb.rpc('get_usuarios');
   if (error) {
     el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-sub">Erro ao carregar usuários: ${error.message}</div></div>`;
     return;
   }
+
+  const isAdminMaster = State.userProfile?.role === 'adminMaster';
+  const usuariosExibidos = isAdminMaster 
+    ? usuarios 
+    : (usuarios || []).filter(u => u.role !== 'adminMaster');
 
   el.innerHTML = `
     <div class="section-header">
@@ -4937,11 +4991,11 @@ async function renderUsuarios(el) {
             <tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Status</th><th>Criado em</th><th>Ações</th></tr>
           </thead>
           <tbody>
-            ${(usuarios||[]).map(u => `
+            ${(usuariosExibidos||[]).map(u => `
               <tr>
                 <td><strong>${u.nome || '—'}</strong></td>
                 <td>${u.email || '—'}</td>
-                <td><span class="badge ${u.role === 'admin' ? 'badge--primary' : 'badge--info'}">${u.role === 'admin' ? 'Admin' : 'Funcionário'}</span></td>
+                <td><span class="badge ${u.role === 'adminMaster' ? 'badge--danger' : (u.role === 'admin' ? 'badge--primary' : 'badge--info')}">${u.role === 'adminMaster' ? 'Admin Master' : (u.role === 'admin' ? 'Admin' : 'Funcionário')}</span></td>
                 <td>
                   <span class="badge ${u.ativo ? 'badge--success' : 'badge--danger'}">
                     ${u.ativo ? 'Ativo' : 'Bloqueado'}
@@ -4972,15 +5026,10 @@ window.abrirModalUsuario = function(usuarioId) {
   let userData = {};
 
   if (isEdit) {
-    // Buscar dados do usuário para edição
     // Precisamos buscar da view ou da tabela profiles
-    sb.from('profiles').select('*, auth_users!inner(email)').eq('id', usuarioId).single()
-      .then(({ data }) => {
-        if (data) {
-          userData = data;
-          abrirModalUsuarioForm(isEdit, userData);
-        }
-      });
+    sb.from('profiles').select('*').eq('id', State.user.id).maybeSingle()
+    .then(result => console.log('Perfil:', result))
+    .catch(err => console.error('Erro:', err));
   } else {
     abrirModalUsuarioForm(isEdit, { nome: '', role: 'funcionario', email: '', senha: '' });
   }

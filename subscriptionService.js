@@ -130,16 +130,23 @@ const SubscriptionService = (() => {
    * @param {function} onUpdate  — recebe o novo registro
    * @returns {object} canal do Supabase (para dar .unsubscribe() depois)
    */
+  let _realtimeChannel = null;
+
   function assinarMudancas(onUpdate) {
-  return supa
-    .channel('assinatura-realtime')
-    .on(
-      'postgres_changes',
-      { event: 'UPDATE', schema: 'public', table: 'assinaturas', filter: 'id=eq.1' },
-      (payload) => onUpdate(payload.new)
-    )
-    .subscribe();
-}
+    if (_realtimeChannel) {
+      // Se já existe, não criar outro
+      return _realtimeChannel;
+    }
+    _realtimeChannel = supa
+      .channel('assinatura-realtime')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'assinaturas', filter: 'id=eq.1' },
+        (payload) => onUpdate(payload.new)
+      )
+      .subscribe();
+    return _realtimeChannel;
+  }
 
   return {
     getAssinatura,

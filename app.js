@@ -7,6 +7,8 @@
 
 // ── SUPABASE INIT ─────────────────────────────────────────
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+window.sb = sb;
+window.supa = sb; // também para compatibilidade
 
 // ── STATE GLOBAL ──────────────────────────────────────────
 const State = {
@@ -18,6 +20,8 @@ const State = {
   precosCopia: [],
   currentPage: null,
 };
+
+const STORAGE_KEY = 'pm_last_page';
 
 // ── NAV CONFIG ────────────────────────────────────────────
 const NAV = [
@@ -38,6 +42,7 @@ const NAV = [
   { id: 'estoque',      label: 'Estoque',       icon: '📦', page: renderEstoque, roles: ['admin', 'funcionario'] },
   { id: 'contas',       label: 'Contas',        icon: '📋', page: renderContas, roles: ['admin'] },
   { id: 'compras',      label: 'Compras',       icon: '🛒', page: renderCompras, roles: ['admin'] },
+  { id: 'producao', label: 'Produção', icon: '🏭', page: renderProducao, roles: ['admin', 'funcionario'] },
 
   { group: 'Cadastros' },
   { id: 'clientes',     label: 'Clientes',      icon: '👥', page: renderClientes, roles: ['admin'] },
@@ -45,6 +50,9 @@ const NAV = [
   { id: 'fornecedores', label: 'Fornecedores',  icon: '🏭', page: renderFornecedores, roles: ['admin'] },
   { id: 'impressoras',  label: 'Impressoras',   icon: '🖥️', page: renderImpressoras, roles: ['admin', 'funcionario'] },
   { id: 'precos',       label: 'Tabela de Preços', icon:'💲', page: renderPrecos, roles: ['admin', 'funcionario'] },
+
+  { group: 'Sistema' },
+{ id: 'assinatura', label: 'Assinatura', icon: '🔐', page: renderAssinatura, roles: ['adminMaster'] },
 ];
 
 // ── BOOT ──────────────────────────────────────────────────
@@ -112,11 +120,26 @@ async function initApp() {
     State.userProfile = await loadUserProfile(State.user.id);
   }
 
-  if (State.userProfile && !State.userProfile.ativo) {
-  toast('⚠️ Seu usuário está bloqueado. Contate o administrador.', 'error');
-  await sb.auth.signOut();
-  showLogin();
-  return;
+  if (State.userProfile) {
+  window.perfilUsuario = State.userProfile.role;
+  window._operadorNome = State.user.email; // para registrar quem confirma pagamento
+
+  // Inicializa a UI de assinatura (não bloqueia o fluxo)
+  window.SubscriptionUI.inicializar({
+    supabaseUrl: SUPABASE_URL,
+    supabaseKey: SUPABASE_ANON_KEY,
+    contatoFone: '+595976771714', // seu WhatsApp
+    contatoNome: 'Suporte',
+    perfil: State.userProfile.role,
+  }).catch(err => console.warn('Assinatura:', err));
+
+  // Verifica se o usuário está bloqueado (pelo perfil)
+  if (!State.userProfile.ativo) {
+    toast('⚠️ Seu usuário está bloqueado. Contate o administrador.', 'error');
+    await sb.auth.signOut();
+    showLogin();
+    return;
+  }
 }
   
   // Sidebar
@@ -128,8 +151,8 @@ async function initApp() {
   // Widget de cotação BRL na topbar
   renderCotacaoWidget();
 
-  // Rota inicial
-  navigate('dashboard');
+  const lastPage = localStorage.getItem(STORAGE_KEY) || 'dashboard';
+  navigate(lastPage);
   
   // Sidebar collapse
   const collapseBtn = document.getElementById('sidebar-collapse-btn');
@@ -151,6 +174,12 @@ if (collapseBtn) {
   document.getElementById('global-modal').addEventListener('click', e => {
     if (e.target.id === 'global-modal') closeModal();
   });
+}
+
+function userHasRole(requiredRoles) {
+  const role = State.userProfile?.role || 'funcionario';
+  if (role === 'adminMaster') return true; // sempre permitido
+  return requiredRoles.includes(role);
 }
 
 // ── CONFIGURAÇÕES DE CAIXA ──────────────────────────────
@@ -219,9 +248,9 @@ function buildSidebar() {
 
   // Precisamos dos grupos também, então vamos filtrar separadamente
   const allItems = NAV.filter(item => {
-    if (item.group) return true;
-    return !item.roles || item.roles.includes(State.userProfile?.role || 'funcionario');
-  });
+  if (item.group) return true;
+  return !item.roles || userHasRole(item.roles);
+});
 
   allItems.forEach(item => {
     if (item.group) {
@@ -351,6 +380,7 @@ window.salvarCotacao = async function() {
 // ── ROUTER ────────────────────────────────────────────────
 async function navigate(pageId) {
   State.currentPage = pageId;
+  localStorage.setItem(STORAGE_KEY, pageId);
 
   updateActiveNav(pageId);
 
@@ -359,10 +389,10 @@ async function navigate(pageId) {
 
 
   const userRole = State.userProfile?.role || 'funcionario';
-  if (item.roles && !item.roles.includes(userRole)) {
-    toast('Acesso negado. Você não tem permissão para acessar esta página.', 'error');
-    return navigate('dashboard');
-  }
+  if (item.roles && !userHasRole(item.roles)) {
+  toast('Acesso negado.', 'error');
+  return navigate('dashboard');
+}
 
   // Topbar title
   document.getElementById('page-title').textContent = item.label;
@@ -565,6 +595,11 @@ const PdvState = {
   clienteId: null,
   step: 1, 
   paginasPorDocumento: 1,
+};
+
+const VendaProdutoState = {
+  carrinho: [],
+  pagamento: 'dinheiro',
 };
 
 async function renderCopias(el) {
@@ -1014,47 +1049,286 @@ function getVisibleNavItems() {
 // ── MÓDULO: VENDAS (PDV Produtos) ─────────────────────────
 // ============================================================
 async function renderVendas(el) {
+  // Carrega produtos ativos
+  const { data: produtos } = await sb.from('produtos')
+    .select('*')
+    .eq('ativo', true)
+    .eq('tipo', 'produto') // apenas produtos, não insumos
+    .order('nome');
+
+  // HTML com layout de duas colunas
+  el.innerHTML = `
+    <div class="pdv-layout" style="display:flex; gap:var(--sp-4); height:100%; min-height:0;">
+      <!-- ESQUERDA: lista de produtos -->
+      <div class="pdv-left" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:var(--sp-4);">
+        <div class="section-header">
+          <div>
+            <div class="section-title">Produtos</div>
+            <div class="section-sub">Selecione os itens para venda</div>
+          </div>
+        </div>
+        <div class="search-bar">
+          <span class="search-bar-icon">🔍</span>
+          <input type="text" class="input" placeholder="Buscar produto..." id="busca-produto-venda" oninput="filtrarProdutosVenda(this.value)" />
+        </div>
+        <div class="printer-grid" id="lista-produtos-venda" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));">
+          ${(produtos||[]).map(p => `
+            <div class="tipo-copia-btn" data-id="${p.id}" data-nome="${p.nome}" data-preco="${p.preco_venda}" onclick="adicionarProdutoVendaPdv('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.preco_venda||0})">
+              <div style="font-size:1.5rem;margin-bottom:var(--sp-2)">📦</div>
+              <div style="font-weight:600;font-size:var(--t-sm)">${p.nome}</div>
+              <div style="font-size:var(--t-xs);color:var(--c-text-3)">${p.categoria}</div>
+              <div style="font-size:var(--t-sm);font-weight:700;color:var(--c-accent);margin-top:var(--sp-2)">${formatMoney(p.preco_venda||0)}</div>
+              <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
+            </div>
+          `).join('') || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+        </div>
+      </div>
+
+      <!-- DIREITA: carrinho -->
+      <div class="pdv-right" style="width:360px; flex-shrink:0; background:var(--c-card); border:1px solid var(--c-border); border-radius:var(--r-lg); display:flex; flex-direction:column; overflow:hidden;">
+        <div class="pdv-panel-header">
+          <div style="font-size:var(--t-md);font-weight:700">🧾 Carrinho</div>
+          <div style="font-size:var(--t-xs);color:var(--c-text-3)" id="carrinho-count-venda">0 itens</div>
+        </div>
+        <div class="pdv-panel-items" id="pdv-items-venda">
+          <div class="empty-state">
+            <div class="empty-state-icon">🛒</div>
+            <div class="empty-state-sub">Carrinho vazio</div>
+          </div>
+        </div>
+        <div class="pdv-panel-footer">
+          <div class="pdv-total-row">
+            <span class="pdv-total-label">Total</span>
+            <span class="pdv-total-value" id="pdv-total-venda">${formatMoney(0)}</span>
+          </div>
+          <div id="pdv-total-brl-venda" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
+            🇧🇷 ≈ <span id="pdv-total-brl-value-venda">R$ 0,00</span>
+          </div>
+          <div class="field">
+            <label>Forma de Pagamento</label>
+            <div class="payment-methods" id="payment-methods-venda">
+              ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
+                <button class="payment-btn ${VendaProdutoState.pagamento===p?'selected':''}"
+                        onclick="selecionarPagamentoVenda('${p}')" data-pag="${p}">
+                  ${labelPagamento(p)}
+                </button>
+              `).join('')}
+            </div>
+          </div>
+          <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarVendaProdutos()">
+            ✅ Finalizar Venda — <span id="btn-total-venda">${formatMoney(0)}</span>
+          </button>
+          <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinhoVenda()">
+            🗑️ Limpar carrinho
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Histórico de vendas (opcional, abaixo) -->
+    <div class="card" style="margin-top: var(--sp-6);">
+      <div class="card-header"><span class="card-title">Histórico de Vendas</span></div>
+      <div class="table-wrap" id="historico-vendas">
+        <!-- Carregado via JS separado -->
+      </div>
+    </div>
+  `;
+
+  // Carrega histórico
+  await carregarHistoricoVendas();
+
+  // Função de filtro de produtos
+  window.filtrarProdutosVenda = function(q) {
+    document.querySelectorAll('#lista-produtos-venda .tipo-copia-btn').forEach(el => {
+      const nome = el.dataset.nome?.toLowerCase() || '';
+      el.style.display = nome.includes(q.toLowerCase()) ? '' : 'none';
+    });
+  };
+}
+
+window.adicionarProdutoVendaPdv = function(id, nome, preco) {
+  const existing = VendaProdutoState.carrinho.find(i => i.produto_id === id);
+  if (existing) {
+    existing.quantidade++;
+    existing.total = existing.quantidade * existing.preco_unitario;
+  } else {
+    VendaProdutoState.carrinho.push({
+      produto_id: id,
+      nome,
+      quantidade: 1,
+      preco_unitario: preco,
+      total: preco,
+    });
+  }
+  atualizarCarrinhoVenda();
+  toast(`${nome} adicionado`, 'success');
+};
+
+window.removerDoCarrinhoVenda = function(index) {
+  VendaProdutoState.carrinho.splice(index, 1);
+  atualizarCarrinhoVenda();
+};
+
+window.limparCarrinhoVenda = function() {
+  VendaProdutoState.carrinho = [];
+  atualizarCarrinhoVenda();
+};
+
+window.selecionarPagamentoVenda = function(pag) {
+  VendaProdutoState.pagamento = pag;
+  document.querySelectorAll('#payment-methods-venda .payment-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.pag === pag);
+  });
+  atualizarCarrinhoVenda();
+};
+
+function atualizarCarrinhoVenda() {
+  const itemsEl = document.getElementById('pdv-items-venda');
+  const countEl = document.getElementById('carrinho-count-venda');
+  const totalEl = document.getElementById('pdv-total-venda');
+  const btnTotalEl = document.getElementById('btn-total-venda');
+  if (!itemsEl) return;
+
+  const total = VendaProdutoState.carrinho.reduce((a,b) => a + b.total, 0);
+  if (countEl) countEl.textContent = `${VendaProdutoState.carrinho.length} item(ns)`;
+  if (totalEl) totalEl.textContent = formatMoney(total);
+  if (btnTotalEl) btnTotalEl.textContent = formatMoney(total);
+
+  // Atualiza BRL se necessário
+  const brlEl = document.getElementById('pdv-total-brl-venda');
+  const brlValEl = document.getElementById('pdv-total-brl-value-venda');
+  if (brlEl && brlValEl) {
+    const isPix = VendaProdutoState.pagamento === 'pix' || VendaProdutoState.pagamento === 'pix_brl';
+    brlEl.style.display = isPix ? 'block' : 'none';
+    if (isPix) {
+      const valorBRL = gsToBRL(total);
+      brlValEl.textContent = formatBRL(valorBRL);
+    }
+  }
+
+  if (VendaProdutoState.carrinho.length === 0) {
+    itemsEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🛒</div><div class="empty-state-sub">Carrinho vazio</div></div>`;
+    return;
+  }
+
+  itemsEl.innerHTML = VendaProdutoState.carrinho.map((item, idx) => `
+    <div class="pdv-item">
+      <div class="pdv-item-info">
+        <div class="pdv-item-name">${item.nome}</div>
+        <div class="pdv-item-sub">${item.quantidade} × ${formatMoney(item.preco_unitario)}</div>
+      </div>
+      <div class="pdv-item-price">${formatMoney(item.total)}</div>
+      <button class="pdv-remove-btn" onclick="removerDoCarrinhoVenda(${idx})">✕</button>
+    </div>
+  `).join('');
+}
+
+window.finalizarVendaProdutos = async function() {
+  if (await isCaixaTravado()) {
+    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
+    return;
+  }
+
+  if (!VendaProdutoState.carrinho.length) { toast('Carrinho vazio', 'warning'); return; }
+  const pagamento = VendaProdutoState.pagamento;
+
+  // ---- CONSUMO DE INSUMOS (SEMPRE) ----
+  for (const item of VendaProdutoState.carrinho) {
+    const { data: vinculos } = await sb.from('produto_insumos')
+      .select('*, insumos:insumo_id(id, nome, estoque_atual)')
+      .eq('produto_id', item.produto_id);
+
+    if (vinculos && vinculos.length > 0) {
+      let podeVender = true;
+      for (const v of vinculos) {
+        const total = v.quantidade * item.quantidade;
+        if (v.insumos.estoque_atual < total) {
+          toast(`Insumo insuficiente: ${v.insumos.nome} (necessário ${total}, disponível ${v.insumos.estoque_atual})`, 'error');
+          podeVender = false;
+          break;
+        }
+      }
+      if (!podeVender) return;
+
+      for (const v of vinculos) {
+        const total = v.quantidade * item.quantidade;
+        const novoEstoque = v.insumos.estoque_atual - total;
+        await sb.from('produtos')
+          .update({ estoque_atual: novoEstoque })
+          .eq('id', v.insumo_id);
+      }
+    }
+  }
+  // ---- FIM CONSUMO DE INSUMOS ----
+
+  // Prossegue com a venda
+  const subtotal = VendaProdutoState.carrinho.reduce((a,b) => a + b.total, 0);
+  const { data: venda, error } = await sb.from('vendas').insert({
+    subtotal, total: subtotal, forma_pagamento: pagamento, status: 'concluido',
+  }).select().single();
+
+  if (error) { toast('Erro: '+error.message,'error'); return; }
+
+  const itens = VendaProdutoState.carrinho.map(i => ({
+    venda_id: venda.id,
+    produto_id: i.produto_id,
+    quantidade: i.quantidade,
+    preco_unitario: i.preco_unitario,
+    total: i.total,
+  }));
+  await sb.from('venda_itens').insert(itens);
+
+  // Baixa estoque dos produtos
+  for (const item of VendaProdutoState.carrinho) {
+    const { data: produto } = await sb.from('produtos')
+      .select('estoque_atual')
+      .eq('id', item.produto_id)
+      .single();
+    if (produto) {
+      const novoEstoque = Math.max(0, produto.estoque_atual - item.quantidade);
+      await sb.from('produtos')
+        .update({ estoque_atual: novoEstoque })
+        .eq('id', item.produto_id);
+    }
+  }
+
+  toast('Venda registrada!', 'success');
+  limparCarrinhoVenda();
+  navigate('vendas'); // recarrega
+};
+
+async function carregarHistoricoVendas() {
   const { data: vendas } = await sb.from('vendas')
     .select('*, clientes(nome)')
     .order('created_at', { ascending: false })
     .limit(30);
 
-  el.innerHTML = `
-    <div class="section-header">
-      <div>
-        <div class="section-title">Vendas de Produtos</div>
-        <div class="section-sub">PDV da loja — materiais, papelaria e serviços</div>
-      </div>
-      <button class="btn btn--primary" onclick="abrirModalNovaVenda()">+ Nova Venda</button>
-    </div>
-    <div class="card">
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>#</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr>
-          </thead>
-          <tbody>
-            ${(vendas||[]).length === 0
-              ? `<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">🛍️</div><div class="empty-state-sub">Nenhuma venda registrada</div></div></td></tr>`
-              : (vendas||[]).map(v => `
-                <tr>
-                  <td class="td-mono">#${v.numero_venda}</td>
-                  <td>${v.clientes?.nome || 'Consumidor'}</td>
-                  <td><span class="badge badge--primary">${labelPagamento(v.forma_pagamento)}</span></td>
-                  <td style="color:var(--c-success);font-weight:600">${formatMoney(v.total)}</td>
-                  <td>${badgeStatus(v.status)}</td>
-                  <td class="td-mono">${formatDateTime(v.created_at)}</td>
-                  <td><button class="btn btn--ghost btn--sm" onclick="verVenda('${v.id}')">Ver</button></td>
-                </tr>
-              `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
+  const container = document.getElementById('historico-vendas');
+  if (!container) return;
 
-  // Adiciona botão no topbar
-  document.getElementById('topbar-actions').innerHTML = '';
+  if (!vendas || vendas.length === 0) {
+    container.innerHTML = `<div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma venda registrada</div></div>`;
+    return;
+  }
+
+  container.innerHTML = `
+    <table>
+      <thead><tr><th>#</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
+      <tbody>
+        ${vendas.map(v => `
+          <tr>
+            <td class="td-mono">#${v.numero_venda}</td>
+            <td>${v.clientes?.nome || 'Consumidor'}</td>
+            <td><span class="badge badge--primary">${labelPagamento(v.forma_pagamento)}</span></td>
+            <td style="color:var(--c-success);font-weight:600">${formatMoney(v.total)}</td>
+            <td>${badgeStatus(v.status)}</td>
+            <td class="td-mono">${formatDateTime(v.created_at)}</td>
+            <td><button class="btn btn--ghost btn--sm" onclick="verVenda('${v.id}')">Ver</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
 }
 
 window.abrirModalNovaVenda = async function() {
@@ -1163,9 +1437,42 @@ window.salvarVenda = async function() {
   }
 
   if (!window._vendaItens.length) { toast('Adicione itens', 'warning'); return; }
-  const pagamento = document.getElementById('venda-pagamento')?.addEventListener('change', function() {
-    atualizarCarrinhoVendaModal();
-  });
+  const pagamento = document.getElementById('venda-pagamento')?.value;
+
+  // ---- CONSUMO DE INSUMOS (SEMPRE) ----
+  for (const item of window._vendaItens) {
+    // Busca insumos vinculados ao produto
+    const { data: vinculos } = await sb.from('produto_insumos')
+      .select('*, insumos:insumo_id(id, nome, estoque_atual)')
+      .eq('produto_id', item.produto_id);
+
+    if (vinculos && vinculos.length > 0) {
+      // Verifica se há estoque suficiente de cada insumo
+      let podeVender = true;
+      for (const v of vinculos) {
+        const total = v.quantidade * item.quantidade;
+        if (v.insumos.estoque_atual < total) {
+          toast(`Insumo insuficiente: ${v.insumos.nome} (necessário ${total}, disponível ${v.insumos.estoque_atual})`, 'error');
+          podeVender = false;
+          break;
+        }
+      }
+      if (!podeVender) return;
+
+      // Baixa os insumos
+      for (const v of vinculos) {
+        const total = v.quantidade * item.quantidade;
+        const novoEstoque = v.insumos.estoque_atual - total;
+        await sb.from('produtos')
+          .update({ estoque_atual: novoEstoque })
+          .eq('id', v.insumo_id);
+      }
+    }
+    // Se não tiver insumos, apenas segue em frente (produto sem composição)
+  }
+  // ---- FIM CONSUMO DE INSUMOS ----
+
+  // Agora prossegue com a venda normal (baixa estoque do produto)
   const subtotal = window._vendaItens.reduce((a,b)=>a+b.total,0);
 
   const { data: venda, error } = await sb.from('vendas').insert({
@@ -1183,21 +1490,19 @@ window.salvarVenda = async function() {
   }));
   await sb.from('venda_itens').insert(itens);
 
-  // Baixa no estoque
+  // Baixa no estoque do produto (já ajustado, mas mantido)
   for (const i of window._vendaItens) {
-  // Buscar estoque atual
-  const { data: produto } = await sb.from('produtos')
-    .select('estoque_atual')
-    .eq('id', i.produto_id)
-    .single();
-
-  if (produto) {
-    const novoEstoque = Math.max(0, produto.estoque_atual - i.quantidade);
-    await sb.from('produtos')
-      .update({ estoque_atual: novoEstoque })
-      .eq('id', i.produto_id);
+    const { data: produto } = await sb.from('produtos')
+      .select('estoque_atual')
+      .eq('id', i.produto_id)
+      .single();
+    if (produto) {
+      const novoEstoque = Math.max(0, produto.estoque_atual - i.quantidade);
+      await sb.from('produtos')
+        .update({ estoque_atual: novoEstoque })
+        .eq('id', i.produto_id);
+    }
   }
-}
 
   toast('Venda registrada!','success');
   closeModal();
@@ -1727,6 +2032,14 @@ async function renderEstoque(el) {
       </div>
       <button class="btn btn--primary" onclick="abrirModalProduto()">+ Cadastrar Produto</button>
     </div>
+
+    <!-- ABAS DE FILTRO -->
+    <div class="tabs" style="margin-bottom:var(--sp-4);">
+      <button class="tab-btn active" data-tipo="todos" onclick="filtrarEstoquePorTipo('todos', this)">Todos</button>
+      <button class="tab-btn" data-tipo="produto" onclick="filtrarEstoquePorTipo('produto', this)">Produtos</button>
+      <button class="tab-btn" data-tipo="insumo" onclick="filtrarEstoquePorTipo('insumo', this)">Insumos</button>
+    </div>
+
     <div class="card" style="margin-bottom:var(--sp-4); height: auto;">
       <div class="card-body" style="padding:var(--sp-3) var(--sp-5)">
         <div class="search-bar">
@@ -1736,6 +2049,7 @@ async function renderEstoque(el) {
         </div>
       </div>
     </div>
+
     <div class="card">
       <div class="table-wrap">
         <table id="tabela-produtos">
@@ -1744,7 +2058,7 @@ async function renderEstoque(el) {
           </thead>
           <tbody>
             ${(produtos||[]).map(p => `
-              <tr>
+              <tr data-tipo="${p.tipo || 'produto'}">
                 <td style="font-weight:500">${p.nome}</td>
                 <td><span class="badge badge--primary">${p.categoria}</span></td>
                 <td>
@@ -1761,6 +2075,7 @@ async function renderEstoque(el) {
                   <div style="display:flex;gap:4px">
                     <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
                     <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}')">±</button>
+                    <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}')" title="Gerenciar insumos">🧩</button>
                   </div>
                 </td>
               </tr>
@@ -1770,6 +2085,25 @@ async function renderEstoque(el) {
       </div>
     </div>
   `;
+
+  // Adiciona a função de filtro por tipo
+  window.filtrarEstoquePorTipo = function(tipo, btn) {
+    // Atualiza classe ativa das abas
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+
+    // Filtra as linhas da tabela
+    document.querySelectorAll('#tabela-produtos tbody tr').forEach(tr => {
+      if (tipo === 'todos') {
+        tr.style.display = '';
+      } else {
+        const tipoProduto = tr.dataset.tipo || 'produto';
+        tr.style.display = tipoProduto === tipo ? '' : 'none';
+      }
+    });
+  };
+
+  // Inicializa com a aba 'Todos' ativa (já está ativa por padrão)
 }
 
 // ============================================================
@@ -1947,6 +2281,61 @@ async function renderCaixa(el) {
   `;
 }
 
+window.verVenda = async function(vendaId) {
+  // Busca dados da venda e itens
+  const { data: venda, error: errVenda } = await sb.from('vendas')
+    .select('*, clientes(nome)')
+    .eq('id', vendaId)
+    .single();
+
+  if (errVenda || !venda) {
+    toast('Venda não encontrada', 'error');
+    return;
+  }
+
+  const { data: itens, error: errItens } = await sb.from('venda_itens')
+    .select('*, produtos(nome, unidade)')
+    .eq('venda_id', vendaId);
+
+  if (errItens) {
+    toast('Erro ao carregar itens', 'error');
+    return;
+  }
+
+  // Abre modal com detalhes
+  openModal(`Venda #${venda.numero_venda}`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="display:flex;justify-content:space-between">
+        <div>
+          <div style="color:var(--c-text-3)">Cliente</div>
+          <div style="font-weight:700">${venda.clientes?.nome || 'Consumidor'}</div>
+        </div>
+        <div>
+          <div style="color:var(--c-text-3)">Data</div>
+          <div>${formatDateTime(venda.created_at)}</div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between">
+        <div>
+          <div style="color:var(--c-text-3)">Pagamento</div>
+          <div>${labelPagamento(venda.forma_pagamento)}</div>
+        </div>
+        <div>
+          <div style="color:var(--c-text-3)">Total</div>
+          <div style="font-size:var(--t-xl);font-weight:700;color:var(--c-success)">${formatMoney(venda.total)}</div>
+        </div>
+      </div>
+      <div class="divider-text">Itens</div>
+      ${(itens||[]).map(item => `
+        <div style="display:flex;justify-content:space-between;padding:var(--sp-2) 0;border-bottom:1px solid var(--c-border)">
+          <span>${item.produtos?.nome || '—'} × ${item.quantidade}</span>
+          <span style="font-weight:600">${formatMoney(item.total)}</span>
+        </div>
+      `).join('') || '<div style="color:var(--c-text-3)">Nenhum item</div>'}
+    </div>
+  `, 'modal--lg');
+};
+
 window.filtrarTabelaProdutos = debounce(function(q) {
   document.querySelectorAll('#tabela-produtos tbody tr').forEach(tr => {
     tr.style.display = tr.textContent.toLowerCase().includes(q.toLowerCase()) ? '' : 'none';
@@ -1966,6 +2355,13 @@ window.abrirModalProduto = async function(produtoId) {
       <div class="form-row form-row--2">
         <div class="field"><label>Nome *</label><input type="text" class="input" id="prod-nome" value="${p.nome||''}" placeholder="Ex: Papel A4 500fls" /></div>
         <div class="field"><label>Código de Barras</label><input type="text" class="input" id="prod-barras" value="${p.codigo_barras||''}" placeholder="EAN-13..." /></div>
+      </div>
+      <div class="field">
+        <label>Tipo</label>
+        <select class="input" id="prod-tipo">
+          <option value="produto">Produto (venda)</option>
+          <option value="insumo">Insumo (consumo)</option>
+        </select>
       </div>
       <div class="form-row form-row--3">
         <div class="field"><label>Categoria</label>
@@ -1997,6 +2393,109 @@ window.abrirModalProduto = async function(produtoId) {
   `, 'modal--lg');
 };
 
+window.gerenciarComposicao = async function(produtoId, nomeProduto) {
+  // Busca insumos já vinculados
+  const { data: vinculos } = await sb.from('produto_insumos')
+    .select('*, insumos:insumo_id(id, nome, unidade, estoque_atual)')
+    .eq('produto_id', produtoId);
+
+  // Busca todos os insumos cadastrados
+  const { data: insumos } = await sb.from('produtos')
+    .select('id, nome, unidade, estoque_atual')
+    .eq('tipo', 'insumo')
+    .order('nome');
+
+  openModal(`Composição de "${nomeProduto}"`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="font-size:var(--t-sm);color:var(--c-text-3)">Informe quais insumos são consumidos para produzir 1 unidade deste produto.</div>
+      <div id="lista-vinculos" style="display:flex;flex-direction:column;gap:var(--sp-2)">
+        ${(vinculos||[]).map(v => `
+          <div style="display:flex;align-items:center;gap:var(--sp-3);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)">
+            <span style="flex:1">${v.insumos.nome}</span>
+            <input type="number" class="input" id="qtd-${v.insumo_id}" value="${v.quantidade}" step="0.1" min="0.001" style="width:80px" />
+            <span>por unidade</span>
+            <button class="pdv-remove-btn" onclick="removerInsumoVinculo('${v.id}','${produtoId}')">✕</button>
+          </div>
+        `).join('') || '<div style="color:var(--c-text-3);font-size:var(--t-xs)">Nenhum insumo vinculado ainda.</div>'}
+      </div>
+      <div style="display:flex;gap:var(--sp-2);align-items:center">
+        <select class="input" id="novo-insumo-id" style="flex:1">
+          <option value="">— Adicionar insumo —</option>
+          ${(insumos||[]).map(i => `<option value="${i.id}">${i.nome} (${i.unidade}) – Estoque: ${i.estoque_atual}</option>`).join('')}
+        </select>
+        <button class="btn btn--ghost" onclick="adicionarInsumoVinculo('${produtoId}')">+ Adicionar</button>
+      </div>
+      <button class="btn btn--primary" onclick="salvarVinculos('${produtoId}')">💾 Salvar Composição</button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.removerInsumoVinculo = async function(vinculoId, produtoId) {
+  if (!confirm('Remover este insumo da composição?')) return;
+  await sb.from('produto_insumos').delete().eq('id', vinculoId);
+  toast('Insumo removido', 'info');
+  gerenciarComposicao(produtoId);
+};
+
+window.adicionarInsumoVinculo = function(produtoId) {
+  const insumoId = document.getElementById('novo-insumo-id').value;
+  if (!insumoId) { toast('Selecione um insumo', 'warning'); return; }
+  // apenas adiciona na interface; o salvamento será feito em lote
+  // Busca o nome do insumo para exibir
+  const select = document.getElementById('novo-insumo-id');
+  const nome = select.options[select.selectedIndex].text;
+  const lista = document.getElementById('lista-vinculos');
+  const div = document.createElement('div');
+  div.style.cssText = 'display:flex;align-items:center;gap:var(--sp-3);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)';
+  div.dataset.insumoId = insumoId;
+  div.innerHTML = `
+    <span style="flex:1">${nome}</span>
+    <input type="number" class="input" id="qtd-${insumoId}" value="1" step="0.1" min="0.001" style="width:80px" />
+    <span>por unidade</span>
+    <button class="pdv-remove-btn" onclick="this.parentElement.remove()">✕</button>
+  `;
+  lista.appendChild(div);
+  // Limpa o select
+  select.value = '';
+};
+
+window.salvarVinculos = async function(produtoId) {
+  // Coleta todos os pares (insumo_id, quantidade) da interface
+  const itens = [];
+  document.querySelectorAll('#lista-vinculos > div').forEach(div => {
+    const insumoId = div.dataset.insumoId || div.querySelector('input[type="number"]')?.id?.replace('qtd-', '');
+    if (!insumoId) return;
+    const qtd = parseFloat(div.querySelector('input[type="number"]')?.value || 0);
+    if (qtd > 0) {
+      itens.push({ insumo_id: insumoId, quantidade: qtd });
+    }
+  });
+
+  // Para cada item, verifica se já existe vínculo, se sim atualiza, senão insere
+  for (const item of itens) {
+    const { data: existing } = await sb.from('produto_insumos')
+      .select('id')
+      .eq('produto_id', produtoId)
+      .eq('insumo_id', item.insumo_id)
+      .maybeSingle();
+    if (existing) {
+      await sb.from('produto_insumos')
+        .update({ quantidade: item.quantidade })
+        .eq('id', existing.id);
+    } else {
+      await sb.from('produto_insumos')
+        .insert({ produto_id: produtoId, insumo_id: item.insumo_id, quantidade: item.quantidade });
+    }
+  }
+
+  // Remove vínculos que não estão mais na lista (opcional, mas pode ser feito)
+  // Vamos simplesmente recarregar a tela.
+  toast('Composição salva!', 'success');
+  closeModal();
+  // Recarregar a página de estoque para atualizar a listagem
+  navigate('estoque');
+};
+
 window.editarProduto = function(id) { abrirModalProduto(id); };
 
 window.salvarProduto = async function(id) {
@@ -2011,6 +2510,7 @@ window.salvarProduto = async function(id) {
     estoque_atual: parseFloat(document.getElementById('prod-estoque').value)||0,
     estoque_minimo: parseFloat(document.getElementById('prod-estoque-min').value)||0,
     descricao: document.getElementById('prod-desc').value||null,
+    tipo: document.getElementById('prod-tipo').value
   };
   if (!payload.nome) { toast('Nome obrigatório','warning'); return; }
   const { error } = id
@@ -2020,6 +2520,183 @@ window.salvarProduto = async function(id) {
   toast('Produto salvo!','success');
   closeModal();
   navigate('estoque');
+};
+
+async function renderProducao(el) {
+  // Busca todos os produtos finais (tipo = 'produto')
+  const { data: produtos } = await sb.from('produtos')
+    .select('id, nome, estoque_atual, unidade')
+    .eq('tipo', 'produto')
+    .order('nome');
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">🏭 Produção para Estoque</div>
+        <div class="section-sub">Registre a produção de produtos finais, consumindo insumos automaticamente.</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <div class="form-row form-row--2" style="align-items:end">
+          <div class="field">
+            <label>Produto a produzir *</label>
+            <select class="input" id="producao-produto">
+              <option value="">— Selecione —</option>
+              ${(produtos||[]).map(p => `<option value="${p.id}">${p.nome} (Estoque atual: ${p.estoque_atual} ${p.unidade})</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <label>Quantidade *</label>
+            <input type="number" class="input" id="producao-qtd" min="1" value="1" />
+          </div>
+        </div>
+        <div style="margin-top:var(--sp-4)">
+          <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="confirmarProducao()">
+            🏭 Produzir e Baixar Insumos
+          </button>
+        </div>
+        <div id="preview-producao" style="margin-top:var(--sp-4)"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:var(--sp-4)">
+      <div class="card-header"><span class="card-title">Histórico de Produções</span></div>
+      <div class="table-wrap" id="tabela-producoes">
+        <table>
+          <thead><tr><th>Produto</th><th>Quantidade</th><th>Data</th><th>Observações</th></tr></thead>
+          <tbody id="tbody-producoes">
+            <tr><td colspan="4"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Carregando...</div></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  // Carrega histórico
+  await carregarHistoricoProducao();
+
+  // Preview quando selecionar produto
+  document.getElementById('producao-produto')?.addEventListener('change', previewProducao);
+}
+
+async function carregarHistoricoProducao() {
+  const { data: producoes } = await sb.from('producoes')
+    .select('*, produtos(nome)')
+    .order('data_producao', { ascending: false })
+    .limit(20);
+
+  const tbody = document.getElementById('tbody-producoes');
+  if (!tbody) return;
+  if (!producoes || producoes.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma produção registrada ainda</div></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = producoes.map(p => `
+    <tr>
+      <td>${p.produtos?.nome || '—'}</td>
+      <td>${p.quantidade_produzida}</td>
+      <td class="td-mono">${formatDate(p.data_producao)}</td>
+      <td>${p.observacoes || '—'}</td>
+    </tr>
+  `).join('');
+}
+
+window.previewProducao = async function() {
+  const produtoId = document.getElementById('producao-produto').value;
+  const qtd = parseInt(document.getElementById('producao-qtd').value) || 1;
+  const preview = document.getElementById('preview-producao');
+  if (!produtoId) { preview.innerHTML = ''; return; }
+
+  // Busca insumos da composição
+  const { data: vinculos } = await sb.from('produto_insumos')
+    .select('*, insumos:insumo_id(id, nome, unidade, estoque_atual)')
+    .eq('produto_id', produtoId);
+
+  if (!vinculos || vinculos.length === 0) {
+    preview.innerHTML = `<div style="color:var(--c-warning)">⚠️ Este produto não possui insumos cadastrados. Nenhum consumo será registrado.</div>`;
+    return;
+  }
+
+  // Calcula consumo total
+  let html = `<div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+    <div style="font-weight:600;margin-bottom:var(--sp-3)">📦 Consumo de insumos para ${qtd} unidade(s):</div>
+    <ul style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:var(--sp-2)">`;
+  let podeProduzir = true;
+  vinculos.forEach(v => {
+    const total = v.quantidade * qtd;
+    const estoque = v.insumos?.estoque_atual || 0;
+    const suficiente = estoque >= total;
+    if (!suficiente) podeProduzir = false;
+    html += `<li style="display:flex;justify-content:space-between;padding:var(--sp-2) var(--sp-3);background:${suficiente ? 'var(--c-success-s)' : 'var(--c-danger-s)'};border-radius:var(--r-sm)">
+      <span>${v.insumos?.nome || '—'} (${v.insumos?.unidade || 'un'})</span>
+      <span>${total} <span style="color:${suficiente ? 'var(--c-success)' : 'var(--c-danger)'}">${suficiente ? '✅' : '❌ falta ' + (total - estoque)}</span></span>
+    </li>`;
+  });
+  html += `</ul>
+    ${podeProduzir ? `<div style="margin-top:var(--sp-3);color:var(--c-success)">✅ Todos os insumos estão disponíveis.</div>` :
+                    `<div style="margin-top:var(--sp-3);color:var(--c-danger)">⚠️ Estoque insuficiente para alguns insumos. Produção não permitida.</div>`}
+  </div>`;
+  preview.innerHTML = html;
+  preview.dataset.podeProduzir = podeProduzir ? 'true' : 'false';
+};
+
+window.confirmarProducao = async function() {
+  const produtoId = document.getElementById('producao-produto').value;
+  const qtd = parseInt(document.getElementById('producao-qtd').value) || 1;
+  if (!produtoId) { toast('Selecione um produto', 'warning'); return; }
+  if (qtd < 1) { toast('Quantidade inválida', 'warning'); return; }
+
+  const preview = document.getElementById('preview-producao');
+  if (preview.dataset.podeProduzir !== 'true') {
+    toast('Verifique o preview: insumos insuficientes.', 'error');
+    return;
+  }
+
+  if (!confirm(`Produzir ${qtd} unidade(s) deste produto? Os insumos serão baixados do estoque.`)) return;
+
+  try {
+    // 1. Buscar insumos
+    const { data: vinculos } = await sb.from('produto_insumos')
+      .select('*, insumos:insumo_id(id, estoque_atual)')
+      .eq('produto_id', produtoId);
+
+    if (!vinculos || vinculos.length === 0) {
+      toast('Este produto não tem insumos. Produção cancelada.', 'warning');
+      return;
+    }
+
+    // 2. Baixar insumos (atualizar estoque)
+    for (const v of vinculos) {
+      const total = v.quantidade * qtd;
+      const novoEstoque = v.insumos.estoque_atual - total;
+      if (novoEstoque < 0) throw new Error(`Estoque insuficiente de ${v.insumos.nome}`);
+      await sb.from('produtos')
+        .update({ estoque_atual: novoEstoque })
+        .eq('id', v.insumo_id);
+    }
+
+    // 3. Aumentar estoque do produto final
+    const { data: prod } = await sb.from('produtos')
+      .select('estoque_atual')
+      .eq('id', produtoId)
+      .single();
+    await sb.from('produtos')
+      .update({ estoque_atual: (prod.estoque_atual || 0) + qtd })
+      .eq('id', produtoId);
+
+    // 4. Registrar produção
+    await sb.from('producoes').insert({
+      produto_id: produtoId,
+      quantidade_produzida: qtd,
+      observacoes: `Produção automática via sistema`
+    });
+
+    toast(`✅ Produção de ${qtd} unidade(s) concluída!`, 'success');
+    // Recarregar página
+    navigate('producao');
+  } catch (err) {
+    toast('Erro na produção: ' + err.message, 'error');
+  }
 };
 
 window.ajusteEstoque = function(id, nome, atual, unidade) {
@@ -2529,6 +3206,9 @@ window.salvarFornecedor = async function(id) {
 // ── MÓDULO: IMPRESSORAS ───────────────────────────────────
 // ============================================================
 function renderStepImpressoras() {
+
+  const impressorasOnline = State.impressoras.filter(imp => imp.status === 'online');
+// Use impressorasOnline no lugar de State.impressoras no map
   return `
     <div class="card">
       <div class="card-header">
@@ -2537,34 +3217,26 @@ function renderStepImpressoras() {
       </div>
       <div class="card-body">
         <div class="printer-grid" id="printer-grid">
-          ${State.impressoras.map(imp => `
-            <div class="printer-card ${imp.status !== 'online' ? 'opacity-half' : ''} ${PdvState.impressoraSelecionada === imp.id ? 'selected' : ''}"
-                 data-id="${imp.id}"
-                 onclick="selecionarImpressora('${imp.id}')">
-              <div style="display:flex;align-items:center;gap:var(--sp-2)">
-                <div class="printer-status-dot ${imp.status}"></div>
-                <span class="badge badge--${imp.status === 'online' ? 'success' : 'danger'}">${imp.status}</span>
-                ${imp.colorida ? '<span class="badge badge--accent">Colorida</span>' : '<span class="badge">P&B</span>'}
-              </div>
-              <div class="printer-card-name">${imp.nome}</div>
-              <div class="printer-card-model">${imp.marca||''} ${imp.modelo||''}</div>
-              <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">📍 ${imp.localizacao||'—'} · IP: ${imp.ip_rede||'—'}</div>
-              <div class="printer-counters">
-                <div class="printer-counter">
-                  <div class="printer-counter-val">${(imp.contador_pb_sesssao||0).toLocaleString()}</div>
-                  <div class="printer-counter-label">P&B hoje</div>
-                </div>
-                <div class="printer-counter">
-                  <div class="printer-counter-val">${(imp.contador_cor_sessao||0).toLocaleString()}</div>
-                  <div class="printer-counter-label">Cor hoje</div>
-                </div>
-                <div class="printer-counter">
-                  <div class="printer-counter-val">${((imp.contador_pb_total||0)+(imp.contador_cor_total||0)).toLocaleString()}</div>
-                  <div class="printer-counter-label">Total geral</div>
-                </div>
-              </div>
-            </div>
-          `).join('') || '<div class="empty-state"><div class="empty-state-icon">🖥️</div><div class="empty-state-sub">Cadastre impressoras em Impressoras</div></div>'}
+          ${State.impressoras.map(imp => {
+  const isOnline = imp.status === 'online';
+  return `
+    <div class="printer-card ${!isOnline ? 'opacity-half disabled' : ''} ${PdvState.impressoraSelecionada === imp.id ? 'selected' : ''}"
+         data-id="${imp.id}"
+         onclick="${isOnline ? `selecionarImpressora('${imp.id}')` : ''}"
+         style="${!isOnline ? 'cursor:not-allowed;opacity:0.5' : ''}">
+      <div style="display:flex;align-items:center;gap:var(--sp-2)">
+        <div class="printer-status-dot ${imp.status}"></div>
+        <span class="badge badge--${imp.status === 'online' ? 'success' : 'danger'}">${imp.status}</span>
+        ${imp.colorida ? '<span class="badge badge--accent">Colorida</span>' : '<span class="badge">P&B</span>'}
+      </div>
+      <div class="printer-card-name">${imp.nome}</div>
+      <div class="printer-card-model">${imp.marca||''} ${imp.modelo||''}</div>
+      ${!isOnline ? '<div style="color:var(--c-danger);font-size:var(--t-xs)">⚠️ Indisponível</div>' : ''}
+      <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">📍 ${imp.localizacao||'—'} · IP: ${imp.ip_rede||'—'}</div>
+      <div class="printer-counters">...</div>
+    </div>
+  `;
+}).join('')} || '<div class="empty-state"><div class="empty-state-icon">🖥️</div><div class="empty-state-sub">Cadastre impressoras em Impressoras</div></div>'}
         </div>
       </div>
     </div>
@@ -2677,7 +3349,14 @@ async function renderImpressoras(el) {
               </div>
               <div style="display:flex;gap:4px">
                 <button class="btn btn--ghost btn--sm" onclick="editarImpressora('${imp.id}')">✏️</button>
-                <button class="btn btn--ghost btn--sm" onclick="mudarStatusImpressora('${imp.id}')">⚡</button>
+                <select class="input" style="width:auto;padding:2px 4px;font-size:var(--t-xs)" 
+                        onchange="mudarStatusImpressora('${imp.id}', this.value)">
+                  <option value="online" ${imp.status==='online'?'selected':''}>🟢 Online</option>
+                  <option value="offline" ${imp.status==='offline'?'selected':''}>🔴 Offline</option>
+                  <option value="manutencao" ${imp.status==='manutencao'?'selected':''}>🟠 Manutenção</option>
+                  <option value="sem_papel" ${imp.status==='sem_papel'?'selected':''}>📄 Sem Papel</option>
+                  <option value="sem_toner" ${imp.status==='sem_toner'?'selected':''}>🖨️ Sem Toner</option>
+                </select>
               </div>
             </div>
             <div class="printer-card-name">${imp.nome}</div>
@@ -2757,15 +3436,13 @@ window.salvarImpressora = async function(id) {
   await loadImpressoras();
   closeModal();navigate('impressoras');
 };
-window.mudarStatusImpressora = async function(id) {
-  const imp = State.impressoras.find(i=>i.id===id);
-  if(!imp) return;
-  const statuses = ['online','offline','manutencao','sem_papel','sem_toner'];
-  const next = statuses[(statuses.indexOf(imp.status)+1) % statuses.length];
-  await sb.from('impressoras').update({status:next}).eq('id',id);
+
+window.mudarStatusImpressora = async function(id, novoStatus) {
+  await sb.from('impressoras').update({ status: novoStatus }).eq('id', id);
   await loadImpressoras();
   navigate('impressoras');
 };
+
 window.verInstrucoesSNMP = function() {
   openModal('Integração SNMP / Contadores', `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4);font-size:var(--t-sm);line-height:1.7;color:var(--c-text-2)">
@@ -2791,6 +3468,7 @@ async function renderPrecos(el) {
       <div><div class="section-title">Tabela de Preços de Cópias</div>
       <div class="section-sub">Configure os preços por tipo de cópia e desconto por volume</div></div>
     </div>
+    <button class="btn btn--primary" onclick="abrirModalNovoPreco()">+ Novo Tipo de Cópia</button>
     <div class="card">
       <div class="table-wrap">
         <table>
@@ -2813,6 +3491,72 @@ async function renderPrecos(el) {
     </div>
   `;
 }
+
+window.abrirModalNovoPreco = function() {
+  openModal('Novo Tipo de Cópia', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="field">
+        <label>Identificador (tipo) *</label>
+        <input type="text" class="input" id="novo-tipo" placeholder="ex: pb_laser, a3_colorida" />
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">Use letras minúsculas, underscore para espaços. Ex: <code>a4_colorida_frente_verso</code></div>
+      </div>
+      <div class="field">
+        <label>Descrição *</label>
+        <input type="text" class="input" id="novo-desc" placeholder="Cópia Colorida A4 Frente e Verso" />
+      </div>
+      <div class="form-row form-row--3">
+        <div class="field"><label>Preço Unitário (₲) *</label><input type="number" class="input" id="novo-unit" step="100" min="0" /></div>
+        <div class="field"><label>Preço com Desconto</label><input type="number" class="input" id="novo-desc-val" step="100" min="0" /></div>
+        <div class="field"><label>A partir de (qtd)</label><input type="number" class="input" id="novo-qtd" value="100" min="1" /></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
+        <input type="checkbox" id="novo-ativo" checked> <span>Ativo no PDV</span>
+      </label>
+      <button class="btn btn--primary btn--lg" onclick="salvarNovoPreco()">💾 Criar Tipo de Cópia</button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.salvarNovoPreco = async function() {
+  const tipo = document.getElementById('novo-tipo').value.trim();
+  const descricao = document.getElementById('novo-desc').value.trim();
+  const preco_unitario = parseFloat(document.getElementById('novo-unit').value) || 0;
+  const preco_desconto = parseFloat(document.getElementById('novo-desc-val').value) || null;
+  const qtd_desconto = parseInt(document.getElementById('novo-qtd').value) || 100;
+  const ativo = document.getElementById('novo-ativo').checked;
+
+  if (!tipo || !descricao || preco_unitario <= 0) {
+    toast('Preencha tipo, descrição e preço unitário', 'warning');
+    return;
+  }
+
+  // Verifica se já existe um tipo com esse identificador
+  const { data: existente } = await sb.from('precos_copia').select('id').eq('tipo', tipo).maybeSingle();
+  if (existente) {
+    toast('Já existe um tipo com esse identificador', 'error');
+    return;
+  }
+
+  const { error } = await sb.from('precos_copia').insert({
+    tipo,
+    descricao,
+    preco_unitario,
+    preco_desconto,
+    qtd_desconto,
+    ativo
+  });
+
+  if (error) {
+    toast('Erro ao criar: ' + error.message, 'error');
+    return;
+  }
+
+  toast('Novo tipo de cópia criado!', 'success');
+  closeModal();
+  await loadPrecosCopia(); // recarrega o state
+  navigate('precos');       // re-renderiza a página
+};
+
 window.editarPreco = async function(id) {
   const {data} = await sb.from('precos_copia').select('*').eq('id',id).single();
   if(!data) return;
@@ -3684,6 +4428,7 @@ async function renderFilaProducao(el) {
         <div class="live-dot" title="Atualização automática a cada ${FILA_REFRESH_MS/1000}s"></div>
         <span style="font-size:var(--t-sm);font-weight:600">Fila de Produção</span>
         <span style="font-size:var(--t-xs);color:var(--c-text-3)" id="fila-ultima-atualizacao"></span>
+        <button class="btn btn--ghost btn--sm" onclick="limparConcluidos()">🧹 Limpar Concluídos</button>
 
         <div style="margin-left:auto;display:flex;gap:var(--sp-2);flex-wrap:wrap">
           <!-- Filtro de status -->
@@ -3717,6 +4462,17 @@ async function renderFilaProducao(el) {
     else { clearInterval(_filaRefreshTimer); _filaRefreshTimer = null; }
   }, FILA_REFRESH_MS);
 }
+
+window.limparConcluidos = async function() {
+  if (!confirm('Remover todos os pedidos concluídos da fila?')) return;
+  const { error } = await sb
+    .from('pedidos_copia')
+    .delete()
+    .eq('status', 'concluido');
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  toast('Pedidos concluídos removidos!', 'success');
+  refreshFila();
+};
 
 // ── Carrega e renderiza pedidos por impressora ─────────────
 window.refreshFila = async function() {
@@ -3754,11 +4510,12 @@ window.refreshFila = async function() {
   // Filtro ativo
   const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
 
+
   // Renderiza colunas
   filaBody.innerHTML = Object.values(porImpressora).map(({ impressora, pedidos: peds }) => {
     const pedidosFiltrados = filtroAtivo === 'todos'
-      ? peds
-      : peds.filter(p => p.status === filtroAtivo);
+    ? peds.filter(p => p.status !== 'concluido')
+    : peds.filter(p => p.status === filtroAtivo);
 
     const counts = {
       na_fila:     peds.filter(p => p.status === 'na_fila').length,
@@ -4145,6 +4902,15 @@ window.filtrarFila = function(chip, filtro) {
   chip.dataset.filtro = filtro;
   refreshFila();
 };
+
+async function renderAssinatura(el) {
+  el.innerHTML = `<div id="painel-assinatura" style="padding:20px;"></div>`;
+  if (typeof carregarPainelAssinatura === 'function') {
+    await carregarPainelAssinatura();
+  } else {
+    el.innerHTML = '<div class="empty-state">Módulo de assinatura não carregado.</div>';
+  }
+}
 
 window.navigate = navigate;
 async function renderUsuarios(el) {

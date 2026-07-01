@@ -1369,3 +1369,85 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
   justify-content: center;
   padding: 8px 0;
 }
+
+/* ── Estilos para o painel de assinatura ────────────────── */
+.sub-card {
+  background: var(--c-card);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+}
+.sub-card-label {
+  font-size: var(--t-xs);
+  color: var(--c-text-3);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  font-weight: 600;
+}
+.sub-card-value {
+  font-size: var(--t-xl);
+  font-weight: 700;
+  color: var(--c-text);
+}
+.sub-section {
+  margin-top: var(--sp-6);
+  padding: var(--sp-5);
+  background: var(--c-card);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+}
+.sub-section-title {
+  font-size: var(--t-md);
+  font-weight: 600;
+  margin-bottom: var(--sp-4);
+}
+.sub-label {
+  display: block;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  color: var(--c-text-2);
+  margin-bottom: var(--sp-1);
+}
+.sub-input {
+  background: var(--c-bg);
+  border: 1.5px solid var(--c-border);
+  border-radius: var(--r-md);
+  padding: 9px 12px;
+  color: var(--c-text);
+  font-size: var(--t-base);
+  width: 100%;
+  transition: border-color var(--dur-fast), box-shadow var(--dur-fast);
+}
+.sub-input:focus {
+  border-color: var(--c-primary);
+  box-shadow: var(--shadow-glow);
+}
+.sub-btn-primary {
+  background: var(--c-primary);
+  color: #fff;
+  border: none;
+  padding: 9px 18px;
+  border-radius: var(--r-md);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-fast);
+}
+.sub-btn-primary:hover { background: var(--c-primary-h); }
+.sub-btn-secondary {
+  background: transparent;
+  color: var(--c-text-2);
+  border: 1px solid var(--c-border);
+  padding: 9px 18px;
+  border-radius: var(--r-md);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--dur-fast);
+}
+.sub-btn-secondary:hover { background: var(--c-card); color: var(--c-text); }
+.alert-box {
+  padding: var(--sp-4);
+  border-radius: var(--r-md);
+  font-weight: 500;
+}
+.alert-box.error { background: var(--c-danger-s); color: var(--c-danger); border-left: 3px solid var(--c-danger); }
+.alert-box.success { background: var(--c-success-s); color: var(--c-success); border-left: 3px solid var(--c-success); }

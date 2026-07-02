@@ -1114,7 +1114,7 @@ window.pdvLerCodigoBarras = async function(codigo) {
 
   // Se não achou (produto pode estar fora do cache), busca no banco
   if (!produto) {
-    const { data } = await sb.from('produtos').select('*').eq('codigo_barras', valor).eq('ativo', true).maybeSingle();
+    const { data } = await sb.from('produtos').select('*').eq('codigo_barras', valor).eq('ativo', true).eq('tipo', 'produto').maybeSingle();
     produto = data || null;
   }
 
@@ -2478,8 +2478,8 @@ window.abrirModalProduto = async function(produtoId) {
       <div class="field">
         <label>Tipo</label>
         <select class="input" id="prod-tipo">
-          <option value="produto">Produto (venda)</option>
-          <option value="insumo">Insumo (consumo)</option>
+          <option value="produto" ${(!p.tipo || p.tipo==='produto')?'selected':''}>Produto (venda)</option>
+          <option value="insumo" ${p.tipo==='insumo'?'selected':''}>Insumo (consumo)</option>
         </select>
       </div>
       <div class="form-row form-row--3">
@@ -2623,6 +2623,98 @@ window.salvarVinculos = async function(produtoId) {
 };
 
 window.editarProduto = function(id) { abrirModalProduto(id); };
+
+// ── Composição de insumos por TIPO DE CÓPIA (papel, toner, etc.) ──
+// Consumo é definido "por folha impressa" e é baixado do estoque na
+// conferência/entrega (confirmarConferencia), quando sabemos a quantidade
+// real de folhas usadas.
+window.gerenciarInsumosCopia = async function(tipoCopia, descricao) {
+  const { data: vinculos } = await sb.from('copia_insumos')
+    .select('*, insumos:insumo_id(id, nome, unidade, estoque_atual)')
+    .eq('tipo_copia', tipoCopia);
+
+  const { data: insumos } = await sb.from('produtos')
+    .select('id, nome, unidade, estoque_atual')
+    .eq('tipo', 'insumo')
+    .order('nome');
+
+  openModal(`Insumos de "${descricao}"`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="font-size:var(--t-sm);color:var(--c-text-3)">Informe quantos de cada insumo são consumidos por <strong>folha impressa</strong> deste tipo de cópia.</div>
+      <div id="lista-vinculos-copia" style="display:flex;flex-direction:column;gap:var(--sp-2)">
+        ${(vinculos||[]).map(v => `
+          <div style="display:flex;align-items:center;gap:var(--sp-3);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)">
+            <span style="flex:1">${v.insumos.nome}</span>
+            <input type="number" class="input" id="qtd-copia-${v.insumo_id}" value="${v.quantidade}" step="0.01" min="0.001" style="width:80px" />
+            <span>por folha</span>
+            <button class="pdv-remove-btn" onclick="removerInsumoVinculoCopia('${v.id}','${tipoCopia}','${descricao.replace(/'/g,"\\'")}')">✕</button>
+          </div>
+        `).join('') || '<div style="color:var(--c-text-3);font-size:var(--t-xs)">Nenhum insumo vinculado ainda.</div>'}
+      </div>
+      <div style="display:flex;gap:var(--sp-2);align-items:center">
+        <select class="input" id="novo-insumo-copia-id" style="flex:1">
+          <option value="">— Adicionar insumo —</option>
+          ${(insumos||[]).map(i => `<option value="${i.id}">${i.nome} (${i.unidade}) – Estoque: ${i.estoque_atual}</option>`).join('')}
+        </select>
+        <button class="btn btn--ghost" onclick="adicionarInsumoVinculoCopia()">+ Adicionar</button>
+      </div>
+      <button class="btn btn--primary" onclick="salvarVinculosCopia('${tipoCopia}')">💾 Salvar</button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.removerInsumoVinculoCopia = async function(vinculoId, tipoCopia, descricao) {
+  if (!confirm('Remover este insumo do tipo de cópia?')) return;
+  await sb.from('copia_insumos').delete().eq('id', vinculoId);
+  toast('Insumo removido', 'info');
+  gerenciarInsumosCopia(tipoCopia, descricao);
+};
+
+window.adicionarInsumoVinculoCopia = function() {
+  const select = document.getElementById('novo-insumo-copia-id');
+  const insumoId = select.value;
+  if (!insumoId) { toast('Selecione um insumo', 'warning'); return; }
+  const nome = select.options[select.selectedIndex].text;
+  const lista = document.getElementById('lista-vinculos-copia');
+  const div = document.createElement('div');
+  div.style.cssText = 'display:flex;align-items:center;gap:var(--sp-3);background:var(--c-bg);padding:var(--sp-3);border-radius:var(--r-md)';
+  div.dataset.insumoId = insumoId;
+  div.innerHTML = `
+    <span style="flex:1">${nome}</span>
+    <input type="number" class="input" id="qtd-copia-${insumoId}" value="1" step="0.01" min="0.001" style="width:80px" />
+    <span>por folha</span>
+    <button class="pdv-remove-btn" onclick="this.parentElement.remove()">✕</button>
+  `;
+  lista.appendChild(div);
+  select.value = '';
+};
+
+window.salvarVinculosCopia = async function(tipoCopia) {
+  const itens = [];
+  document.querySelectorAll('#lista-vinculos-copia > div').forEach(div => {
+    const insumoId = div.dataset.insumoId || div.querySelector('input[type="number"]')?.id?.replace('qtd-copia-', '');
+    if (!insumoId) return;
+    const qtd = parseFloat(div.querySelector('input[type="number"]')?.value || 0);
+    if (qtd > 0) itens.push({ insumo_id: insumoId, quantidade: qtd });
+  });
+
+  for (const item of itens) {
+    const { data: existing } = await sb.from('copia_insumos')
+      .select('id')
+      .eq('tipo_copia', tipoCopia)
+      .eq('insumo_id', item.insumo_id)
+      .maybeSingle();
+    if (existing) {
+      await sb.from('copia_insumos').update({ quantidade: item.quantidade }).eq('id', existing.id);
+    } else {
+      await sb.from('copia_insumos').insert({ tipo_copia: tipoCopia, insumo_id: item.insumo_id, quantidade: item.quantidade });
+    }
+  }
+  toast('Insumos da cópia salvos!', 'success');
+  closeModal();
+  navigate('precos');
+};
+
 
 window.salvarProduto = async function(id) {
   const payload = {
@@ -3575,7 +3667,7 @@ async function renderPrecos(el) {
     <div class="card">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>💳 Cartão</th><th>Ativo</th><th></th></tr></thead>
+          <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>💳 Cartão</th><th>Ativo</th><th>Ações</th></tr></thead>
           <tbody>
             ${(precos||[]).map(p=>`
               <tr>
@@ -3586,7 +3678,10 @@ async function renderPrecos(el) {
                 <td>${p.qtd_desconto||'—'} cópias</td>
                 <td>${p.preco_cartao ? formatMoney(p.preco_cartao) : '—'}</td>
                 <td><span class="badge badge--${p.ativo?'success':'danger'}">${p.ativo?'Sim':'Não'}</span></td>
-                <td><button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️ Editar</button></td>
+                <td style="display:flex;gap:4px">
+                  <button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️</button>
+                  <button class="btn btn--ghost btn--sm" onclick="gerenciarInsumosCopia('${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Vincular insumos consumidos por folha">🧩</button>
+                </td>
               </tr>
             `).join('')}
           </tbody>
@@ -3764,7 +3859,7 @@ window.filtrarTabela = debounce(function(q, tableId) {
 async function renderPassagens(el) {
   // Roles de visibilidades
   const userRole = State.userProfile?.role || 'funcionario';
-  const isAdmin = userRole === 'admin' || userRole === 'adminMaster';
+  const isAdmin = userRole === 'admin'
   
   // Carrega configurações de comissão
   const { data: comissoes } = await sb.from('config_comissoes').select('*');
@@ -5347,6 +5442,23 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     // Atualiza state local também
     if (imp[campo]      !== undefined) imp[campo]      += folhasReal;
     if (imp[campoTotal] !== undefined) imp[campoTotal] += folhasReal;
+  }
+
+  // Consumo de insumos vinculados a este tipo de cópia (papel, toner, etc.),
+  // proporcional às folhas REALMENTE usadas (não a quantidade solicitada).
+  const { data: pedidoAtual } = await sb.from('pedidos_copia').select('tipo').eq('id', pedidoId).single();
+  if (pedidoAtual?.tipo) {
+    const { data: vinculosInsumo } = await sb.from('copia_insumos')
+      .select('*, insumos:insumo_id(id, nome, estoque_atual)')
+      .eq('tipo_copia', pedidoAtual.tipo);
+    for (const v of (vinculosInsumo || [])) {
+      const consumo = v.quantidade * folhasReal;
+      const estoqueAtual = v.insumos?.estoque_atual || 0;
+      if (estoqueAtual < consumo) {
+        toast(`⚠️ Estoque de "${v.insumos?.nome}" ficou negativo (usado além do disponível).`, 'warning', 5000);
+      }
+      await sb.from('produtos').update({ estoque_atual: Math.max(0, estoqueAtual - consumo) }).eq('id', v.insumo_id);
+    }
   }
 
   // Marca pedido como concluído

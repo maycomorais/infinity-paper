@@ -353,7 +353,7 @@ input, select, textarea {
   border: 1px solid var(--c-border);
   border-radius: var(--r-lg);
   overflow: auto;
-  height: 100%;
+  height: auto;
 }
 .card-header {
   display: flex;
@@ -1451,3 +1451,49 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
 }
 .alert-box.error { background: var(--c-danger-s); color: var(--c-danger); border-left: 3px solid var(--c-danger); }
 .alert-box.success { background: var(--c-success-s); color: var(--c-success); border-left: 3px solid var(--c-success); }
+
+/* ── Desconto no carrinho ── */
+.discount-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-top: 1px dashed var(--c-border);
+}
+.discount-row input[type="number"] {
+  width: 100px;
+  text-align: center;
+}
+.discount-row select {
+  width: 100px;
+  padding: 4px 8px;
+  background: var(--c-bg);
+  border: 1.5px solid var(--c-border);
+  border-radius: var(--r-sm);
+  color: var(--c-text);
+  font-size: var(--t-xs);
+}
+.discount-row .discount-label {
+  font-size: var(--t-xs);
+  color: var(--c-text-3);
+}
+.tax-badge {
+  font-size: var(--t-xs);
+  color: var(--c-warning);
+  background: var(--c-warning-s);
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+}
+/* ── Etiqueta ── */
+.etiqueta-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4);
+  background: #fff;
+  border-radius: var(--r-md);
+}
+.etiqueta-container svg {
+  max-width: 100%;
+}

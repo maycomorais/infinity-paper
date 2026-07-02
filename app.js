@@ -10,6 +10,88 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 window.sb = sb;
 window.supa = sb; // também para compatibilidade
 
+// ── LOG DE AUDITORIA ───────────────────────────────────────
+// Registra ações administrativas (criar/editar/bloquear/excluir etc.)
+// Não bloqueia o fluxo principal se falhar — apenas avisa no console.
+async function registrarLog(acao, entidade, entidade_id, detalhes = {}) {
+  try {
+    await sb.from('logs_admin').insert({
+      usuario_id: State.user?.id || null,
+      usuario_email: State.user?.email || null,
+      acao,
+      entidade,
+      entidade_id: entidade_id != null ? String(entidade_id) : null,
+      detalhes,
+    });
+  } catch (e) {
+    console.warn('[Log] Falha ao registrar log de auditoria:', e);
+  }
+}
+window.registrarLog = registrarLog;
+
+// ── PERSISTÊNCIA DO CARRINHO NO SESSIONSTORAGE ──────────
+const PDV_STORAGE_KEY = 'pm_pdv_state';
+
+function salvarEstadoPdv() {
+  try {
+    const estado = {
+      carrinho: PdvState.carrinho,
+      desconto: PdvState.desconto,
+      pagamento: PdvState.pagamento,
+      impressoraSelecionada: PdvState.impressoraSelecionada,
+      tipoCopia: PdvState.tipoCopia,
+      quantidade: PdvState.quantidade,
+      frenteVerso: PdvState.frenteVerso,
+      paginasPorDocumento: PdvState.paginasPorDocumento,
+      step: PdvState.step,
+      aba: PdvState.aba,
+    };
+    sessionStorage.setItem(PDV_STORAGE_KEY, JSON.stringify(estado));
+  } catch (e) { /* ignora */ }
+}
+
+function carregarEstadoPdv() {
+  try {
+    const raw = sessionStorage.getItem(PDV_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+
+function limparEstadoPdv() {
+  sessionStorage.removeItem(PDV_STORAGE_KEY);
+}
+
+// ── MENSAGENS DE ERRO AMIGÁVEIS ────────────────────────────
+// Traduz erros técnicos do Postgres/Supabase para algo que o usuário entenda.
+// A mensagem original sempre vai pro console, pra não perder o debug.
+function mensagemErroAmigavel(error, contexto = '') {
+  console.error(`[Erro${contexto ? ' — ' + contexto : ''}]`, error);
+  const msg = (error?.message || '').toLowerCase();
+
+  if (msg.includes('duplicate key') || msg.includes('already registered') || msg.includes('já existe')) {
+    return 'Já existe um registro com esses dados.';
+  }
+  if (msg.includes('violates foreign key') || msg.includes('foreign key constraint')) {
+    return 'Não é possível concluir: existem outros registros vinculados a este item.';
+  }
+  if (msg.includes('permission denied') || msg.includes('acesso negado') || msg.includes('rls')) {
+    return 'Você não tem permissão para realizar esta ação.';
+  }
+  if (msg.includes('network') || msg.includes('failed to fetch') || msg.includes('timeout')) {
+    return 'Falha de conexão. Verifique sua internet e tente novamente.';
+  }
+  if (msg.includes('invalid login') || msg.includes('invalid credentials')) {
+    return 'E-mail ou senha inválidos.';
+  }
+  if (msg.includes('password') && msg.includes('short')) {
+    return 'A senha é muito curta (mínimo 6 caracteres).';
+  }
+  // Sem tradução conhecida: mostra algo genérico, sem expor SQL/estrutura interna
+  return 'Ocorreu um erro ao processar sua solicitação. Tente novamente ou contate o suporte.';
+}
+window.mensagemErroAmigavel = mensagemErroAmigavel;
+
 // ── STATE GLOBAL ──────────────────────────────────────────
 const State = {
   user: null,
@@ -27,8 +109,7 @@ const STORAGE_KEY = 'pm_last_page';
 const NAV = [
   { group: 'Principal' },
   { id: 'dashboard',    label: 'Dashboard',     icon: '📊', page: renderDashboard, roles: ['admin', 'funcionario'] },
-  { id: 'copias',       label: 'Cópias / PDV',  icon: '🖨️', page: renderCopias,   pdv: true, roles: ['admin', 'funcionario'] },
-  { id: 'vendas',       label: 'Vendas Loja',   icon: '🛍️', page: renderVendas, roles: ['admin', 'funcionario'] },
+  { id: 'copias',       label: 'PDV',           icon: '🖨️', page: renderCopias,   pdv: true, roles: ['admin', 'funcionario'] },
   { id: 'passagens',    label: 'Passagens NSA', icon:'🚌', page: renderPassagens, roles: ['admin', 'funcionario'] },
   { group: 'Produção' },
   { id: 'fila',         label: 'Fila de Produção', icon:'🖨️', page: renderFilaProducao, pdv: true, roles: ['admin', 'funcionario'] },
@@ -39,6 +120,7 @@ const NAV = [
 
   { group: 'Gestão' },
   { id: 'caixa',        label: 'Caixa',         icon: '💰', page: renderCaixa, roles: ['admin', 'funcionario'] },
+  { id: 'fiado',        label: 'Fiado',         icon: '📒', page: renderFiado, roles: ['admin', 'funcionario'] },
   { id: 'estoque',      label: 'Estoque',       icon: '📦', page: renderEstoque, roles: ['admin', 'funcionario'] },
   { id: 'contas',       label: 'Contas',        icon: '📋', page: renderContas, roles: ['admin'] },
   { id: 'compras',      label: 'Compras',       icon: '🛒', page: renderCompras, roles: ['admin'] },
@@ -112,11 +194,13 @@ async function initApp() {
   await Promise.all([loadEmpresa(), loadImpressoras(), loadPrecosCopia()]);
    console.log('✅ Dados base carregados');
 
-  if (State.empresa?.config?.cotacao_brl) {
-    setCotacao(State.empresa.config.cotacao_brl);
-    // Atualiza o campo do widget se ele já existir
+  // Cotação BRL: fonte única é a coluna empresa.cotacao_brl.
+  // Fallback pro campo antigo (config.cotacao_brl) só pra não perder valor já salvo por instalações antigas.
+  const cotacaoDoBanco = State.empresa?.cotacao_brl ?? State.empresa?.config?.cotacao_brl;
+  if (cotacaoDoBanco) {
+    setCotacao(cotacaoDoBanco);
     const input = document.getElementById('input-cotacao');
-    if (input) input.value = State.empresa.config.cotacao_brl;
+    if (input) input.value = cotacaoDoBanco;
   }
 
   if (State.user) {
@@ -406,15 +490,16 @@ window.salvarCotacao = async function() {
   const val = parseFloat(document.getElementById('input-cotacao')?.value);
   if (!val || val < 100) { toast('Cotação inválida', 'warning'); return; }
 
-  // Atualiza no localStorage
+  // Cache local (usado como valor inicial instantâneo antes do banco responder)
   setCotacao(val);
 
-  // Atualiza no banco
-  const { data: empresa } = await sb.from('empresa').select('id, config').single();
+  // Fonte de verdade: coluna dedicada empresa.cotacao_brl
+  const { data: empresa } = await sb.from('empresa').select('id').single();
   if (empresa) {
-    const config = empresa.config || {};
-    config.cotacao_brl = val;
-    await sb.from('empresa').update({ config }).eq('id', empresa.id);
+    const { error } = await sb.from('empresa').update({ cotacao_brl: val }).eq('id', empresa.id);
+    if (error) { toast(mensagemErroAmigavel(error, 'salvar cotação'), 'error'); return; }
+    State.empresa.cotacao_brl = val;
+    await registrarLog('editar', 'cotacao_brl', empresa.id, { valor: val });
   }
 
   toast(`Cotação atualizada: R$1 = ₲${val.toLocaleString('es-PY')}`, 'success');
@@ -495,6 +580,21 @@ window.closeModal = closeModal;
 // ============================================================
 // ── MÓDULO: DASHBOARD ─────────────────────────────────────
 // ============================================================
+// ── Total efetivamente realizado num período ──────────────
+// Vendas em 'fiado' NÃO contam como receita enquanto não forem
+// quitadas — contam no dia em que o cliente realmente pagar
+// (quitado_em), não no dia da venda original.
+async function getTotalRealizado(tabela, dataInicioISO) {
+  const [{ data: normais }, { data: quitados }] = await Promise.all([
+    sb.from(tabela).select('total').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO),
+    sb.from(tabela).select('total').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO),
+  ]);
+  const total = (normais || []).reduce((a, b) => a + (b.total || 0), 0)
+              + (quitados || []).reduce((a, b) => a + (b.total || 0), 0);
+  const count = (normais || []).length + (quitados || []).length;
+  return { total, count };
+}
+
 async function renderDashboard(el) {
   const hoje = new Date();
   const inicioHoje = new Date(hoje.setHours(0,0,0,0)).toISOString();
@@ -502,23 +602,18 @@ async function renderDashboard(el) {
   const inicioMes = new Date(hoje.getFullYear(), hoje.getMonth(), 1).toISOString();
 
   const [
-    { data: copiasHoje },
-    { data: copiasMes },
-    { data: vendasHoje },
+    { total: totalCopiasHoje, count: qtdCopiasHoje },
+    { total: totalCopiasMes, count: qtdCopiasMes },
+    { total: totalVendasHoje },
     { data: contasVencer },
     { data: estoqueCritico },
   ] = await Promise.all([
-    sb.from('pedidos_copia').select('total').eq('status','concluido').gte('created_at', inicioHoje),
-    sb.from('pedidos_copia').select('total').eq('status','concluido').gte('created_at', inicioMes),
-    sb.from('vendas').select('total').eq('status','concluido').gte('created_at', inicioHoje),
+    getTotalRealizado('pedidos_copia', inicioHoje),
+    getTotalRealizado('pedidos_copia', inicioMes),
+    getTotalRealizado('vendas', inicioHoje),
     sb.from('contas').select('id').eq('status','pendente').lte('vencimento', new Date(Date.now()+7*86400000).toISOString().split('T')[0]),
     sb.from('vw_estoque_critico').select('id'),
   ]);
-
-  const sumTotal = arr => (arr||[]).reduce((a,b) => a + (b.total||0), 0);
-  const totalCopiasHoje = sumTotal(copiasHoje);
-  const totalCopiasMes  = sumTotal(copiasMes);
-  const totalVendasHoje = sumTotal(vendasHoje);
 
   // Últimos pedidos de cópia
   const { data: ultimosPedidos } = await sb.from('pedidos_copia')
@@ -534,7 +629,7 @@ async function renderDashboard(el) {
           <span class="stat-card-icon">🖨️</span>
         </div>
         <div class="stat-card-value">${formatMoney(totalCopiasHoje)}</div>
-        <div class="stat-card-sub">${(copiasHoje||[]).length} pedidos realizados</div>
+        <div class="stat-card-sub">${qtdCopiasHoje} pedidos realizados</div>
       </div>
       <div class="stat-card stat-card--success">
         <div class="stat-card-header">
@@ -550,7 +645,7 @@ async function renderDashboard(el) {
           <span class="stat-card-icon">📅</span>
         </div>
         <div class="stat-card-value">${formatMoney(totalCopiasMes)}</div>
-        <div class="stat-card-sub">${(copiasMes||[]).length} pedidos este mês</div>
+        <div class="stat-card-sub">${qtdCopiasMes} pedidos este mês</div>
       </div>
       <div class="stat-card stat-card--danger">
         <div class="stat-card-header">
@@ -615,7 +710,7 @@ async function renderDashboard(el) {
           <div class="card-header"><span class="card-title">Ações Rápidas</span></div>
           <div class="card-body" style="display:flex;flex-direction:column;gap:var(--sp-2)">
             <button class="btn btn--primary" style="width:100%;justify-content:center" onclick="navigate('copias')">🖨️ Registrar Cópias</button>
-            <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('vendas')">🛍️ Nova Venda</button>
+            <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('copias')">🛍️ Nova Venda</button>
             <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('caixa')">💰 Ver Caixa</button>
             <button class="btn btn--ghost" style="width:100%;justify-content:center" onclick="navigate('contas')">📋 Contas a Pagar</button>
           </div>
@@ -626,212 +721,233 @@ async function renderDashboard(el) {
 }
 
 // ============================================================
-// ── MÓDULO: CÓPIAS / PDV ──────────────────────────────────
 // ============================================================
+// ── MÓDULO: PDV UNIFICADO (Cópias + Produtos) ─────────────
+// ============================================================
+// Um único carrinho mistura itens de impressão ('copia') e
+// itens de produto ('produto'). Regra de finalização:
+//   • Carrinho só com cópias  → envia para a Fila de Produção
+//     (pedidos_copia, status 'na_fila'), igual ao fluxo anterior.
+//   • Carrinho com produto(s) → registra a venda de produtos
+//     imediatamente (vendas/venda_itens, status 'concluido',
+//     baixa de estoque) e, se também houver cópias, essas
+//     cópias são enviadas para a fila normalmente. Ou seja: o
+//     carrinho "finaliza" tudo em uma única ação, mas cada
+//     parte segue para onde já era controlada financeiramente
+//     — assim não há risco de contar a mesma venda duas vezes
+//     nos relatórios de caixa.
 const PdvState = {
+  // aba ativa no painel esquerdo
+  aba: 'copia', // 'copia' | 'produto'
+  // seleção de impressão (equivalente ao antigo passo 1→ removido)
   impressoraSelecionada: null,
   tipoCopia: null,
   quantidade: 1,
   frenteVerso: false,
-  carrinho: [],
-  pagamento: 'dinheiro',
-  clienteId: null,
-  step: 1, 
   paginasPorDocumento: 1,
-};
-
-const VendaProdutoState = {
+  // passo do "mini-stepper" de impressão: 1 = tipo, 2 = quantidade
+  // (o antigo passo 1 — escolher impressora — foi removido; a
+  // impressora é escolhida por um seletor compacto sempre visível)
+  step: 1,
+  // carrinho único
   carrinho: [],
   pagamento: 'dinheiro',
+  desconto: 0,
+  clienteId: null,
 };
 
 async function renderCopias(el) {
+    // Restaura estado salvo, se existir
+  const estadoSalvo = carregarEstadoPdv();
+  if (estadoSalvo) {
+    Object.assign(PdvState, estadoSalvo);
+  } else {
+    // Valores padrão (caso não haja estado salvo)
+    PdvState.step = 1;
+    PdvState.carrinho = [];
+    PdvState.desconto = 0;
+    PdvState.pagamento = 'dinheiro';
+    PdvState.impressoraSelecionada = null;
+    PdvState.tipoCopia = null;
+    PdvState.quantidade = 1;
+    PdvState.frenteVerso = false;
+    PdvState.paginasPorDocumento = 1;
+    PdvState.aba = 'copia';
+  }
+
   await loadImpressoras();
   await loadPrecosCopia();
+  await carregarProdutosPdv();
 
-  // Garante que o step seja 1 ao entrar
+  if (!PdvState.impressoraSelecionada) {
+    const online = State.impressoras.find(i => i.status === 'online') || State.impressoras[0];
+    PdvState.impressoraSelecionada = online?.id || null;
+  }
+
   PdvState.step = 1;
+  if (!PdvState.impressoraSelecionada) {
+    const online = State.impressoras.find(i => i.status === 'online') || State.impressoras[0];
+    PdvState.impressoraSelecionada = online?.id || null;
+  }
 
-  // HTML base: painel esquerdo com stepper + painel direito fixo
   el.innerHTML = `
-    <div class="pdv-layout">
-      <!-- ESQUERDA: Stepper -->
-      <div class="pdv-left">
-        <div class="stepper-header">
-          <div class="step-indicators">
-            <span class="step-dot ${PdvState.step === 1 ? 'active' : ''}" data-step="1">1</span>
-            <span class="step-line"></span>
-            <span class="step-dot ${PdvState.step === 2 ? 'active' : ''}" data-step="2">2</span>
-            <span class="step-line"></span>
-            <span class="step-dot ${PdvState.step === 3 ? 'active' : ''}" data-step="3">3</span>
-          </div>
-          <div class="step-label">${getStepLabel(PdvState.step)}</div>
-        </div>
+  <div class="pdv-layout">
+    <!-- ESQUERDA -->
+    <div class="pdv-left">
+      <div class="chip-row" style="margin-bottom:var(--sp-3)">
+        <span class="chip ${PdvState.aba==='copia'?'active':''}" onclick="pdvMudarAba('copia',this)">🖨️ Impressões</span>
+        <span class="chip ${PdvState.aba==='produto'?'active':''}" onclick="pdvMudarAba('produto',this)">📦 Produtos</span>
+      </div>
+      <div id="pdv-aba-content"></div>
+    </div>
 
-        <div id="step-content">
-          <!-- Renderizado dinamicamente -->
-        </div>
-
-        <!-- Navegação entre passos -->
-        <div class="step-nav">
-          <button class="btn btn--ghost" id="step-back" style="${PdvState.step === 1 ? 'display:none' : ''}">
-            ← Voltar
-          </button>
-          <button class="btn btn--primary" id="step-next">
-            ${PdvState.step === 3 ? '➕ Adicionar ao Carrinho' : 'Avançar →'}
-          </button>
+    <!-- DIREITA: Carrinho único -->
+    <div class="pdv-right">
+      <div class="pdv-panel-header">
+        <div style="font-size:var(--t-md);font-weight:700">🧾 Carrinho</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)" id="carrinho-count">0 itens</div>
+      </div>
+      <div class="pdv-panel-items" id="pdv-items">
+        <div class="empty-state">
+          <div class="empty-state-icon">🧾</div>
+          <div class="empty-state-sub">Carrinho vazio</div>
         </div>
       </div>
-
-      <!-- DIREITA: Painel do carrinho (igual ao anterior) -->
-      <div class="pdv-right">
-        <div class="pdv-panel-header">
-          <div style="font-size:var(--t-md);font-weight:700">🧾 Carrinho</div>
-          <div style="font-size:var(--t-xs);color:var(--c-text-3)" id="carrinho-count">0 itens</div>
+      <div class="pdv-panel-footer">
+        <div class="field" style="margin-bottom:var(--sp-2)">
+          <label>Desconto (₲)</label>
+          <input type="number" class="input" id="input-desconto" min="0" step="100" value="${PdvState.desconto || ''}"
+                 placeholder="0" oninput="aplicarDesconto(this.value)" />
         </div>
-        <div class="pdv-panel-items" id="pdv-items">
-          <div class="empty-state">
-            <div class="empty-state-icon">🖨️</div>
-            <div class="empty-state-sub">Selecione uma impressora e tipo de cópia para começar</div>
+        <div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-text-3)">
+          <span>Subtotal</span>
+          <span id="pdv-subtotal-value">${formatMoney(0)}</span>
+        </div>
+        <div class="pdv-total-row">
+          <span class="pdv-total-label">Total</span>
+          <span class="pdv-total-value" id="pdv-total-value">${formatMoney(0)}</span>
+        </div>
+        <div id="pdv-total-brl" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
+          🇧🇷 ≈ <span id="pdv-total-brl-value">R$ 0,00</span>
+        </div>
+        <div class="field">
+          <label>Forma de Pagamento</label>
+          <div class="payment-methods" id="payment-methods">
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
+              <button class="payment-btn ${PdvState.pagamento===p?'selected':''}"
+                      onclick="selecionarPagamento('${p}')" data-pag="${p}">
+                ${labelPagamento(p)}
+              </button>
+            `).join('')}
           </div>
         </div>
-        <div class="pdv-panel-footer">
-          <div class="pdv-total-row">
-            <span class="pdv-total-label">Total</span>
-            <span class="pdv-total-value" id="pdv-total-value">${formatMoney(0)}</span>
-          </div>
-          <div id="pdv-total-brl" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
-            🇧🇷 ≈ <span id="pdv-total-brl-value">R$ 0,00</span>
-          </div>
-          <div class="field">
-            <label>Forma de Pagamento</label>
-            <div class="payment-methods" id="payment-methods">
-              ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
-                <button class="payment-btn ${PdvState.pagamento===p?'selected':''}"
-                        onclick="selecionarPagamento('${p}')" data-pag="${p}">
-                  ${labelPagamento(p)}
-                </button>
-              `).join('')}
-            </div>
-          </div>
-          <div class="field" style="margin-bottom:var(--sp-2)">
-            <label>Cliente / Identificação</label>
-            <input type="text" class="input" id="input-cliente-nome-pdv"
-                   placeholder="Nome para identificar o pedido (opcional)" />
-          </div>
-          <div id="troco-row" style="display:none">...</div>
-          <div id="pix-brl-row" style="display:none">...</div>
-          <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" id="btn-finalizar-venda" onclick="finalizarVenda()">
-            📋 Enviar para Fila — <span id="btn-total">${formatMoney(0)}</span>
-          </button>
-          <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinho()">
-            🗑️ Limpar carrinho
-          </button>
+        <div class="field" style="margin-bottom:var(--sp-2)">
+          <label>Cliente / Identificação</label>
+          <input type="text" class="input" id="input-cliente-nome-pdv"
+                 placeholder="Nome para identificar o pedido (opcional)" />
         </div>
+        <div id="troco-row" style="display:none">...</div>
+        <div id="pix-brl-row" style="display:none">...</div>
+        <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" id="btn-finalizar-venda" onclick="finalizarVenda()">
+          <span id="btn-finalizar-label">📋 Enviar para Fila</span> — <span id="btn-total">${formatMoney(0)}</span>
+        </button>
+        <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinho()">
+          🗑️ Limpar carrinho
+        </button>
       </div>
     </div>
-  `;
+  </div>
+`;
 
-  // Renderiza o conteúdo do passo atual
-  renderStep(PdvState.step);
-
-  // Eventos dos botões de navegação
-  document.getElementById('step-back')?.addEventListener('click', () => {
-    if (PdvState.step > 1) {
-      PdvState.step--;
-      renderStep(PdvState.step);
-      updateStepUI();
-    }
-  });
-
-  document.getElementById('step-next')?.addEventListener('click', () => {
-    if (PdvState.step === 1 && !PdvState.impressoraSelecionada) {
-      toast('Selecione uma impressora', 'warning');
-      return;
-    }
-    if (PdvState.step === 2 && !PdvState.tipoCopia) {
-      toast('Selecione o tipo de cópia', 'warning');
-      return;
-    }
-    if (PdvState.step === 3) {
-      // Adiciona ao carrinho
-      adicionarAoCarrinho();
-      // Opcional: volta para o passo 1 após adicionar
-      // PdvState.step = 1;
-      // renderStep(1);
-      // updateStepUI();
-      return;
-    }
-    if (PdvState.step < 3) {
-      PdvState.step++;
-      renderStep(PdvState.step);
-      updateStepUI();
-    }
-  });
-
-  // Atualiza carrinho
+  renderAbaPdv();
   atualizarCarrinhoUI();
 }
 
+// ── Alternância de abas ───────────────────────────────────
+window.pdvMudarAba = function(aba, el) {
+  PdvState.aba = aba;
+  document.querySelectorAll('.pdv-left .chip').forEach(c => c.classList.remove('active'));
+  el?.classList.add('active');
+  renderAbaPdv();
+  salvarEstadoPdv()
+};
+
+function renderAbaPdv() {
+  const container = document.getElementById('pdv-aba-content');
+  if (!container) return;
+  container.innerHTML = PdvState.aba === 'copia' ? renderAbaCopia() : renderAbaProduto();
+  if (PdvState.aba === 'copia') {
+    renderPassoCopia(PdvState.step);
+  } else {
+    // Garante foco no leitor de código de barras assim que a aba abre
+    setTimeout(() => document.getElementById('input-barcode-scan')?.focus(), 50);
+  }
+}
+
+// ── ABA: IMPRESSÕES (2 passos — impressora já vem pré-selecionada) ──
+function renderAbaCopia() {
+  const impressoras = State.impressoras || [];
+  return `
+    <div class="field" style="margin-bottom:var(--sp-3)">
+      <label>Impressora</label>
+      <select class="input" id="select-impressora-pdv" onchange="selecionarImpressora(this.value)">
+        ${impressoras.map(imp => `
+          <option value="${imp.id}" ${PdvState.impressoraSelecionada===imp.id?'selected':''} ${imp.status!=='online'?'disabled':''}>
+            ${imp.status==='online'?'🟢':'🔴'} ${imp.nome}${imp.status!=='online'?' (offline)':''}
+          </option>
+        `).join('') || '<option value="">Cadastre uma impressora</option>'}
+      </select>
+    </div>
+    <div class="stepper-header">
+      <div class="step-indicators">
+        <span class="step-dot ${PdvState.step === 1 ? 'active' : ''}" data-step="1">1</span>
+        <span class="step-line"></span>
+        <span class="step-dot ${PdvState.step === 2 ? 'active' : ''}" data-step="2">2</span>
+      </div>
+      <div class="step-label">${getStepLabel(PdvState.step)}</div>
+    </div>
+    <div id="step-content"></div>
+    <div class="step-nav">
+      <button class="btn btn--ghost" id="step-back" style="${PdvState.step === 1 ? 'display:none' : ''}">← Voltar</button>
+      <button class="btn btn--primary" id="step-next">
+        ${PdvState.step === 2 ? '➕ Adicionar ao Carrinho' : 'Avançar →'}
+      </button>
+    </div>
+  `;
+}
+
+function renderPassoCopia(step) {
+  const container = document.getElementById('step-content');
+  if (!container) return;
+  container.innerHTML = step === 1 ? renderStepTipoCopia() : renderStepQuantidade();
+  atualizarPreviewPdv();
+
+  document.getElementById('step-back')?.addEventListener('click', () => {
+    if (PdvState.step > 1) { PdvState.step--; renderAbaCopia_refresh(); }
+  });
+  document.getElementById('step-next')?.addEventListener('click', () => {
+    if (PdvState.step === 1 && !PdvState.tipoCopia) { toast('Selecione o tipo de cópia', 'warning'); return; }
+    if (PdvState.step === 2) { adicionarAoCarrinho(); return; }
+    if (PdvState.step < 2) { PdvState.step++; renderAbaCopia_refresh(); }
+  });
+}
+
+// Reconstrói apenas a parte da aba impressão (evita re-renderizar o carrinho)
+function renderAbaCopia_refresh() {
+  const container = document.getElementById('pdv-aba-content');
+  if (!container) return;
+  container.innerHTML = renderAbaCopia();
+  renderPassoCopia(PdvState.step);
+}
+
 function getStepLabel(step) {
-  const labels = {
-    1: 'Selecionar Impressora',
-    2: 'Tipo de Cópia',
-    3: 'Quantidade e Opções'
-  };
+  const labels = { 1: 'Tipo de Cópia', 2: 'Quantidade e Opções' };
   return labels[step] || '';
 }
 
-function updateStepUI() {
-  // Atualiza indicadores de passo
-  document.querySelectorAll('.step-dot').forEach(dot => {
-    const num = parseInt(dot.dataset.step);
-    dot.classList.toggle('active', num === PdvState.step);
-  });
-  const label = document.querySelector('.step-label');
-  if (label) label.textContent = getStepLabel(PdvState.step);
-
-  // Mostra/esconde botão voltar
-  const backBtn = document.getElementById('step-back');
-  if (backBtn) backBtn.style.display = PdvState.step === 1 ? 'none' : '';
-
-  // Muda texto do botão avançar
-  const nextBtn = document.getElementById('step-next');
-  if (nextBtn) {
-    nextBtn.textContent = PdvState.step === 3 ? '➕ Adicionar ao Carrinho' : 'Avançar →';
-  }
-}
-
-function renderStep(step) {
-  const container = document.getElementById('step-content');
-  if (!container) return;
-
-  switch (step) {
-    case 1:
-      container.innerHTML = renderStepImpressoras();
-      break;
-    case 2:
-      container.innerHTML = renderStepTipoCopia();
-      break;
-    case 3:
-      container.innerHTML = renderStepQuantidade();
-      break;
-  }
-}
-
-// ── PDV Helpers ───────────────────────────────────────────
 window.selecionarImpressora = function(id) {
   PdvState.impressoraSelecionada = id;
-  // Atualiza visualmente os cards
-  document.querySelectorAll('.printer-card').forEach(c => {
-    c.classList.toggle('selected', c.dataset.id === id);
-  });
-  // Avança para passo 2 automaticamente
-  if (PdvState.step === 1) {
-    PdvState.step = 2;
-    renderStep(2);
-    updateStepUI();
-  }
+  salvarEstadoPdv()
 };
 
 window.selecionarTipoCopia = function(tipo) {
@@ -839,14 +955,9 @@ window.selecionarTipoCopia = function(tipo) {
   document.querySelectorAll('.tipo-copia-btn').forEach(b => {
     b.classList.toggle('selected', b.dataset.tipo === tipo);
   });
-  // Avança para passo 3 automaticamente
-  if (PdvState.step === 2) {
-    PdvState.step = 3;
-    renderStep(3);
-    updateStepUI();
-  }
-  // Atualiza preview
-  atualizarPreviewPdv();
+  if (PdvState.step === 1) { PdvState.step = 2; renderAbaCopia_refresh(); }
+  else atualizarPreviewPdv();
+  salvarEstadoPdv()
 };
 
 window.ajustarQtd = function(delta) {
@@ -854,31 +965,40 @@ window.ajustarQtd = function(delta) {
   const input = document.getElementById('input-qtd');
   if (input) input.value = PdvState.quantidade;
   atualizarPreviewPdv();
+  salvarEstadoPdv()
 };
 
-function getPrecoAtual() {
-  if (!PdvState.tipoCopia) return 0;
+function getPrecoCopiaAtual() {
+  if (!PdvState.tipoCopia) return { base: 0, cartao: null };
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
-  if (!preco) return 0;
-  if (preco.preco_desconto && PdvState.quantidade >= preco.qtd_desconto) {
-    return preco.preco_desconto;
-  }
-  return preco.preco_unitario;
+  if (!preco) return { base: 0, cartao: null };
+  let base = preco.preco_unitario;
+  if (preco.preco_desconto && PdvState.quantidade >= preco.qtd_desconto) base = preco.preco_desconto;
+  return { base, cartao: preco.preco_cartao || null };
+}
+
+// Retorna o preço unitário efetivo considerando a forma de pagamento.
+// Cartão de crédito/débito usa preco_cartao (valor fixo cadastrado)
+// quando ele existir; caso contrário cai no preço normal.
+function precoComPagamento(base, precoCartao, pagamento) {
+  const ehCartao = pagamento === 'cartao_debito' || pagamento === 'cartao_credito';
+  if (ehCartao && precoCartao != null && precoCartao > 0) return precoCartao;
+  return base;
 }
 
 function atualizarPreviewPdv() {
   const preview = document.getElementById('preview-pdv');
   if (!preview) return;
-  if (!PdvState.tipoCopia || !PdvState.impressoraSelecionada) { preview.innerHTML=''; return; }
+  if (!PdvState.tipoCopia) { preview.innerHTML=''; return; }
 
-  const precoUnit = getPrecoAtual();
+  const { base, cartao } = getPrecoCopiaAtual();
+  const precoUnit = precoComPagamento(base, cartao, PdvState.pagamento);
   const total = precoUnit * PdvState.quantidade;
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
   const paginasPorDoc = PdvState.paginasPorDocumento || 1;
   const totalPaginas = PdvState.quantidade * paginasPorDoc;
   const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
 
-  // Atualiza os campos de preview de páginas e folhas
   const totalPagEl = document.getElementById('total-paginas-preview');
   const folhasEl = document.getElementById('folhas-preview');
   if (totalPagEl) totalPagEl.value = totalPaginas;
@@ -888,7 +1008,7 @@ function atualizarPreviewPdv() {
     <div style="background:var(--c-bg);border:1.5px solid var(--c-primary);border-radius:var(--r-md);padding:var(--sp-4);display:flex;justify-content:space-between;align-items:center">
       <div>
         <div style="font-size:var(--t-sm);color:var(--c-text-2)">${preco?.descricao||''}</div>
-        <div style="font-size:var(--t-xs);color:var(--c-text-3)">${PdvState.quantidade} × ${formatMoney(precoUnit)}</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">${PdvState.quantidade} × ${formatMoney(precoUnit)}${cartao ? ' <span style="opacity:.7">(preço cartão aplicado se pagar no cartão)</span>' : ''}</div>
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">📄 ${totalPaginas} páginas · ${folhas} folhas</div>
         ${PdvState.frenteVerso ? '<div style="font-size:10px;color:var(--c-accent)">✓ Frente e Verso</div>' : ''}
       </div>
@@ -904,82 +1024,236 @@ window.adicionarAoCarrinho = function() {
 
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
   const impressora = State.impressoras.find(i => i.id === PdvState.impressoraSelecionada);
-  const precoUnit = getPrecoAtual();
-  const total = precoUnit * PdvState.quantidade;
+  const { base, cartao } = getPrecoCopiaAtual();
   const paginasPorDoc = PdvState.paginasPorDocumento || 1;
   const totalPaginas = PdvState.quantidade * paginasPorDoc;
   const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
 
   PdvState.carrinho.push({
     id: uuid(),
+    tipo_item: 'copia',
     impressora_id: PdvState.impressoraSelecionada,
     impressora_nome: impressora?.nome || '—',
     tipo: PdvState.tipoCopia,
     tipo_label: preco?.descricao || PdvState.tipoCopia,
     quantidade: PdvState.quantidade,
     frente_verso: PdvState.frenteVerso,
-    preco_unitario: precoUnit,
-    total,
-    paginas_por_documento: paginasPorDoc,   // guarda no carrinho
-    total_folhas: folhas,                   // guarda no carrinho
+    preco_base: base,
+    preco_cartao: cartao,
+    paginas_por_documento: paginasPorDoc,
+    total_folhas: folhas,
   });
 
   atualizarCarrinhoUI();
   toast(`${PdvState.quantidade} cópias adicionadas`, 'success');
+
+  // Reinicia o mini-stepper para o próximo item
+  PdvState.step = 1;
+  PdvState.tipoCopia = null;
+  PdvState.quantidade = 1;
+  renderAbaCopia_refresh();
+  salvarEstadoPdv()
 };
 
+// ── ABA: PRODUTOS (busca + leitor de código de barras) ────
+async function carregarProdutosPdv() {
+  const { data } = await sb.from('produtos')
+    .select('*')
+    .eq('ativo', true)
+    .eq('tipo', 'produto')
+    .order('nome');
+  State.produtosPdv = data || [];
+}
+
+function renderAbaProduto() {
+  const produtos = State.produtosPdv || [];
+  return `
+    <div class="card" style="margin-bottom:var(--sp-3)">
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--sp-3)">
+        <div class="field" style="margin-bottom:0">
+          <label>📷 Leitor de código de barras</label>
+          <input type="text" class="input" id="input-barcode-scan" autocomplete="off"
+                 placeholder="Escaneie o código de barras e pressione Enter..."
+                 onkeydown="if(event.key==='Enter'){event.preventDefault(); pdvLerCodigoBarras(this.value); this.value='';}" />
+        </div>
+        <div class="search-bar">
+          <span class="search-bar-icon">🔍</span>
+          <input type="text" class="input" placeholder="Buscar produto pelo nome..." id="busca-produto-venda" oninput="filtrarProdutosVenda(this.value)" />
+        </div>
+      </div>
+    </div>
+    <div class="printer-grid" id="lista-produtos-venda" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));">
+      ${produtos.map(p => `
+        <div class="tipo-copia-btn" data-id="${p.id}" data-nome="${p.nome}" onclick="pdvAdicionarProduto('${p.id}')">
+          <div style="font-size:1.5rem;margin-bottom:var(--sp-2)">📦</div>
+          <div style="font-weight:600;font-size:var(--t-sm)">${p.nome}</div>
+          <div style="font-size:var(--t-xs);color:var(--c-text-3)">${p.categoria}</div>
+          <div style="font-size:var(--t-sm);font-weight:700;color:var(--c-accent);margin-top:var(--sp-2)">${formatMoney(p.preco_venda||0)}</div>
+          ${p.preco_cartao ? `<div style="font-size:10px;color:var(--c-text-3)">💳 ${formatMoney(p.preco_cartao)}</div>` : ''}
+          <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
+        </div>
+      `).join('') || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+    </div>
+  `;
+}
+
+window.filtrarProdutosVenda = function(q) {
+  document.querySelectorAll('#lista-produtos-venda .tipo-copia-btn').forEach(el => {
+    const nome = el.dataset.nome?.toLowerCase() || '';
+    el.style.display = nome.includes(q.toLowerCase()) ? '' : 'none';
+  });
+};
+
+// Lê um código de barras escaneado e adiciona o produto correspondente
+window.pdvLerCodigoBarras = async function(codigo) {
+  const valor = (codigo || '').trim();
+  if (!valor) return;
+
+  // Primeiro tenta na lista já carregada (mais rápido)
+  let produto = (State.produtosPdv || []).find(p => p.codigo_barras === valor);
+
+  // Se não achou (produto pode estar fora do cache), busca no banco
+  if (!produto) {
+    const { data } = await sb.from('produtos').select('*').eq('codigo_barras', valor).eq('ativo', true).maybeSingle();
+    produto = data || null;
+  }
+
+  if (!produto) {
+    toast(`Nenhum produto encontrado para o código "${valor}"`, 'warning');
+    document.getElementById('input-barcode-scan')?.focus();
+    return;
+  }
+
+  pdvAdicionarProduto(produto.id, produto);
+  document.getElementById('input-barcode-scan')?.focus();
+};
+
+window.pdvAdicionarProduto = function(id, produtoPreCarregado) {
+  const produto = produtoPreCarregado || (State.produtosPdv || []).find(p => p.id === id);
+  if (!produto) { toast('Produto não encontrado', 'error'); return; }
+
+  const existing = PdvState.carrinho.find(i => i.tipo_item === 'produto' && i.produto_id === id);
+  if (existing) {
+    existing.quantidade++;
+  } else {
+    PdvState.carrinho.push({
+      id: uuid(),
+      tipo_item: 'produto',
+      produto_id: produto.id,
+      nome: produto.nome,
+      quantidade: 1,
+      preco_base: produto.preco_venda || 0,
+      preco_cartao: produto.preco_cartao || null,
+    });
+  }
+  atualizarCarrinhoUI();
+  toast(`${produto.nome} adicionado`, 'success');
+};
+
+// ── Preço/total efetivo de um item do carrinho, dado o pagamento atual ──
+function itemPrecoUnitario(item) {
+  return precoComPagamento(item.preco_base, item.preco_cartao, PdvState.pagamento);
+}
+function itemTotal(item) {
+  return itemPrecoUnitario(item) * item.quantidade;
+}
+
+// ── CARRINHO ÚNICO ─────────────────────────────────────────
 function atualizarCarrinhoUI() {
   const itemsEl = document.getElementById('pdv-items');
   const countEl = document.getElementById('carrinho-count');
+  const subtotalEl = document.getElementById('pdv-subtotal-value');
   const totalEl = document.getElementById('pdv-total-value');
   const btnTotalEl = document.getElementById('btn-total');
+  const btnLabelEl = document.getElementById('btn-finalizar-label');
   if (!itemsEl) return;
 
-  const total = Math.round(PdvState.carrinho.reduce((a,b) => a+b.total, 0));
+  const subtotal = Math.round(PdvState.carrinho.reduce((a,b) => a + itemTotal(b), 0));
+  const desconto = Math.min(PdvState.desconto || 0, subtotal);
+  const total = Math.max(0, subtotal - desconto);
+
   if (countEl) countEl.textContent = `${PdvState.carrinho.length} ite${PdvState.carrinho.length===1?'m':'ns'}`;
+  if (subtotalEl) subtotalEl.textContent = formatMoney(subtotal);
   if (totalEl) totalEl.textContent = formatMoney(total);
   if (btnTotalEl) btnTotalEl.textContent = formatMoney(total);
 
-  if (PdvState.carrinho.length === 0) {
-    itemsEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🖨️</div><div class="empty-state-sub">Carrinho vazio</div></div>`;
-    return;
-  }
+  const temCopia = PdvState.carrinho.some(i => i.tipo_item === 'copia');
+  if (btnLabelEl) btnLabelEl.textContent = temCopia ? '📋 Enviar para Fila' : '✅ Finalizar Venda';
 
   const brlEl = document.getElementById('pdv-total-brl');
   const brlValEl = document.getElementById('pdv-total-brl-value');
   if (brlEl && brlValEl) {
     const isPix = PdvState.pagamento === 'pix' || PdvState.pagamento === 'pix_brl';
     brlEl.style.display = isPix ? 'block' : 'none';
-    if (isPix) {
-      const valorBRL = gsToBRL(total);
-      brlValEl.textContent = formatBRL(valorBRL);
-    }
+    if (isPix) brlValEl.textContent = formatBRL(gsToBRL(total));
   }
 
+  if (PdvState.carrinho.length === 0) {
+    itemsEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🧾</div><div class="empty-state-sub">Carrinho vazio</div></div>`;
+    return;
+  }
 
-  itemsEl.innerHTML = PdvState.carrinho.map(item => `
-    <div class="pdv-item">
-      <div class="pdv-item-info">
-        <div class="pdv-item-name">${item.tipo_label}</div>
-        <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
-        <div class="pdv-item-sub">${formatMoney(item.preco_unitario)}/un</div>
-      </div>
-      <div class="pdv-item-price">${formatMoney(item.total)}</div>
-      <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
-    </div>
-  `).join('');
+  itemsEl.innerHTML = PdvState.carrinho.map(item => {
+    const precoUnit = itemPrecoUnitario(item);
+    const tot = itemTotal(item);
+    if (item.tipo_item === 'copia') {
+      return `
+        <div class="pdv-item">
+          <div class="pdv-item-info">
+            <div class="pdv-item-name">🖨️ ${item.tipo_label}</div>
+            <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
+            <div class="pdv-item-sub">${formatMoney(precoUnit)}/un</div>
+          </div>
+          <div class="pdv-item-price">${formatMoney(tot)}</div>
+          <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
+        </div>`;
+    }
+    return `
+      <div class="pdv-item">
+        <div class="pdv-item-info">
+          <div class="pdv-item-name">📦 ${item.nome}</div>
+          <div class="pdv-item-sub">
+            <button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdCarrinho('${item.id}',-1)">−</button>
+            ${item.quantidade} × ${formatMoney(precoUnit)}
+            <button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdCarrinho('${item.id}',1)">+</button>
+          </div>
+        </div>
+        <div class="pdv-item-price">${formatMoney(tot)}</div>
+        <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
+      </div>`;
+  }).join('');
+
+  salvarEstadoPdv()
 }
+
+window.alterarQtdCarrinho = function(id, delta) {
+  const item = PdvState.carrinho.find(i => i.id === id);
+  if (!item) return;
+  item.quantidade = Math.max(1, item.quantidade + delta);
+  atualizarCarrinhoUI();
+};
 
 window.removerDoCarrinho = function(id) {
   PdvState.carrinho = PdvState.carrinho.filter(i => i.id !== id);
   atualizarCarrinhoUI();
+  salvarEstadoPdv()
 };
 
 window.limparCarrinho = function() {
   PdvState.carrinho = [];
   PdvState.tipoCopia = null;
   PdvState.quantidade = 1;
+  PdvState.desconto = 0;
+  const descInput = document.getElementById('input-desconto');
+  if (descInput) descInput.value = '';
   atualizarCarrinhoUI();
+  salvarEstadoPdv()
+};
+
+window.aplicarDesconto = function(valor) {
+  PdvState.desconto = Math.max(0, Math.round(parseFloat(valor) || 0));
+  atualizarCarrinhoUI();
+  salvarEstadoPdv()
 };
 
 window.selecionarPagamento = function(pag) {
@@ -990,20 +1264,13 @@ window.selecionarPagamento = function(pag) {
   const trocoRow  = document.getElementById('troco-row');
   const pixBrlRow = document.getElementById('pix-brl-row');
   const cotEl     = document.getElementById('cotacao-atual-pdv');
-  const total = Math.round(PdvState.carrinho.reduce((a,b) => a+b.total, 0));
-  const brlEl = document.getElementById('pdv-total-brl');
-  const brlValEl = document.getElementById('pdv-total-brl-value');
-  if (brlEl && brlValEl) {
-    const isPix = pag === 'pix' || pag === 'pix_brl';
-    brlEl.style.display = isPix ? 'block' : 'none';
-    if (isPix) {
-      const valorBRL = gsToBRL(total);
-      brlValEl.textContent = formatBRL(valorBRL);
-    }
-  }
   if (trocoRow)  trocoRow.style.display  = pag === 'dinheiro' ? 'block' : 'none';
   if (pixBrlRow) pixBrlRow.style.display = pag === 'pix_brl'  ? 'block' : 'none';
   if (cotEl)     cotEl.textContent = APP_CONFIG.cotacaoBRL.toLocaleString('es-PY');
+  // Recalcula preços do carrinho e da prévia de impressão (preço cartão!)
+  atualizarCarrinhoUI();
+  atualizarPreviewPdv();
+  salvarEstadoPdv()
 };
 
 window.calcularPixBRL = function() {
@@ -1014,331 +1281,201 @@ window.calcularPixBRL = function() {
 };
 
 window.calcularTroco = function() {
-  const total    = PdvState.carrinho.reduce((a,b) => a + b.total, 0);
+  const subtotal = PdvState.carrinho.reduce((a,b) => a + itemTotal(b), 0);
+  const total    = Math.max(0, subtotal - (PdvState.desconto || 0));
   const recebido = Math.round(parseFloat(document.getElementById('input-valor-recebido')?.value || 0));
   const troco    = Math.max(0, recebido - total);
   const el = document.getElementById('troco-value');
   if (el) el.textContent = formatMoney(troco);
 };
 
+// ── FINALIZAÇÃO ────────────────────────────────────────────
+// Regra:
+//  • Carrinho só com produto(s)  → finaliza AGORA (venda concluída,
+//    forma de pagamento já escolhida no painel do PDV).
+//  • Carrinho com cópia (com ou sem produto) → cria um "carrinho
+//    pendente", manda as cópias pra fila com preço/pagamento
+//    PROVISÓRIOS (a forma de pagamento real só é escolhida na
+//    retirada, depois da conferência — ver finalizarCarrinhoPendente).
 window.finalizarVenda = async function() {
-   if (await isCaixaTravado()) {
+  if (await isCaixaTravado()) {
     toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
     return;
   }
-
   if (PdvState.carrinho.length === 0) { toast('Carrinho vazio', 'warning'); return; }
-  const btn = document.getElementById('btn-finalizar-venda');
-  if (btn) { btn.disabled = true; btn.textContent = 'Enviando para fila...'; }
 
-  // Coleta nome do cliente (campo opcional no PDV)
+  const itensCopia   = PdvState.carrinho.filter(i => i.tipo_item === 'copia');
+  const itensProduto = PdvState.carrinho.filter(i => i.tipo_item === 'produto');
   const clienteNomePDV = document.getElementById('input-cliente-nome-pdv')?.value?.trim() || null;
-  const pagamentoDb = PdvState.pagamento === 'pix_brl' ? 'pix' : PdvState.pagamento;
-  let obsExtra = '';
-  if (PdvState.pagamento === 'pix_brl') {
-    const brlVal = parseFloat(document.getElementById('input-brl-pix')?.value || 0);
-    obsExtra = `Pix BRL: R$ ${brlVal.toFixed(2)} @ ₲${APP_CONFIG.cotacaoBRL}/R$`;
+
+  const btn = document.getElementById('btn-finalizar-venda');
+  if (btn) { btn.disabled = true; btn.textContent = 'Processando...'; }
+
+  // ── Carrinho só com produto(s): finaliza na hora ──
+  if (itensCopia.length === 0) {
+    try {
+      const pagamentoDb = PdvState.pagamento === 'pix_brl' ? 'pix' : PdvState.pagamento;
+      const subtotal = itensProduto.reduce((a,b) => a + itemTotal(b), 0);
+      const desconto = Math.min(PdvState.desconto || 0, subtotal);
+      const vendaId = await processarVendaProdutos(itensProduto, subtotal, desconto, pagamentoDb, clienteNomePDV);
+      if (vendaId === null) { if (btn) btn.disabled = false; return; }
+
+      toast('✅ Venda registrada!', 'success', 3500);
+      limparCarrinho();
+      limparEstadoPdv();
+      if (btn) { btn.disabled = false; }
+      renderAbaCopia_refresh();
+    } catch (err) {
+      toast('Erro ao finalizar: ' + err.message, 'error');
+      if (btn) { btn.disabled = false; }
+    }
+    return;
   }
 
+  // ── Carrinho com cópia (+ produto opcional): vai pra fila via carrinho pendente ──
   try {
-    let numPedidos = 0;
-    for (const item of PdvState.carrinho) {
-      // ★ STATUS = 'na_fila' — pedido entra na produção, NÃO finalizado
+    const { data: carrinho, error: errCarrinho } = await sb
+      .from('carrinhos_pendentes')
+      .insert({
+        itens: PdvState.carrinho,
+        cliente_nome: clienteNomePDV,
+        desconto: PdvState.desconto || 0,
+        observacoes: '',
+      })
+      .select()
+      .single();
+
+    if (errCarrinho) throw new Error('Erro ao criar carrinho pendente: ' + errCarrinho.message);
+
+    for (const item of itensCopia) {
       const { error } = await sb.from('pedidos_copia').insert({
         impressora_id:   item.impressora_id,
         tipo:            item.tipo,
         quantidade:      item.quantidade,
         frente_verso:    item.frente_verso,
-        preco_unitario:  Math.round(item.preco_unitario),
+        // Preço/forma de pagamento aqui são PROVISÓRIOS (preço normal, sem
+        // desconto) — servem só pra exibir algo na fila. O valor real é
+        // recalculado em finalizarCarrinhoPendente(), na retirada.
+        preco_unitario:  Math.round(item.preco_base),
+        preco_base:      item.preco_base,
+        preco_cartao:    item.preco_cartao,
         desconto:        0,
-        total:           Math.round(item.total),
-        status:          'na_fila',       // ← Mudança central da nova arquitetura
-        forma_pagamento: pagamentoDb,
-        cliente_nome_pdv: clienteNomePDV, // campo de texto livre no PDV
-        observacoes:     obsExtra || null,
-        paginas_por_documento: item.paginas_por_documento || 1,   // ← novo
-        total_folhas:    item.total_folhas,                       // ← novo
+        total:           Math.round(item.preco_base * item.quantidade),
+        status:          'na_fila',
+        forma_pagamento: null,
+        cliente_nome_pdv: clienteNomePDV,
+        paginas_por_documento: item.paginas_por_documento || 1,
+        total_folhas:    item.total_folhas,
+        carrinho_id:     carrinho.id,
       });
       if (error) throw error;
-      numPedidos++;
     }
 
-    toast(`✅ ${numPedidos} pedido(s) enviado(s) para a fila de produção!`, 'success', 4000);
+    const msgProduto = itensProduto.length > 0 ? ` + ${itensProduto.length} produto(s) aguardando retirada` : '';
+    toast(`✅ ${itensCopia.length} impressão(ões) enviada(s) para a fila${msgProduto}!`, 'success', 4500);
+
     limparCarrinho();
-
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `✅ Enviar para Fila — <span id="btn-total">${formatMoney(0)}</span>`;
-    }
+    limparEstadoPdv();
+    if (btn) { btn.disabled = false; }
+    renderAbaCopia_refresh();
   } catch (err) {
     toast('Erro ao enviar: ' + err.message, 'error');
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `✅ Enviar para Fila — <span id="btn-total">—</span>`;
-    }
+    if (btn) { btn.disabled = false; }
   }
 };
 
-// ── ITENS VISÍVEIS POR PERFIL ────────────────────────────
-function getVisibleNavItems() {
-  const userRole = State.userProfile?.role || 'funcionario';
-  return NAV.filter(item => {
-    if (item.group) return false; // não incluir grupos
-    return !item.roles || item.roles.includes(userRole);
-  });
-}
+// Busca o carrinho pendente associado a um pedido de cópia
+async function obterCarrinhoPendentePorPedido(pedidoId) {
+  const { data: pedido } = await sb
+    .from('pedidos_copia')
+    .select('carrinho_id')
+    .eq('id', pedidoId)
+    .single();
 
-// ============================================================
-// ── MÓDULO: VENDAS (PDV Produtos) ─────────────────────────
-// ============================================================
-async function renderVendas(el) {
-  // Carrega produtos ativos
-  const { data: produtos } = await sb.from('produtos')
+  if (!pedido?.carrinho_id) return null;
+
+  const { data: carrinho } = await sb
+    .from('carrinhos_pendentes')
     .select('*')
-    .eq('ativo', true)
-    .eq('tipo', 'produto') // apenas produtos, não insumos
-    .order('nome');
+    .eq('id', pedido.carrinho_id)
+    .single();
 
-  // HTML com layout de duas colunas
-  el.innerHTML = `
-    <div class="pdv-layout" style="display:flex; gap:var(--sp-4); height:100%; min-height:0;">
-      <!-- ESQUERDA: lista de produtos -->
-      <div class="pdv-left" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:var(--sp-4);">
-        <div class="section-header">
-          <div>
-            <div class="section-title">Produtos</div>
-            <div class="section-sub">Selecione os itens para venda</div>
-          </div>
-        </div>
-        <div class="search-bar">
-          <span class="search-bar-icon">🔍</span>
-          <input type="text" class="input" placeholder="Buscar produto..." id="busca-produto-venda" oninput="filtrarProdutosVenda(this.value)" />
-        </div>
-        <div class="printer-grid" id="lista-produtos-venda" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));">
-          ${(produtos||[]).map(p => `
-            <div class="tipo-copia-btn" data-id="${p.id}" data-nome="${p.nome}" data-preco="${p.preco_venda}" onclick="adicionarProdutoVendaPdv('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.preco_venda||0})">
-              <div style="font-size:1.5rem;margin-bottom:var(--sp-2)">📦</div>
-              <div style="font-weight:600;font-size:var(--t-sm)">${p.nome}</div>
-              <div style="font-size:var(--t-xs);color:var(--c-text-3)">${p.categoria}</div>
-              <div style="font-size:var(--t-sm);font-weight:700;color:var(--c-accent);margin-top:var(--sp-2)">${formatMoney(p.preco_venda||0)}</div>
-              <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
-            </div>
-          `).join('') || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
-        </div>
-      </div>
-
-      <!-- DIREITA: carrinho -->
-      <div class="pdv-right" style="width:360px; flex-shrink:0; background:var(--c-card); border:1px solid var(--c-border); border-radius:var(--r-lg); display:flex; flex-direction:column; overflow:hidden;">
-        <div class="pdv-panel-header">
-          <div style="font-size:var(--t-md);font-weight:700">🧾 Carrinho</div>
-          <div style="font-size:var(--t-xs);color:var(--c-text-3)" id="carrinho-count-venda">0 itens</div>
-        </div>
-        <div class="pdv-panel-items" id="pdv-items-venda">
-          <div class="empty-state">
-            <div class="empty-state-icon">🛒</div>
-            <div class="empty-state-sub">Carrinho vazio</div>
-          </div>
-        </div>
-        <div class="pdv-panel-footer">
-          <div class="pdv-total-row">
-            <span class="pdv-total-label">Total</span>
-            <span class="pdv-total-value" id="pdv-total-venda">${formatMoney(0)}</span>
-          </div>
-          <div id="pdv-total-brl-venda" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
-            🇧🇷 ≈ <span id="pdv-total-brl-value-venda">R$ 0,00</span>
-          </div>
-          <div class="field">
-            <label>Forma de Pagamento</label>
-            <div class="payment-methods" id="payment-methods-venda">
-              ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
-                <button class="payment-btn ${VendaProdutoState.pagamento===p?'selected':''}"
-                        onclick="selecionarPagamentoVenda('${p}')" data-pag="${p}">
-                  ${labelPagamento(p)}
-                </button>
-              `).join('')}
-            </div>
-          </div>
-          <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarVendaProdutos()">
-            ✅ Finalizar Venda — <span id="btn-total-venda">${formatMoney(0)}</span>
-          </button>
-          <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinhoVenda()">
-            🗑️ Limpar carrinho
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Histórico de vendas (opcional, abaixo) -->
-    <div class="card" style="margin-top: var(--sp-6);">
-      <div class="card-header"><span class="card-title">Histórico de Vendas</span></div>
-      <div class="table-wrap" id="historico-vendas">
-        <!-- Carregado via JS separado -->
-      </div>
-    </div>
-  `;
-
-  // Carrega histórico
-  await carregarHistoricoVendas();
-
-  // Função de filtro de produtos
-  window.filtrarProdutosVenda = function(q) {
-    document.querySelectorAll('#lista-produtos-venda .tipo-copia-btn').forEach(el => {
-      const nome = el.dataset.nome?.toLowerCase() || '';
-      el.style.display = nome.includes(q.toLowerCase()) ? '' : 'none';
-    });
-  };
+  return carrinho;
 }
 
-window.adicionarProdutoVendaPdv = function(id, nome, preco) {
-  const existing = VendaProdutoState.carrinho.find(i => i.produto_id === id);
-  if (existing) {
-    existing.quantidade++;
-    existing.total = existing.quantidade * existing.preco_unitario;
-  } else {
-    VendaProdutoState.carrinho.push({
-      produto_id: id,
-      nome,
-      quantidade: 1,
-      preco_unitario: preco,
-      total: preco,
-    });
-  }
-  atualizarCarrinhoVenda();
-  toast(`${nome} adicionado`, 'success');
-};
-
-window.removerDoCarrinhoVenda = function(index) {
-  VendaProdutoState.carrinho.splice(index, 1);
-  atualizarCarrinhoVenda();
-};
-
-window.limparCarrinhoVenda = function() {
-  VendaProdutoState.carrinho = [];
-  atualizarCarrinhoVenda();
-};
-
-window.selecionarPagamentoVenda = function(pag) {
-  VendaProdutoState.pagamento = pag;
-  document.querySelectorAll('#payment-methods-venda .payment-btn').forEach(b => {
-    b.classList.toggle('selected', b.dataset.pag === pag);
-  });
-  atualizarCarrinhoVenda();
-};
-
-function atualizarCarrinhoVenda() {
-  const itemsEl = document.getElementById('pdv-items-venda');
-  const countEl = document.getElementById('carrinho-count-venda');
-  const totalEl = document.getElementById('pdv-total-venda');
-  const btnTotalEl = document.getElementById('btn-total-venda');
-  if (!itemsEl) return;
-
-  const total = VendaProdutoState.carrinho.reduce((a,b) => a + b.total, 0);
-  if (countEl) countEl.textContent = `${VendaProdutoState.carrinho.length} item(ns)`;
-  if (totalEl) totalEl.textContent = formatMoney(total);
-  if (btnTotalEl) btnTotalEl.textContent = formatMoney(total);
-
-  // Atualiza BRL se necessário
-  const brlEl = document.getElementById('pdv-total-brl-venda');
-  const brlValEl = document.getElementById('pdv-total-brl-value-venda');
-  if (brlEl && brlValEl) {
-    const isPix = VendaProdutoState.pagamento === 'pix' || VendaProdutoState.pagamento === 'pix_brl';
-    brlEl.style.display = isPix ? 'block' : 'none';
-    if (isPix) {
-      const valorBRL = gsToBRL(total);
-      brlValEl.textContent = formatBRL(valorBRL);
-    }
-  }
-
-  if (VendaProdutoState.carrinho.length === 0) {
-    itemsEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🛒</div><div class="empty-state-sub">Carrinho vazio</div></div>`;
-    return;
-  }
-
-  itemsEl.innerHTML = VendaProdutoState.carrinho.map((item, idx) => `
-    <div class="pdv-item">
-      <div class="pdv-item-info">
-        <div class="pdv-item-name">${item.nome}</div>
-        <div class="pdv-item-sub">${item.quantidade} × ${formatMoney(item.preco_unitario)}</div>
-      </div>
-      <div class="pdv-item-price">${formatMoney(item.total)}</div>
-      <button class="pdv-remove-btn" onclick="removerDoCarrinhoVenda(${idx})">✕</button>
-    </div>
-  `).join('');
+// Distribui um valor total entre N pesos, arredondando e ajustando o
+// último item para que a soma bata exatamente (evita erro de centavos).
+function distribuirValor(total, pesos) {
+  const somaPesos = pesos.reduce((a,b) => a+b, 0);
+  if (total <= 0 || somaPesos <= 0) return pesos.map(() => 0);
+  const partes = pesos.map(p => Math.round(total * (p / somaPesos)));
+  const diff = total - partes.reduce((a,b) => a+b, 0);
+  partes[partes.length - 1] += diff;
+  return partes;
 }
 
-window.finalizarVendaProdutos = async function() {
-  if (await isCaixaTravado()) {
-    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
-    return;
-  }
-
-  if (!VendaProdutoState.carrinho.length) { toast('Carrinho vazio', 'warning'); return; }
-  const pagamento = VendaProdutoState.pagamento;
-
-  // ---- CONSUMO DE INSUMOS (SEMPRE) ----
-  for (const item of VendaProdutoState.carrinho) {
+// Processa a parte de produtos do carrinho: consome insumos vinculados
+// (composição do produto — combos/kits), registra a venda e baixa o
+// estoque do produto final. Retorna o id da venda criada, ou null em erro.
+async function processarVendaProdutos(itensProduto, subtotal, desconto, pagamento, clienteNomePDV) {
+  // Consumo de insumos vinculados (ex.: produto composto por matérias-primas).
+  // Isso é independente da produção de cópias — um produto de prateleira
+  // pode ter composição própria mesmo sem nenhuma impressão no carrinho.
+  for (const item of itensProduto) {
     const { data: vinculos } = await sb.from('produto_insumos')
       .select('*, insumos:insumo_id(id, nome, estoque_atual)')
       .eq('produto_id', item.produto_id);
 
     if (vinculos && vinculos.length > 0) {
-      let podeVender = true;
       for (const v of vinculos) {
-        const total = v.quantidade * item.quantidade;
-        if (v.insumos.estoque_atual < total) {
-          toast(`Insumo insuficiente: ${v.insumos.nome} (necessário ${total}, disponível ${v.insumos.estoque_atual})`, 'error');
-          podeVender = false;
-          break;
+        const consumo = v.quantidade * item.quantidade;
+        if (v.insumos.estoque_atual < consumo) {
+          toast(`Insumo insuficiente: ${v.insumos.nome} (necessário ${consumo}, disponível ${v.insumos.estoque_atual})`, 'error');
+          return null;
         }
       }
-      if (!podeVender) return;
-
       for (const v of vinculos) {
-        const total = v.quantidade * item.quantidade;
-        const novoEstoque = v.insumos.estoque_atual - total;
-        await sb.from('produtos')
-          .update({ estoque_atual: novoEstoque })
-          .eq('id', v.insumo_id);
+        const consumo = v.quantidade * item.quantidade;
+        await sb.from('produtos').update({ estoque_atual: v.insumos.estoque_atual - consumo }).eq('id', v.insumo_id);
       }
     }
   }
-  // ---- FIM CONSUMO DE INSUMOS ----
 
-  // Prossegue com a venda
-  const subtotal = VendaProdutoState.carrinho.reduce((a,b) => a + b.total, 0);
+  const total = Math.max(0, Math.round(subtotal) - desconto);
   const { data: venda, error } = await sb.from('vendas').insert({
-    subtotal, total: subtotal, forma_pagamento: pagamento, status: 'concluido',
+    subtotal: Math.round(subtotal),
+    desconto,
+    total,
+    forma_pagamento: pagamento,
+    status: 'concluido',
+    cliente_nome_pdv: clienteNomePDV,
   }).select().single();
 
-  if (error) { toast('Erro: '+error.message,'error'); return; }
+  if (error) { toast('Erro ao registrar venda: ' + error.message, 'error'); return null; }
 
-  const itens = VendaProdutoState.carrinho.map(i => ({
-    venda_id: venda.id,
-    produto_id: i.produto_id,
-    quantidade: i.quantidade,
-    preco_unitario: i.preco_unitario,
-    total: i.total,
-  }));
+  const itens = itensProduto.map(i => {
+    const precoUnit = precoComPagamento(i.preco_base, i.preco_cartao, pagamento);
+    return {
+      venda_id: venda.id,
+      produto_id: i.produto_id,
+      quantidade: i.quantidade,
+      preco_unitario: Math.round(precoUnit),
+      total: Math.round(precoUnit * i.quantidade),
+    };
+  });
   await sb.from('venda_itens').insert(itens);
 
-  // Baixa estoque dos produtos
-  for (const item of VendaProdutoState.carrinho) {
-    const { data: produto } = await sb.from('produtos')
-      .select('estoque_atual')
-      .eq('id', item.produto_id)
-      .single();
+  // Baixa estoque do produto final
+  for (const item of itensProduto) {
+    const { data: produto } = await sb.from('produtos').select('estoque_atual').eq('id', item.produto_id).single();
     if (produto) {
       const novoEstoque = Math.max(0, produto.estoque_atual - item.quantidade);
-      await sb.from('produtos')
-        .update({ estoque_atual: novoEstoque })
-        .eq('id', item.produto_id);
+      await sb.from('produtos').update({ estoque_atual: novoEstoque }).eq('id', item.produto_id);
     }
   }
 
-  toast('Venda registrada!', 'success');
-  limparCarrinhoVenda();
-  navigate('vendas'); // recarrega
-};
+  return venda.id;
+}
 
 async function carregarHistoricoVendas() {
   const { data: vendas } = await sb.from('vendas')
@@ -1360,8 +1497,8 @@ async function carregarHistoricoVendas() {
       <tbody>
         ${vendas.map(v => `
           <tr>
-            <td class="td-mono">#${v.numero_venda}</td>
-            <td>${v.clientes?.nome || 'Consumidor'}</td>
+            <td class="td-mono">#${v.numero_venda ?? '—'}</td>
+            <td>${v.clientes?.nome || v.cliente_nome_pdv || 'Consumidor'}</td>
             <td><span class="badge badge--primary">${labelPagamento(v.forma_pagamento)}</span></td>
             <td style="color:var(--c-success);font-weight:600">${formatMoney(v.total)}</td>
             <td>${badgeStatus(v.status)}</td>
@@ -1374,185 +1511,15 @@ async function carregarHistoricoVendas() {
   `;
 }
 
-window.abrirModalNovaVenda = async function() {
-  const { data: produtos } = await sb.from('produtos').select('*').eq('ativo', true).order('nome');
-
-  openModal('Nova Venda', `
-    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
-      <div class="field">
-        <label>Buscar produto</label>
-        <input type="text" class="input" id="venda-produto-busca" placeholder="Nome ou código..." oninput="filtrarProdutosVenda(this.value)" />
-      </div>
-      <div id="venda-lista-produtos" style="max-height:200px;overflow-y:auto;border:1px solid var(--c-border);border-radius:var(--r-md)">
-        ${(produtos||[]).map(p => `
-          <div class="pdv-item" style="cursor:pointer;padding:var(--sp-3) var(--sp-4)" onclick="adicionarProdutoVenda('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.preco_venda||0})">
-            <div class="pdv-item-info">
-              <div class="pdv-item-name">${p.nome}</div>
-              <div class="pdv-item-sub">${p.categoria} · Estoque: ${p.estoque_atual} ${p.unidade}</div>
-            </div>
-            <div class="pdv-item-price">${formatMoney(p.preco_venda||0)}</div>
-          </div>
-        `).join('') || '<div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
-      </div>
-      <div id="venda-carrinho" style="display:none">
-        <div class="divider-text">Itens do carrinho</div>
-        <div id="venda-itens-lista"></div>
-        <div style="display:flex;justify-content:space-between;font-weight:700;padding:var(--sp-3) 0">
-          <span>Total</span><span id="venda-total-modal">${formatMoney(0)}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-weight:700; padding:var(--sp-3) 0">
-          <span>Total</span>
-          <span id="venda-total-modal">${formatMoney(0)}</span>
-        </div>
-        <div id="venda-total-brl-modal" style="display:none; text-align:right; font-size:var(--t-xs); color:var(--c-text-3); margin-top:-4px; margin-bottom:4px">
-          🇧🇷 ≈ <span id="venda-total-brl-value-modal">R$ 0,00</span>
-        </div>
-        <div class="field">
-          <label>Forma de pagamento</label>
-          <select class="input" id="venda-pagamento">
-            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado','cheque'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
-          </select>
-        </div>
-        <button class="btn btn--success btn--lg" style="width:100%;justify-content:center;margin-top:var(--sp-3)" onclick="salvarVenda()">
-          ✅ Confirmar Venda
-        </button>
-      </div>
-    </div>
-  `, 'modal--lg');
-
-  window._vendaItens = [];
-  document.getElementById('venda-pagamento')?.addEventListener('change', function() {
-  atualizarCarrinhoVendaModal();
+// ── ITENS VISÍVEIS POR PERFIL ────────────────────────────
+function getVisibleNavItems() {
+  const userRole = State.userProfile?.role || 'funcionario';
+  return NAV.filter(item => {
+    if (item.group) return false; // não incluir grupos
+    return !item.roles || item.roles.includes(userRole);
   });
-
-};
-
-window._vendaItens = [];
-window.adicionarProdutoVenda = function(id, nome, preco) {
-  const existing = window._vendaItens.find(i => i.produto_id === id);
-  if (existing) { existing.quantidade++; existing.total = existing.quantidade * existing.preco_unitario; }
-  else { window._vendaItens.push({ produto_id: id, nome, quantidade: 1, preco_unitario: preco, total: preco }); }
-  atualizarCarrinhoVendaModal();
-};
-
-function atualizarCarrinhoVendaModal() {
-  const carrinhoDiv = document.getElementById('venda-carrinho');
-  const listaEl = document.getElementById('venda-itens-lista');
-  const totalEl = document.getElementById('venda-total-modal');
-  const brlDiv = document.getElementById('venda-total-brl-modal');
-  const brlVal = document.getElementById('venda-total-brl-value-modal');
-
-  if (!carrinhoDiv) return;
-
-  const total = window._vendaItens.reduce((a, b) => a + b.total, 0);
-  carrinhoDiv.style.display = window._vendaItens.length > 0 ? 'block' : 'none';
-  if (totalEl) totalEl.textContent = formatMoney(total);
-
-  // Atualiza BRL com base no pagamento selecionado
-  const pagamentoSelect = document.getElementById('venda-pagamento');
-  const pagamento = pagamentoSelect ? pagamentoSelect.value : 'dinheiro';
-  const isPix = pagamento === 'pix' || pagamento === 'pix_brl';
-  if (brlDiv && brlVal) {
-    brlDiv.style.display = isPix ? 'block' : 'none';
-    if (isPix) {
-      const valorBRL = gsToBRL(total);
-      brlVal.textContent = formatBRL(valorBRL);
-    }
-  }
-
-  if (!listaEl) return;
-  listaEl.innerHTML = window._vendaItens.map((item, idx) => `
-    <div class="pdv-item" style="padding:var(--sp-2) 0">
-      <div class="pdv-item-info">
-        <div class="pdv-item-name">${item.nome}</div>
-        <div class="pdv-item-sub">${item.quantidade} × ${formatMoney(item.preco_unitario)}</div>
-      </div>
-      <div class="pdv-item-price">${formatMoney(item.total)}</div>
-      <button class="pdv-remove-btn" onclick="window._vendaItens.splice(${idx},1);atualizarCarrinhoVendaModal()">✕</button>
-    </div>
-  `).join('');
 }
 
-window.salvarVenda = async function() {
-  if (await isCaixaTravado()) {
-    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
-    return;
-  }
-
-  if (!window._vendaItens.length) { toast('Adicione itens', 'warning'); return; }
-  const pagamento = document.getElementById('venda-pagamento')?.value;
-
-  // ---- CONSUMO DE INSUMOS (SEMPRE) ----
-  for (const item of window._vendaItens) {
-    // Busca insumos vinculados ao produto
-    const { data: vinculos } = await sb.from('produto_insumos')
-      .select('*, insumos:insumo_id(id, nome, estoque_atual)')
-      .eq('produto_id', item.produto_id);
-
-    if (vinculos && vinculos.length > 0) {
-      // Verifica se há estoque suficiente de cada insumo
-      let podeVender = true;
-      for (const v of vinculos) {
-        const total = v.quantidade * item.quantidade;
-        if (v.insumos.estoque_atual < total) {
-          toast(`Insumo insuficiente: ${v.insumos.nome} (necessário ${total}, disponível ${v.insumos.estoque_atual})`, 'error');
-          podeVender = false;
-          break;
-        }
-      }
-      if (!podeVender) return;
-
-      // Baixa os insumos
-      for (const v of vinculos) {
-        const total = v.quantidade * item.quantidade;
-        const novoEstoque = v.insumos.estoque_atual - total;
-        await sb.from('produtos')
-          .update({ estoque_atual: novoEstoque })
-          .eq('id', v.insumo_id);
-      }
-    }
-    // Se não tiver insumos, apenas segue em frente (produto sem composição)
-  }
-  // ---- FIM CONSUMO DE INSUMOS ----
-
-  // Agora prossegue com a venda normal (baixa estoque do produto)
-  const subtotal = window._vendaItens.reduce((a,b)=>a+b.total,0);
-
-  const { data: venda, error } = await sb.from('vendas').insert({
-    subtotal, total: subtotal, forma_pagamento: pagamento, status: 'concluido',
-  }).select().single();
-
-  if (error) { toast('Erro: '+error.message,'error'); return; }
-
-  const itens = window._vendaItens.map(i => ({
-    venda_id: venda.id,
-    produto_id: i.produto_id,
-    quantidade: i.quantidade,
-    preco_unitario: i.preco_unitario,
-    total: i.total,
-  }));
-  await sb.from('venda_itens').insert(itens);
-
-  // Baixa no estoque do produto (já ajustado, mas mantido)
-  for (const i of window._vendaItens) {
-    const { data: produto } = await sb.from('produtos')
-      .select('estoque_atual')
-      .eq('id', i.produto_id)
-      .single();
-    if (produto) {
-      const novoEstoque = Math.max(0, produto.estoque_atual - i.quantidade);
-      await sb.from('produtos')
-        .update({ estoque_atual: novoEstoque })
-        .eq('id', i.produto_id);
-    }
-  }
-
-  toast('Venda registrada!','success');
-  closeModal();
-  navigate('vendas');
-};
-
-// ============================================================
 // ── MÓDULO: CAIXA (VERSÃO COMPLETA) ──────────────────────
 // ============================================================
 
@@ -1620,7 +1587,7 @@ async function renderCaixa(el) {
         <div style="display:flex; align-items:center; gap: var(--sp-4); flex-wrap:wrap">
           <div style="display:flex; align-items:center; gap: var(--sp-3)">
             <div style="width:12px;height:12px;border-radius:50%;background:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; ${sessaoAberta ? 'animation: pulse 1.5s infinite' : ''}"></div>
-            <span style="font-weight:700; font-size:var(--t-lg)">${sessaoAberta ? '🟢 Caixa Aberto' : '🔴 Caixa Fechado'}</span>
+            <span style="font-weight:700; font-size:var(--t-lg); height: auto;">${sessaoAberta ? '🟢 Caixa Aberto' : '🔴 Caixa Fechado'}</span>
           </div>
           ${sessaoAberta ? `
             <div style="display:flex; gap: var(--sp-6); flex-wrap:wrap">
@@ -1671,8 +1638,14 @@ async function renderCaixa(el) {
     </div>
     ` : ''}
 
+    <!-- Histórico de Vendas -->
+    <div class="card" style="margin-top: var(--sp-4);">
+      <div class="card-header"><span class="card-title">📋 Histórico de Vendas</span></div>
+      <div class="table-wrap" id="historico-vendas"></div>
+    </div>
+
     <!-- Histórico de caixas (já existente) -->
-    <div class="card">
+    <div class="card" style="margin-top: var(--sp-4);">
       <div class="card-header"><span class="card-title">Histórico de Caixas</span></div>
       <div class="table-wrap">
         <table>
@@ -1692,8 +1665,10 @@ async function renderCaixa(el) {
           </tbody>
         </table>
       </div>
-    </div>
+    </div>     
+
   `;
+  await carregarHistoricoVendas();
 }
 
 // ── ABRIR CAIXA ───────────────────────────────────────────
@@ -2004,15 +1979,13 @@ window.salvarLimiteSangria = async function() {
 };
 
 window.fecharCaixa = async function(sessaoId) {
-  // Calcula totais do dia
+  // Calcula totais do dia (fiado pendente não entra — só conta quando quitado)
   const hoje = new Date(); hoje.setHours(0,0,0,0);
-  const [{ data: copias }, { data: vendas }] = await Promise.all([
-    sb.from('pedidos_copia').select('total,forma_pagamento').eq('status','concluido').gte('created_at', hoje.toISOString()),
-    sb.from('vendas').select('total,forma_pagamento').eq('status','concluido').gte('created_at', hoje.toISOString()),
+  const [{ total: totalCopias }, { total: totalVendas }] = await Promise.all([
+    getTotalRealizado('pedidos_copia', hoje.toISOString()),
+    getTotalRealizado('vendas', hoje.toISOString()),
   ]);
 
-  const totalCopias = (copias||[]).reduce((a,b)=>a+b.total,0);
-  const totalVendas = (vendas||[]).reduce((a,b)=>a+b.total,0);
   const totalGeral = totalCopias + totalVendas;
 
   openModal('Fechar Caixa', `
@@ -2060,6 +2033,152 @@ window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas)
 };
 
 // ============================================================
+// ── MÓDULO: FIADO ──────────────────────────────────────────
+// ============================================================
+// Vendas em fiado contam como venda realizada (produto sai, cópia é
+// produzida), mas NÃO como receita — até o cliente pagar. Esta tela
+// lista o que está pendente, agrupado por cliente, e permite "Quitar"
+// (uma linha ou tudo de um cliente), momento em que o valor passa a
+// contar no financeiro (Dashboard/Caixa), usando quitado_em como data.
+async function renderFiado(el) {
+  const [{ data: vendasFiado }, { data: copiasFiado }] = await Promise.all([
+    sb.from('vendas').select('*').eq('forma_pagamento', 'fiado').eq('fiado_quitado', false).eq('status', 'concluido').order('created_at', { ascending: false }),
+    sb.from('pedidos_copia').select('*').eq('forma_pagamento', 'fiado').eq('fiado_quitado', false).eq('status', 'concluido').order('created_at', { ascending: false }),
+  ]);
+
+  const itens = [
+    ...(vendasFiado || []).map(v => ({
+      origem: 'venda', id: v.id, cliente: v.cliente_nome_pdv || 'Consumidor',
+      descricao: `Venda #${v.numero_venda ?? '—'}`, total: v.total, created_at: v.created_at,
+    })),
+    ...(copiasFiado || []).map(p => ({
+      origem: 'copia', id: p.id, cliente: p.cliente_nome_pdv || 'Consumidor',
+      descricao: `Cópia #${p.numero_pedido ?? '—'} · ${labelTipoCopia(p.tipo)} (${p.quantidade})`, total: p.total, created_at: p.created_at,
+    })),
+  ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+  const totalPendenteGeral = itens.reduce((a, b) => a + (b.total || 0), 0);
+
+  // Agrupa por cliente
+  const porCliente = {};
+  itens.forEach(i => {
+    if (!porCliente[i.cliente]) porCliente[i.cliente] = [];
+    porCliente[i.cliente].push(i);
+  });
+  const clientes = Object.keys(porCliente).sort((a, b) =>
+    porCliente[b].reduce((s, i) => s + i.total, 0) - porCliente[a].reduce((s, i) => s + i.total, 0));
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">📒 Fiado</div>
+        <div class="section-sub">Vendas pendentes de pagamento — não entram no financeiro até serem quitadas</div>
+      </div>
+      <div class="stat-card stat-card--danger" style="padding:var(--sp-3) var(--sp-4)">
+        <div class="stat-card-label">Total Pendente</div>
+        <div class="stat-card-value" style="font-size:var(--t-xl)">${formatMoney(totalPendenteGeral)}</div>
+      </div>
+    </div>
+
+    ${clientes.length === 0 ? `
+      <div class="card"><div class="card-body"><div class="empty-state" style="padding:var(--sp-8)">
+        <div class="empty-state-icon">📒</div>
+        <div class="empty-state-sub">Nenhum fiado pendente 🎉</div>
+      </div></div></div>
+    ` : clientes.map(cliente => {
+      const linhas = porCliente[cliente];
+      const totalCliente = linhas.reduce((a, b) => a + b.total, 0);
+      return `
+        <div class="card" style="margin-bottom:var(--sp-4)">
+          <div class="card-header">
+            <span class="card-title">👤 ${cliente}</span>
+            <div style="display:flex;align-items:center;gap:var(--sp-3)">
+              <span style="font-weight:700;color:var(--c-danger)">${formatMoney(totalCliente)}</span>
+              <button class="btn btn--success btn--sm" onclick="abrirQuitarFiado(null, '${cliente.replace(/'/g,"\\'")}')">✅ Quitar Tudo</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Descrição</th><th>Valor</th><th>Data</th><th></th></tr></thead>
+              <tbody>
+                ${linhas.map(i => `
+                  <tr>
+                    <td>${i.descricao}</td>
+                    <td style="color:var(--c-danger);font-weight:600">${formatMoney(i.total)}</td>
+                    <td class="td-mono">${formatDateTime(i.created_at)}</td>
+                    <td><button class="btn btn--ghost btn--sm" onclick="abrirQuitarFiado({origem:'${i.origem}',id:'${i.id}',total:${i.total}}, '${cliente.replace(/'/g,"\\'")}')">Quitar</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }).join('')}
+  `;
+}
+
+// item = null → quita tudo do cliente; item = {origem,id,total} → quita só essa linha
+window.abrirQuitarFiado = function(item, cliente) {
+  const total = item ? item.total : null;
+  openModal(`✅ Quitar — ${cliente}`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="section-sub">${item ? 'Confirma o pagamento desta pendência?' : 'Confirma o pagamento de TODAS as pendências deste cliente?'}</div>
+      <div class="field">
+        <label>Forma de pagamento recebida agora</label>
+        <select class="input" id="quitar-pagamento">
+          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito'].map(p => `<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center"
+        onclick="confirmarQuitarFiado(${item ? `'${item.origem}','${item.id}'` : 'null,null'}, '${cliente.replace(/'/g,"\\'")}')">
+        ✅ Confirmar Quitação
+      </button>
+    </div>
+  `);
+};
+
+window.confirmarQuitarFiado = async function(origem, id, cliente) {
+  const pagamento = document.getElementById('quitar-pagamento')?.value || 'dinheiro';
+  const agora = new Date().toISOString();
+
+  try {
+    if (origem && id) {
+      // Quita só uma linha
+      const tabela = origem === 'venda' ? 'vendas' : 'pedidos_copia';
+      const { error } = await sb.from(tabela).update({
+        fiado_quitado: true, quitado_em: agora, forma_pagamento_quitacao: pagamento,
+      }).eq('id', id);
+      if (error) throw error;
+    } else {
+      // Quita tudo do cliente (vendas + cópias). Quando não há nome
+      // (mostrado como "Consumidor" na tela), o filtro precisa ser
+      // IS NULL — .eq() nunca casa com NULL no Postgres.
+      const aplicarFiltroCliente = (query) =>
+        cliente === 'Consumidor' ? query.is('cliente_nome_pdv', null) : query.eq('cliente_nome_pdv', cliente);
+
+      const { error: e1 } = await aplicarFiltroCliente(
+        sb.from('vendas').update({ fiado_quitado: true, quitado_em: agora, forma_pagamento_quitacao: pagamento })
+          .eq('forma_pagamento', 'fiado').eq('fiado_quitado', false)
+      );
+      if (e1) throw e1;
+
+      const { error: e2 } = await aplicarFiltroCliente(
+        sb.from('pedidos_copia').update({ fiado_quitado: true, quitado_em: agora, forma_pagamento_quitacao: pagamento })
+          .eq('forma_pagamento', 'fiado').eq('fiado_quitado', false)
+      );
+      if (e2) throw e2;
+    }
+
+    toast('✅ Fiado quitado! Já entra no financeiro de hoje.', 'success');
+    closeModal();
+    navigate('fiado');
+  } catch (err) {
+    toast('Erro ao quitar: ' + err.message, 'error');
+  }
+};
+
+// ============================================================
 // ── MÓDULO: ESTOQUE ───────────────────────────────────────
 // ============================================================
 async function renderEstoque(el) {
@@ -2073,7 +2192,10 @@ async function renderEstoque(el) {
         <div class="section-title">Estoque de Produtos</div>
         <div class="section-sub">Papéis, toneres, tintas e materiais</div>
       </div>
-      <button class="btn btn--primary" onclick="abrirModalProduto()">+ Cadastrar Produto</button>
+      <div style="display:flex;gap:var(--sp-2)">
+        <button class="btn btn--ghost" onclick="abrirGeradorEtiquetas()">🏷️ Gerar Etiquetas</button>
+        <button class="btn btn--primary" onclick="abrirModalProduto()">+ Cadastrar Produto</button>
+      </div>
     </div>
 
     <!-- ABAS DE FILTRO -->
@@ -2153,177 +2275,6 @@ async function renderEstoque(el) {
 // ── MÓDULO: CAIXA (UI MELHORADA E CORRIGIDA) ─────────────
 // ============================================================
 
-async function renderCaixa(el) {
-  const [{ data: sessoes }, { data: empresa }] = await Promise.all([
-    sb.from('caixa_sessoes')
-      .select('*, funcionarios(nome)')
-      .order('aberto_em', { ascending: false })
-      .limit(10),
-    sb.from('empresa').select('config').single()
-  ]);
-
-  const sessaoAberta = sessoes?.find(s => !s.fechado_em);
-  const limiteSangria = empresa?.config?.limite_sangria || 1000000;
-
-  let movimentos = [];
-  let saldoAtual = 0;
-  let totalVendasDinheiro = 0;
-  let totalSuprimentos = 0;
-  let totalRetiradas = 0;
-  let totalDespesas = 0;
-  let totalSangrias = 0;
-  let quebra = 0;
-
-  if (sessaoAberta) {
-    // Buscar movimentos
-    const { data: mov } = await sb.from('caixa_movimentos')
-      .select('*')
-      .eq('sessao_id', sessaoAberta.id)
-      .order('created_at', { ascending: false });
-    movimentos = mov || [];
-
-    // Calcular saldo esperado via RPC
-    const { data: saldo } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoAberta.id });
-    saldoAtual = saldo || 0;
-
-    // Atualizar saldo_atual na sessão (para manter consistência)
-    await sb.from('caixa_sessoes').update({ saldo_atual: saldoAtual }).eq('id', sessaoAberta.id);
-
-    // Buscar totais da view
-    const { data: viewData } = await sb.from('vw_caixa_sessao_atual').select('*').eq('id', sessaoAberta.id).single();
-    if (viewData) {
-      totalSuprimentos = viewData.total_suprimentos || 0;
-      totalRetiradas = viewData.total_retiradas || 0;
-      totalDespesas = viewData.total_despesas || 0;
-      totalSangrias = viewData.total_sangrias || 0;
-      totalVendasDinheiro = (viewData.total_vendas_copias_dinheiro || 0) + (viewData.total_vendas_produtos_dinheiro || 0);
-    }
-  }
-
-  // Montar HTML
-  el.innerHTML = `
-    <div class="section-header">
-      <div>
-        <div class="section-title">💰 Controle de Caixa</div>
-        <div class="section-sub">Abertura, movimentações e fechamento</div>
-      </div>
-      <div style="display:flex; gap: var(--sp-2); flex-wrap: wrap">
-        ${sessaoAberta 
-          ? `<button class="btn btn--danger" onclick="fecharCaixa('${sessaoAberta.id}')">🔒 Fechar Caixa</button>`
-          : `<button class="btn btn--success" onclick="abrirCaixa()">🔓 Abrir Caixa</button>`
-        }
-        <button class="btn btn--ghost" onclick="irConfiguracoes()">⚙️ Configurações</button>
-      </div>
-    </div>
-
-    <!-- Card de Status da Sessão Atual -->
-    <div class="card" style="border-color:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; margin-bottom: var(--sp-4); height: auto;">
-      <div class="card-body">
-        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap: var(--sp-3)">
-          <div style="display:flex; align-items:center; gap: var(--sp-3)">
-            <div style="width:12px;height:12px;border-radius:50%;background:${sessaoAberta ? 'var(--c-success)' : 'var(--c-danger)'}; ${sessaoAberta ? 'animation: pulse 1.5s infinite' : ''}"></div>
-            <span style="font-weight:700; font-size:var(--t-lg)">${sessaoAberta ? '🟢 Caixa Aberto' : '🔴 Caixa Fechado'}</span>
-            ${sessaoAberta?.travado ? `<span class="badge badge--danger" style="font-weight:700">🔒 TRAVADO</span>` : ''}
-          </div>
-          ${sessaoAberta ? `
-            <div style="display:flex; gap: var(--sp-4); flex-wrap:wrap; font-size:var(--t-sm)">
-              <div><span style="color:var(--c-text-3)">Abertura:</span> <strong>${formatMoney(sessaoAberta.valor_abertura)}</strong></div>
-              <div><span style="color:var(--c-text-3)">Saldo atual:</span> <strong style="color:var(--c-accent)">${formatMoney(saldoAtual)}</strong></div>
-              <div><span style="color:var(--c-text-3)">Limite sangria:</span> ${formatMoney(limiteSangria)}</div>
-              ${sessaoAberta.travado ? `<button class="btn btn--warning btn--sm" onclick="liberarCaixa('${sessaoAberta.id}')">🔓 Liberar (Admin)</button>` : ''}
-            </div>
-          ` : ''}
-        </div>
-
-        ${sessaoAberta ? `
-        <!-- Resumo de movimentações (mini cards) -->
-        <div class="summary-grid" style="margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--c-border)">
-          <div class="summary-item">
-            <div class="summary-item-label">Vendas em Dinheiro</div>
-            <div class="summary-item-value" style="color:var(--c-success)">${formatMoney(totalVendasDinheiro)}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-item-label">Suprimentos</div>
-            <div class="summary-item-value" style="color:var(--c-success)">${formatMoney(totalSuprimentos)}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-item-label">Retiradas</div>
-            <div class="summary-item-value" style="color:var(--c-warning)">${formatMoney(totalRetiradas)}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-item-label">Despesas</div>
-            <div class="summary-item-value" style="color:var(--c-danger)">${formatMoney(totalDespesas)}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-item-label">Sangrias</div>
-            <div class="summary-item-value" style="color:var(--c-accent)">${formatMoney(totalSangrias)}</div>
-          </div>
-        </div>
-        ` : ''}
-      </div>
-    </div>
-
-    <!-- Botões de Ação (apenas se caixa aberto e NÃO travado) -->
-    ${sessaoAberta && !sessaoAberta.travado ? `
-    <div style="display:flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-4)">
-      <button class="btn btn--primary" onclick="abrirModalSuprimento('${sessaoAberta.id}')">💰 Suprimento</button>
-      <button class="btn btn--ghost" onclick="abrirModalRetirada('${sessaoAberta.id}')">💸 Retirada</button>
-      <button class="btn btn--danger" onclick="abrirModalDespesa('${sessaoAberta.id}')">📋 Despesa</button>
-      <button class="btn btn--accent" onclick="abrirModalSangria('${sessaoAberta.id}')">🏦 Sangria</button>
-    </div>
-    ` : ''}
-
-    <!-- Movimentações do Dia (se houver sessão aberta) -->
-    ${sessaoAberta ? `
-    <div class="card" style="margin-bottom: var(--sp-4)">
-      <div class="card-header"><span class="card-title">📋 Movimentações do Dia</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>Tipo</th><th>Valor</th><th>Descrição</th><th>Hora</th></tr>
-          </thead>
-          <tbody>
-            ${movimentos.length === 0 
-              ? `<tr><td colspan="4"><div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhuma movimentação ainda</div></div></td></tr>`
-              : movimentos.map(m => `
-                <tr>
-                  <td><span class="badge ${m.tipo === 'suprimento' ? 'badge--success' : m.tipo === 'retirada' ? 'badge--warning' : m.tipo === 'despesa' ? 'badge--danger' : 'badge--accent'}">${m.tipo}</span></td>
-                  <td style="color:${m.tipo === 'suprimento' ? 'var(--c-success)' : 'var(--c-danger)'}">${formatMoney(m.valor)}</td>
-                  <td>${m.descricao || '—'}</td>
-                  <td class="td-mono">${formatDateTime(m.created_at)}</td>
-                </tr>
-              `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-    ` : ''}
-
-    <!-- Histórico de Caixas -->
-    <div class="card">
-      <div class="card-header"><span class="card-title">Histórico de Caixas</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
-          <tbody>
-            ${(sessoes||[]).map(s => `
-              <tr>
-                <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
-                <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
-                <td>${formatMoney(s.valor_abertura)}</td>
-                <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
-                <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
-                <td style="color:${(s.quebra || 0) > 0 ? 'var(--c-success)' : (s.quebra || 0) < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(s.quebra || 0)}</td>
-                <td>${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}</td>
-              </tr>
-            `).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa registrado</div></div></td></tr>'}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
-}
-
 window.verVenda = async function(vendaId) {
   // Busca dados da venda e itens
   const { data: venda, error: errVenda } = await sb.from('vendas')
@@ -2385,6 +2336,131 @@ window.filtrarTabelaProdutos = debounce(function(q) {
   });
 }, 200);
 
+// ============================================================
+// ── GERADOR DE ETIQUETAS DE CÓDIGO DE BARRAS ──────────────
+// ============================================================
+// Usa a biblioteca JsBarcode (carregada via CDN no index.html) para
+// desenhar códigos Code128 em SVG. Gera uma folha de etiquetas
+// pronta para impressão (window.print), respeitando o layout de
+// etiqueta configurado (padrão 40mm × 25mm, 3 colunas).
+window.abrirGeradorEtiquetas = async function() {
+  const { data: produtos } = await sb.from('produtos')
+    .select('id, nome, codigo_barras, preco_venda')
+    .eq('ativo', true)
+    .order('nome');
+
+  const comCodigo = (produtos || []).filter(p => p.codigo_barras);
+  const semCodigo = (produtos || []).filter(p => !p.codigo_barras);
+
+  openModal('🏷️ Gerador de Etiquetas', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="section-sub">Selecione os produtos e a quantidade de etiquetas de cada um. Produtos sem código de barras cadastrado não aparecem aqui — cadastre o código em "Editar Produto".</div>
+      <div class="search-bar">
+        <span class="search-bar-icon">🔍</span>
+        <input type="text" class="input" placeholder="Buscar produto..." oninput="filtrarEtiquetasLista(this.value)" />
+      </div>
+      <div id="etiquetas-lista" style="max-height:280px;overflow-y:auto;border:1px solid var(--c-border);border-radius:var(--r-md)">
+        ${comCodigo.map(p => `
+          <div class="pdv-item" data-nome="${p.nome.toLowerCase()}" style="padding:var(--sp-2) var(--sp-3)">
+            <div class="pdv-item-info">
+              <div class="pdv-item-name">${p.nome}</div>
+              <div class="pdv-item-sub td-mono">${p.codigo_barras} · ${formatMoney(p.preco_venda||0)}</div>
+            </div>
+            <input type="number" class="input etiqueta-qtd" data-id="${p.id}" data-nome="${p.nome.replace(/"/g,'&quot;')}"
+                   data-codigo="${p.codigo_barras}" data-preco="${p.preco_venda||0}"
+                   value="0" min="0" style="width:70px" />
+          </div>
+        `).join('') || '<div class="empty-state" style="padding:var(--sp-6)"><div class="empty-state-sub">Nenhum produto com código de barras cadastrado</div></div>'}
+      </div>
+      ${semCodigo.length > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-text-3)">⚠️ ${semCodigo.length} produto(s) sem código de barras não listado(s).</div>` : ''}
+      <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
+        <input type="checkbox" id="etiqueta-mostrar-preco" checked> <span>Mostrar preço na etiqueta</span>
+      </label>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="gerarFolhaEtiquetas()">
+        🖨️ Gerar e Imprimir Etiquetas
+      </button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.filtrarEtiquetasLista = function(q) {
+  document.querySelectorAll('#etiquetas-lista .pdv-item').forEach(el => {
+    el.style.display = (el.dataset.nome || '').includes(q.toLowerCase()) ? '' : 'none';
+  });
+};
+
+window.gerarFolhaEtiquetas = function() {
+  if (typeof JsBarcode === 'undefined') {
+    toast('Biblioteca de código de barras não carregou. Verifique sua conexão.', 'error');
+    return;
+  }
+
+  const mostrarPreco = document.getElementById('etiqueta-mostrar-preco')?.checked;
+  const linhas = [];
+  document.querySelectorAll('.etiqueta-qtd').forEach(input => {
+    const qtd = parseInt(input.value) || 0;
+    if (qtd <= 0) return;
+    for (let i = 0; i < qtd; i++) {
+      linhas.push({ nome: input.dataset.nome, codigo: input.dataset.codigo, preco: parseFloat(input.dataset.preco) || 0 });
+    }
+  });
+
+  if (linhas.length === 0) { toast('Informe a quantidade de pelo menos um produto', 'warning'); return; }
+  if (linhas.length > 300) { toast('Máximo de 300 etiquetas por folha. Gere em lotes menores.', 'warning'); return; }
+
+  const janela = window.open('', '_blank', 'width=900,height=700');
+  if (!janela) { toast('Permita pop-ups para gerar as etiquetas', 'warning'); return; }
+
+  janela.document.write(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Etiquetas</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 8mm; font-family: Arial, sans-serif; }
+      .folha { display: flex; flex-wrap: wrap; gap: 2mm; }
+      .etiqueta {
+        width: 40mm; height: 25mm; border: 1px dashed #ccc;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 1mm; overflow: hidden; page-break-inside: avoid;
+      }
+      .etiqueta .nome { font-size: 7.5px; font-weight: 700; text-align: center; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .etiqueta .preco { font-size: 9px; font-weight: 700; margin-top: 1mm; }
+      svg { max-width: 100%; height: 12mm; }
+      @media print { .etiqueta { border: none; } }
+    </style>
+    </head><body>
+      <div class="folha" id="folha"></div>
+    </body></html>
+  `);
+  janela.document.close();
+
+  const folha = janela.document.getElementById('folha');
+  linhas.forEach((item, idx) => {
+    const div = janela.document.createElement('div');
+    div.className = 'etiqueta';
+    const nomeDiv = janela.document.createElement('div');
+    nomeDiv.className = 'nome';
+    nomeDiv.textContent = item.nome;
+    const svg = janela.document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('id', `barcode-${idx}`);
+    div.appendChild(nomeDiv);
+    div.appendChild(svg);
+    if (mostrarPreco) {
+      const precoDiv = janela.document.createElement('div');
+      precoDiv.className = 'preco';
+      precoDiv.textContent = formatMoney(item.preco);
+      div.appendChild(precoDiv);
+    }
+    folha.appendChild(div);
+    try {
+      JsBarcode(svg, item.codigo, { format: 'CODE128', width: 1.3, height: 30, displayValue: true, fontSize: 9, margin: 0 });
+    } catch (e) {
+      nomeDiv.textContent += ' (código inválido)';
+    }
+  });
+
+  setTimeout(() => { janela.focus(); janela.print(); }, 300);
+};
+
 window.abrirModalProduto = async function(produtoId) {
   const { data: fornecedores } = await sb.from('fornecedores').select('id,nome').eq('ativo',true).order('nome');
   let p = {};
@@ -2423,6 +2499,13 @@ window.abrirModalProduto = async function(produtoId) {
       <div class="form-row form-row--2">
         <div class="field"><label>Preço de Venda</label><input type="number" class="input" id="prod-venda" value="${p.preco_venda||''}" step="0.01" min="0" placeholder="0,00" /></div>
         <div class="field"><label>Preço de Custo</label><input type="number" class="input" id="prod-custo" value="${p.preco_custo||''}" step="0.01" min="0" placeholder="0,00" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field">
+          <label>💳 Preço no Cartão (opcional)</label>
+          <input type="number" class="input" id="prod-preco-cartao" value="${p.preco_cartao||''}" step="0.01" min="0" placeholder="Deixe vazio para usar o preço normal" />
+          <div style="font-size:var(--t-xs);color:var(--c-text-3)">Valor fixo cobrado quando o pagamento for em cartão (débito ou crédito).</div>
+        </div>
       </div>
       <div class="form-row form-row--2">
         <div class="field"><label>Estoque Atual</label><input type="number" class="input" id="prod-estoque" value="${p.estoque_atual||0}" step="0.001" /></div>
@@ -2550,6 +2633,7 @@ window.salvarProduto = async function(id) {
     fornecedor_id: document.getElementById('prod-fornecedor').value||null,
     preco_venda: parseFloat(document.getElementById('prod-venda').value)||null,
     preco_custo: parseFloat(document.getElementById('prod-custo').value)||null,
+    preco_cartao: parseFloat(document.getElementById('prod-preco-cartao').value)||null,
     estoque_atual: parseFloat(document.getElementById('prod-estoque').value)||0,
     estoque_minimo: parseFloat(document.getElementById('prod-estoque-min').value)||0,
     descricao: document.getElementById('prod-desc').value||null,
@@ -3254,43 +3338,13 @@ window.salvarFornecedor = async function(id) {
 // ============================================================
 // ── MÓDULO: IMPRESSORAS ───────────────────────────────────
 // ============================================================
-function renderStepImpressoras() {
-
-  const impressorasOnline = State.impressoras.filter(imp => imp.status === 'online');
-// Use impressorasOnline no lugar de State.impressoras no map
-  return `
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Escolha a impressora</span>
-        <button class="btn btn--ghost btn--sm" onclick="loadImpressoras().then(()=>renderStep(1))">↻</button>
-      </div>
-      <div class="card-body">
-        <div class="printer-grid" id="printer-grid">
-          ${State.impressoras.map(imp => {
-  const isOnline = imp.status === 'online';
-  return `
-    <div class="printer-card ${!isOnline ? 'opacity-half disabled' : ''} ${PdvState.impressoraSelecionada === imp.id ? 'selected' : ''}"
-         data-id="${imp.id}"
-         onclick="${isOnline ? `selecionarImpressora('${imp.id}')` : ''}"
-         style="${!isOnline ? 'cursor:not-allowed;opacity:0.5' : ''}">
-      <div style="display:flex;align-items:center;gap:var(--sp-2)">
-        <div class="printer-status-dot ${imp.status}"></div>
-        <span class="badge badge--${imp.status === 'online' ? 'success' : 'danger'}">${imp.status}</span>
-        ${imp.colorida ? '<span class="badge badge--accent">Colorida</span>' : '<span class="badge">P&B</span>'}
-      </div>
-      <div class="printer-card-name">${imp.nome}</div>
-      <div class="printer-card-model">${imp.marca||''} ${imp.modelo||''}</div>
-      ${!isOnline ? '<div style="color:var(--c-danger);font-size:var(--t-xs)">⚠️ Indisponível</div>' : ''}
-      <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">📍 ${imp.localizacao||'—'} · IP: ${imp.ip_rede||'—'}</div>
-      <div class="printer-counters">...</div>
-    </div>
-  `;
-}).join('')} || '<div class="empty-state"><div class="empty-state-icon">🖥️</div><div class="empty-state-sub">Cadastre impressoras em Impressoras</div></div>'}
-        </div>
-      </div>
-    </div>
-  `;
-}
+// ============================================================
+// ── MÓDULO: IMPRESSORAS ───────────────────────────────────
+// ============================================================
+// (renderStepImpressoras foi removido — a escolha de impressora agora
+// é feita por um seletor compacto sempre visível na aba "Impressões"
+// do PDV, ver renderAbaCopia(). O PDV passou a iniciar direto no
+// antigo "passo 2": escolha do tipo de cópia.)
 
 function renderStepTipoCopia() {
   return `
@@ -3521,7 +3575,7 @@ async function renderPrecos(el) {
     <div class="card">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>Ativo</th><th></th></tr></thead>
+          <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>💳 Cartão</th><th>Ativo</th><th></th></tr></thead>
           <tbody>
             ${(precos||[]).map(p=>`
               <tr>
@@ -3530,6 +3584,7 @@ async function renderPrecos(el) {
                 <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_unitario)}</td>
                 <td>${p.preco_desconto ? formatMoney(p.preco_desconto) : '—'}</td>
                 <td>${p.qtd_desconto||'—'} cópias</td>
+                <td>${p.preco_cartao ? formatMoney(p.preco_cartao) : '—'}</td>
                 <td><span class="badge badge--${p.ativo?'success':'danger'}">${p.ativo?'Sim':'Não'}</span></td>
                 <td><button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️ Editar</button></td>
               </tr>
@@ -3558,6 +3613,10 @@ window.abrirModalNovoPreco = function() {
         <div class="field"><label>Preço com Desconto</label><input type="number" class="input" id="novo-desc-val" step="100" min="0" /></div>
         <div class="field"><label>A partir de (qtd)</label><input type="number" class="input" id="novo-qtd" value="100" min="1" /></div>
       </div>
+      <div class="field">
+        <label>💳 Preço no Cartão (opcional)</label>
+        <input type="number" class="input" id="novo-preco-cartao" step="100" min="0" placeholder="Deixe vazio para usar o preço normal" />
+      </div>
       <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
         <input type="checkbox" id="novo-ativo" checked> <span>Ativo no PDV</span>
       </label>
@@ -3572,6 +3631,7 @@ window.salvarNovoPreco = async function() {
   const preco_unitario = parseFloat(document.getElementById('novo-unit').value) || 0;
   const preco_desconto = parseFloat(document.getElementById('novo-desc-val').value) || null;
   const qtd_desconto = parseInt(document.getElementById('novo-qtd').value) || 100;
+  const preco_cartao = parseFloat(document.getElementById('novo-preco-cartao').value) || null;
   const ativo = document.getElementById('novo-ativo').checked;
 
   if (!tipo || !descricao || preco_unitario <= 0) {
@@ -3592,6 +3652,7 @@ window.salvarNovoPreco = async function() {
     preco_unitario,
     preco_desconto,
     qtd_desconto,
+    preco_cartao,
     ativo
   });
 
@@ -3617,6 +3678,10 @@ window.editarPreco = async function(id) {
         <div class="field"><label>Preço c/ Desconto</label><input type="number" class="input" id="preco-desc-val" value="${data.preco_desconto||''}" step="0.01" min="0" /></div>
         <div class="field"><label>A partir de (qtd)</label><input type="number" class="input" id="preco-qtd" value="${data.qtd_desconto||100}" min="1" /></div>
       </div>
+      <div class="field">
+        <label>💳 Preço no Cartão (opcional)</label>
+        <input type="number" class="input" id="preco-cartao" value="${data.preco_cartao||''}" step="0.01" min="0" placeholder="Deixe vazio para usar o preço normal" />
+      </div>
       <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
         <input type="checkbox" id="preco-ativo" ${data.ativo?'checked':''}> <span>Ativo no PDV</span>
       </label>
@@ -3630,6 +3695,7 @@ window.salvarPreco = async function(id) {
     preco_unitario: parseFloat(document.getElementById('preco-unit').value)||0,
     preco_desconto: parseFloat(document.getElementById('preco-desc-val').value)||null,
     qtd_desconto: parseInt(document.getElementById('preco-qtd').value)||100,
+    preco_cartao: parseFloat(document.getElementById('preco-cartao').value)||null,
     ativo: document.getElementById('preco-ativo').checked,
   };
   const {error} = await sb.from('precos_copia').update(p).eq('id',id);
@@ -3648,7 +3714,7 @@ function labelPagamento(p) {
     pix_brl:       '🇧🇷 Pix (R$)',
     cartao_debito: '💳 Débito',
     cartao_credito:'💳 Crédito',
-    // fiado:         '📒 Fiado',
+    fiado:         '📒 Fiado',
     // cheque:        '📄 Cheque',
     transferencia: '🔄 Transfer.',
   };
@@ -3698,7 +3764,7 @@ window.filtrarTabela = debounce(function(q, tableId) {
 async function renderPassagens(el) {
   // Roles de visibilidades
   const userRole = State.userProfile?.role || 'funcionario';
-  const isAdmin = userRole === 'admin'
+  const isAdmin = userRole === 'admin' || userRole === 'adminMaster';
   
   // Carrega configurações de comissão
   const { data: comissoes } = await sb.from('config_comissoes').select('*');
@@ -4528,7 +4594,6 @@ window.refreshFila = async function() {
   const btn = document.getElementById('btn-refresh-fila');
   if (btn) btn.disabled = true;
 
-  // Busca pedidos ativos (exclui cancelados muito antigos)
   const { data: pedidos, error } = await sb
     .from('pedidos_copia')
     .select('*, impressoras(nome, status, colorida, tipo)')
@@ -4541,13 +4606,9 @@ window.refreshFila = async function() {
   const filaBody = document.getElementById('fila-body');
   if (!filaBody) return;
 
-  // Agrupa por impressora
   const porImpressora = {};
-
-  // Inicializa com todas as impressoras cadastradas (mesmo sem pedidos)
   State.impressoras.forEach(imp => { porImpressora[imp.id] = { impressora: imp, pedidos: [] }; });
 
-  // Distribui pedidos
   (pedidos || []).forEach(p => {
     const key = p.impressora_id || '__sem_impressora__';
     if (!porImpressora[key]) {
@@ -4556,15 +4617,14 @@ window.refreshFila = async function() {
     porImpressora[key].pedidos.push(p);
   });
 
-  // Filtro ativo
   const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
 
-
-  // Renderiza colunas
-  filaBody.innerHTML = Object.values(porImpressora).map(({ impressora, pedidos: peds }) => {
+  // Construir as colunas usando um loop for...of com await
+  const colunasHtml = [];
+  for (const { impressora, pedidos: peds } of Object.values(porImpressora)) {
     const pedidosFiltrados = filtroAtivo === 'todos'
-    ? peds.filter(p => p.status !== 'concluido')
-    : peds.filter(p => p.status === filtroAtivo);
+      ? peds.filter(p => p.status !== 'concluido')
+      : peds.filter(p => p.status === filtroAtivo);
 
     const counts = {
       na_fila:     peds.filter(p => p.status === 'na_fila').length,
@@ -4574,7 +4634,18 @@ window.refreshFila = async function() {
     };
     const totalAtivos = counts.na_fila + counts.imprimindo + counts.conferencia + counts.erro;
 
-    return `
+    let bodyHtml = '';
+    if (pedidosFiltrados.length === 0) {
+      bodyHtml = `<div class="fila-empty">
+        <div class="fila-empty-icon">✅</div>
+        <div class="fila-empty-text">${filtroAtivo === 'todos' ? 'Fila livre' : 'Nenhum pedido'}</div>
+      </div>`;
+    } else {
+      const cards = await Promise.all(pedidosFiltrados.map(p => renderPedidoCard(p)));
+      bodyHtml = cards.join('');
+    }
+
+    colunasHtml.push(`
       <div class="fila-coluna">
         <div class="fila-coluna-header">
           <div class="printer-status-dot ${impressora.status || 'offline'}"></div>
@@ -4583,45 +4654,216 @@ window.refreshFila = async function() {
           ${counts.imprimindo > 0 ? `<span class="badge badge--primary">⚡ Imprimindo</span>` : ''}
         </div>
         <div class="fila-coluna-body">
-          ${pedidosFiltrados.length === 0
-            ? `<div class="fila-empty">
-                <div class="fila-empty-icon">✅</div>
-                <div class="fila-empty-text">${filtroAtivo === 'todos' ? 'Fila livre' : 'Nenhum pedido'}</div>
-               </div>`
-            : pedidosFiltrados.map(p => renderPedidoCard(p)).join('')
-          }
+          ${bodyHtml}
         </div>
       </div>
-    `;
-  }).join('') || `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">🖥️</div><div class="fila-empty-text">Nenhuma impressora cadastrada</div></div>`;
+    `);
+  }
 
-  // Atualiza timestamp
+  filaBody.innerHTML = colunasHtml.join('') || `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">🖥️</div><div class="fila-empty-text">Nenhuma impressora cadastrada</div></div>`;
+
   const tsEl = document.getElementById('fila-ultima-atualizacao');
   if (tsEl) tsEl.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })}`;
 
   if (btn) btn.disabled = false;
 };
 
+window.verCarrinhoPendente = async function(pedidoId) {
+  const carrinho = await obterCarrinhoPendentePorPedido(pedidoId);
+  if (!carrinho) {
+    toast('Carrinho não encontrado.', 'error');
+    return;
+  }
+  _carrinhoPendenteAtual = carrinho;
+  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, renderCarrinhoPendenteModalBody(carrinho, 'dinheiro'), 'modal--lg');
+};
+
+// Estado local só pra evitar re-buscar o carrinho a cada troca de forma de pagamento no modal
+let _carrinhoPendenteAtual = null;
+
+function renderCarrinhoPendenteModalBody(carrinho, pagamento) {
+  const itens = carrinho.itens || [];
+  const subtotal = itens.reduce((acc, i) => acc + precoComPagamento(i.preco_base, i.preco_cartao, pagamento) * i.quantidade, 0);
+  const desconto = Math.min(carrinho.desconto || 0, subtotal);
+  const total = Math.max(0, subtotal - desconto);
+
+  const htmlItens = itens.map(i => {
+    const precoUnit = precoComPagamento(i.preco_base, i.preco_cartao, pagamento);
+    return `
+    <div class="pdv-item" style="padding:var(--sp-2) 0">
+      <div class="pdv-item-info">
+        <div class="pdv-item-name">${i.tipo_item === 'copia' ? '🖨️ ' + (i.tipo_label || i.tipo) : '📦 ' + i.nome}</div>
+        <div class="pdv-item-sub">${i.quantidade} × ${formatMoney(precoUnit)}</div>
+      </div>
+      <div class="pdv-item-price">${formatMoney(precoUnit * i.quantidade)}</div>
+      <button class="pdv-remove-btn" onclick="removerItemCarrinhoPendente('${carrinho.id}','${i.id}')">✕</button>
+    </div>`;
+  }).join('');
+
+  return `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="section-sub">Itens pendentes neste carrinho (cópias já na fila + produtos). O preço muda automaticamente se a forma de pagamento for cartão.</div>
+      <div id="carrinho-pendente-itens">
+        ${htmlItens || '<div class="empty-state"><div class="empty-state-sub">Nenhum item</div></div>'}
+      </div>
+      <div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-text-3)">
+        <span>Subtotal</span><span id="cp-subtotal">${formatMoney(subtotal)}</span>
+      </div>
+      ${desconto > 0 ? `<div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-danger)"><span>Desconto</span><span id="cp-desconto">− ${formatMoney(desconto)}</span></div>` : ''}
+      <div class="pdv-total-row">
+        <span class="pdv-total-label">Total</span>
+        <span class="pdv-total-value" id="cp-total">${formatMoney(total)}</span>
+      </div>
+      <div class="field">
+        <label>Forma de Pagamento</label>
+        <select class="input" id="carrinho-pendente-pagamento" onchange="atualizarPreviewCarrinhoPendente(this.value)">
+          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `<option value="${p}" ${p===pagamento?'selected':''}>${labelPagamento(p)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')">
+        ✅ Finalizar Venda — <span id="cp-total-btn">${formatMoney(total)}</span>
+      </button>
+    </div>
+  `;
+}
+
+window.atualizarPreviewCarrinhoPendente = function(pagamento) {
+  if (!_carrinhoPendenteAtual) return;
+  const modalBody = document.getElementById('modal-body');
+  if (modalBody) modalBody.innerHTML = renderCarrinhoPendenteModalBody(_carrinhoPendenteAtual, pagamento);
+};
+
+window.removerItemCarrinhoPendente = async function(carrinhoId, itemId) {
+  const { data: carrinho } = await sb
+    .from('carrinhos_pendentes')
+    .select('itens')
+    .eq('id', carrinhoId)
+    .single();
+
+  if (!carrinho) { toast('Carrinho não encontrado', 'error'); return; }
+
+  const itens = (carrinho.itens || []).filter(i => i.id !== itemId);
+  await sb.from('carrinhos_pendentes')
+    .update({ itens })
+    .eq('id', carrinhoId);
+
+  toast('Item removido', 'info');
+  verCarrinhoPendente(carrinhoId); // recarrega o modal
+};
+
+window.finalizarCarrinhoPendente = async function(carrinhoId) {
+  const { data: carrinho } = await sb
+    .from('carrinhos_pendentes')
+    .select('*')
+    .eq('id', carrinhoId)
+    .single();
+
+  if (!carrinho) { toast('Carrinho não encontrado', 'error'); return; }
+
+  const itens = carrinho.itens || [];
+  const itensProduto = itens.filter(i => i.tipo_item === 'produto');
+  const clienteNome = carrinho.cliente_nome || null;
+
+  const pagamentoSelect = document.getElementById('carrinho-pendente-pagamento')?.value || 'dinheiro';
+  const pagamentoDb = pagamentoSelect === 'pix_brl' ? 'pix' : pagamentoSelect;
+
+  const btn = document.querySelector('#global-modal .btn--success');
+  if (btn) { btn.disabled = true; }
+
+  try {
+    // Busca os pedidos de cópia reais vinculados a este carrinho (fonte da
+    // verdade financeira das cópias — não o JSON, que é só um espelho).
+    const { data: pedidosCopia, error: errPedidos } = await sb
+      .from('pedidos_copia')
+      .select('*')
+      .eq('carrinho_id', carrinhoId)
+      .neq('status', 'cancelado');
+    if (errPedidos) throw errPedidos;
+
+    const subtotalCopia = (pedidosCopia || []).reduce(
+      (a, p) => a + precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb) * p.quantidade, 0);
+    const subtotalProduto = itensProduto.reduce(
+      (a, i) => a + precoComPagamento(i.preco_base, i.preco_cartao, pagamentoDb) * i.quantidade, 0);
+    const subtotalGeral = subtotalCopia + subtotalProduto;
+
+    const descontoTotal   = Math.min(carrinho.desconto || 0, subtotalGeral);
+    const descontoCopia   = subtotalGeral > 0 ? Math.round(descontoTotal * (subtotalCopia / subtotalGeral)) : 0;
+    const descontoProduto = descontoTotal - descontoCopia;
+
+    // ── Atualiza os pedidos de cópia com o preço/forma de pagamento definitivos ──
+    if (pedidosCopia && pedidosCopia.length > 0) {
+      const pesos = pedidosCopia.map(p => precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb) * p.quantidade);
+      const descontoPorPedido = distribuirValor(descontoCopia, pesos);
+      for (let idx = 0; idx < pedidosCopia.length; idx++) {
+        const p = pedidosCopia[idx];
+        const precoUnit = precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb);
+        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx];
+        const { error } = await sb.from('pedidos_copia').update({
+          preco_unitario:  Math.round(precoUnit),
+          desconto:        descontoPorPedido[idx],
+          total:           totalItem,
+          forma_pagamento: pagamentoDb,
+        }).eq('id', p.id);
+        if (error) throw error;
+      }
+    }
+
+    // ── Registra a venda dos produtos, se houver ──
+    let vendaId = null;
+    if (itensProduto.length > 0) {
+      vendaId = await processarVendaProdutos(itensProduto, subtotalProduto, descontoProduto, pagamentoDb, clienteNome);
+      if (vendaId === null) { if (btn) btn.disabled = false; return; } // erro já mostrado
+    }
+
+    // Remove o carrinho pendente (já finalizado)
+    await sb.from('carrinhos_pendentes').delete().eq('id', carrinhoId);
+
+    toast('✅ Venda finalizada com sucesso!', 'success');
+    closeModal();
+    _carrinhoPendenteAtual = null;
+    await refreshFila();
+  } catch (err) {
+    toast('Erro ao finalizar: ' + err.message, 'error');
+    if (btn) { btn.disabled = false; }
+  }
+};
+
 // ── Renderiza um card de pedido ───────────────────────────
-function renderPedidoCard(p) {
+async function renderPedidoCard(p) {
   const folhasEsperadas = p.paginas_por_documento
-  ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
-  : calcularFolhas(p.quantidade, p.frente_verso);
-  const clienteLabel    = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+    ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+    : calcularFolhas(p.quantidade, p.frente_verso);
+  const clienteLabel = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+
+  let totalCarrinho = 0;
+  let carrinho = null;
+  if (p.carrinho_id) {
+    carrinho = await obterCarrinhoPendentePorPedido(p.id);
+    if (carrinho) {
+      // Prévia com preço normal (sem cartão) — a forma de pagamento só é
+      // escolhida na retirada, em finalizarCarrinhoPendente().
+      const subtotalPreview = carrinho.itens.reduce((acc, i) => acc + i.preco_base * i.quantidade, 0);
+      totalCarrinho = Math.max(0, subtotalPreview - (carrinho.desconto || 0));
+    }
+  }
 
   const acoes = {
-    na_fila:     `<button class="btn btn--primary btn--sm" onclick="acaoFila('iniciar','${p.id}')">▶ Iniciar Impressão</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>`,
+    na_fila:     `<button class="btn btn--primary btn--sm" onclick="acaoFila('iniciar','${p.id}')">▶ Iniciar</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
+                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
 
-    imprimindo:  `<button class="btn btn--accent btn--sm" onclick="acaoFila('conferir','${p.id}')">📋 Concluiu? Conferir</button>
+    imprimindo:  `<button class="btn btn--accent btn--sm" onclick="acaoFila('conferir','${p.id}')">📋 Conferir</button>
                   <button class="btn btn--ghost btn--sm" onclick="acaoFila('erro','${p.id}')">⚠ Erro</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('pausar','${p.id}')">⏸ Pausar</button>`,
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('pausar','${p.id}')">⏸ Pausar</button>
+                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
 
-    conferencia: `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar Entrega</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reimprimir</button>`,
+    conferencia: `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Entregar</button>
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reimprimir</button>
+                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
 
     erro:        `<button class="btn btn--warning btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reprocessar</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕ Cancelar</button>`,
+                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕ Cancelar</button>
+                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
 
     concluido:   `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
   };
@@ -4641,20 +4883,196 @@ function renderPedidoCard(p) {
           Recebido: ${formatDateTime(p.created_at)}
           ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
         </div>
-        <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
+        ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
       </div>
       <div class="pedido-card-footer">
         ${acoes[p.status] || ''}
+        ${(p.status !== 'concluido' && p.status !== 'cancelado') ? `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${p.id}','${(p.cliente_nome_pdv||'').replace(/'/g,"\\'")}','${p.impressora_id||''}')">🛒 +</button>` : ''}
         <span class="pedido-card-valor">${formatMoney(p.total)}</span>
       </div>
       ${p.status === 'imprimindo' && p.folhas_usadas !== null ? `
       <div style="font-size:10px;color:var(--c-text-3)">
         ⏳ ${p.folhas_usadas || 0} / ${p.total_folhas_esperadas} folhas
-      </div>
-    ` : ''}
+      </div>` : ''}
     </div>
   `;
 }
+
+// ── Mini-carrinho dentro do card da fila ──────────────────
+// Permite, sem sair da tela de produção, vender um produto extra
+// ou adicionar mais uma impressão para o mesmo cliente do pedido.
+let _filaMiniCarrinho = [];
+
+window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraId) {
+  _filaMiniCarrinho = [];
+  if (!State.produtosPdv || State.produtosPdv.length === 0) await carregarProdutosPdv();
+  const produtos = State.produtosPdv || [];
+  const precos = State.precosCopia || [];
+
+  openModal(`🛒 Adicionar para ${clienteNome || 'este pedido'}`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="section-sub">Adicione produtos ou uma nova impressão para o mesmo cliente, sem sair da fila.</div>
+
+      <div class="divider-text">📦 Produtos</div>
+      <div class="search-bar">
+        <span class="search-bar-icon">🔍</span>
+        <input type="text" class="input" placeholder="Buscar produto..." oninput="filtrarFilaMiniProdutos(this.value)" />
+      </div>
+      <div id="fila-mini-produtos" style="max-height:160px;overflow-y:auto;border:1px solid var(--c-border);border-radius:var(--r-md)">
+        ${produtos.map(p => `
+          <div class="pdv-item" data-nome="${p.nome.toLowerCase()}" style="cursor:pointer;padding:var(--sp-2) var(--sp-3)" onclick="filaMiniAdicionarProduto('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.preco_venda||0})">
+            <div class="pdv-item-info">
+              <div class="pdv-item-name">${p.nome}</div>
+              <div class="pdv-item-sub">${formatMoney(p.preco_venda||0)}</div>
+            </div>
+          </div>
+        `).join('') || '<div class="empty-state" style="padding:var(--sp-4)"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+      </div>
+      <div id="fila-mini-carrinho-itens"></div>
+
+      <div class="divider-text">🖨️ Nova impressão (mesma impressora)</div>
+      <div class="form-row form-row--2">
+        <div class="field">
+          <label>Tipo de cópia</label>
+          <select class="input" id="fila-mini-tipo">
+            <option value="">— Nenhuma —</option>
+            ${precos.map(p => `<option value="${p.tipo}">${p.descricao} (${formatMoney(p.preco_unitario)})</option>`).join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label>Quantidade</label>
+          <input type="number" class="input" id="fila-mini-qtd" min="1" value="1" />
+        </div>
+      </div>
+
+      <div class="field" style="margin-bottom:0">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">💡 A forma de pagamento é escolhida na retirada (quando o carrinho inteiro é finalizado), não aqui.</div>
+      </div>
+
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="confirmarMiniCarrinhoFila('${pedidoId}','${(clienteNome||'').replace(/'/g,"\\'")}','${impressoraId||''}')">
+        ✅ Confirmar
+      </button>
+    </div>
+  `, 'modal--lg');
+};
+
+window.filtrarFilaMiniProdutos = function(q) {
+  document.querySelectorAll('#fila-mini-produtos .pdv-item').forEach(el => {
+    el.style.display = (el.dataset.nome||'').includes(q.toLowerCase()) ? '' : 'none';
+  });
+};
+
+window.filaMiniAdicionarProduto = function(id, nome, preco) {
+  const existing = _filaMiniCarrinho.find(i => i.produto_id === id);
+  if (existing) existing.quantidade++;
+  else _filaMiniCarrinho.push({ produto_id: id, nome, quantidade: 1, preco_unitario: preco });
+  renderFilaMiniCarrinhoItens();
+};
+
+function renderFilaMiniCarrinhoItens() {
+  const el = document.getElementById('fila-mini-carrinho-itens');
+  if (!el) return;
+  if (_filaMiniCarrinho.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = _filaMiniCarrinho.map((i, idx) => `
+    <div class="pdv-item" style="padding:var(--sp-2) 0">
+      <div class="pdv-item-info">
+        <div class="pdv-item-name">${i.nome}</div>
+        <div class="pdv-item-sub">${i.quantidade} × ${formatMoney(i.preco_unitario)}</div>
+      </div>
+      <div class="pdv-item-price">${formatMoney(i.quantidade * i.preco_unitario)}</div>
+      <button class="pdv-remove-btn" onclick="_filaMiniCarrinho.splice(${idx},1);renderFilaMiniCarrinhoItens()">✕</button>
+    </div>
+  `).join('');
+}
+
+window.confirmarMiniCarrinhoFila = async function(pedidoIdOrigem, clienteNome, impressoraId) {
+  const tipoNovo   = document.getElementById('fila-mini-tipo')?.value || '';
+  const qtdNovo    = parseInt(document.getElementById('fila-mini-qtd')?.value) || 1;
+
+  if (_filaMiniCarrinho.length === 0 && !tipoNovo) {
+    toast('Adicione ao menos um produto ou uma impressão', 'warning');
+    return;
+  }
+
+  try {
+    // 1. Buscar o carrinho pendente associado ao pedido
+    const { data: pedido } = await sb
+      .from('pedidos_copia')
+      .select('carrinho_id')
+      .eq('id', pedidoIdOrigem)
+      .single();
+
+    if (!pedido?.carrinho_id) {
+      toast('Carrinho pendente não encontrado.', 'error');
+      return;
+    }
+
+    const { data: carrinho } = await sb
+      .from('carrinhos_pendentes')
+      .select('itens')
+      .eq('id', pedido.carrinho_id)
+      .single();
+
+    if (!carrinho) {
+      toast('Carrinho pendente não encontrado.', 'error');
+      return;
+    }
+
+    // 2. Produtos → só entram no espelho JSON do carrinho (cobrados na retirada)
+    const novosItensProduto = [];
+    for (const item of _filaMiniCarrinho) {
+      const produto = State.produtosPdv?.find(p => p.id === item.produto_id);
+      if (!produto) continue;
+      novosItensProduto.push({
+        id: uuid(),
+        tipo_item: 'produto',
+        produto_id: produto.id,
+        nome: produto.nome,
+        quantidade: item.quantidade,
+        preco_base: produto.preco_venda || 0,
+        preco_cartao: produto.preco_cartao || null,
+      });
+    }
+    if (novosItensProduto.length > 0) {
+      const itensAtualizados = [...(carrinho.itens || []), ...novosItensProduto];
+      await sb.from('carrinhos_pendentes').update({ itens: itensAtualizados }).eq('id', pedido.carrinho_id);
+    }
+
+    // 3. Nova cópia → precisa virar um pedido_copia de verdade, senão nunca
+    //    entra na fila de produção física.
+    if (tipoNovo) {
+      const preco = State.precosCopia.find(p => p.tipo === tipoNovo);
+      const precoBase = preco ? preco.preco_unitario : 0;
+      const precoCartao = preco?.preco_cartao || null;
+      const totalFolhas = calcularFolhas(qtdNovo, false);
+      const { error } = await sb.from('pedidos_copia').insert({
+        impressora_id:   impressoraId || null,
+        tipo:            tipoNovo,
+        quantidade:      qtdNovo,
+        frente_verso:    false,
+        preco_unitario:  Math.round(precoBase),
+        preco_base:      precoBase,
+        preco_cartao:    precoCartao,
+        desconto:        0,
+        total:           Math.round(precoBase * qtdNovo),
+        status:          'na_fila',
+        forma_pagamento: null, // definido na finalização do carrinho, na retirada
+        cliente_nome_pdv: clienteNome || null,
+        paginas_por_documento: 1,
+        total_folhas:    totalFolhas,
+        carrinho_id:     pedido.carrinho_id,
+      });
+      if (error) throw error;
+    }
+
+    toast('✅ Itens adicionados ao carrinho!', 'success');
+    _filaMiniCarrinho = [];
+  } catch (err) {
+    toast('Erro ao adicionar: ' + err.message, 'error');
+  }
+  closeModal();
+  await refreshFila();
+};
 
 // ── Calcula folhas esperadas ──────────────────────────────
 function calcularFolhas(quantidade, frenteVerso) {
@@ -4861,7 +5279,7 @@ window.abrirModalConferencia = async function(pedidoId) {
       </div>
 
       <button class="btn btn--success btn--lg" style="width:100%;justify-content:center"
-              onclick="confirmarConferencia('${pedidoId}', ${p.quantidade}, ${folhasEsperadas}, '${p.impressora_id}', ${p.tipo.startsWith('colorida')||p.tipo.startsWith('foto')||p.tipo==='a3_colorida'?'true':'false'})">
+              onclick="confirmarConferencia('${pedidoId}', ${p.quantidade}, ${folhasEsperadas}, '${p.impressora_id}', ${p.tipo.startsWith('colorida')||p.tipo.startsWith('foto')||p.tipo==='a3_colorida'?'true':'false'}, '${p.carrinho_id||''}')">
         ✅ Confirmar e Finalizar Pedido
       </button>
     </div>
@@ -4876,7 +5294,7 @@ window.calcularFolhasConferencia = function(frenteVerso) {
 };
 
 // ── Confirmar conferência e finalizar pedido ──────────────
-window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEsperadas, impressoraId, isColor) {
+window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEsperadas, impressoraId, isColor, carrinhoId) {
   const resultado    = document.querySelector('input[name="conf-resultado"]:checked')?.value || 'ok';
   const qtdReal      = parseInt(document.getElementById('conf-qtd-real')?.value || qtdOriginal);
   const folhasReal   = parseInt(document.getElementById('conf-folhas-real')?.value || folhasEsperadas);
@@ -4910,6 +5328,8 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
         cliente_nome_pdv: pedidoOriginal.cliente_nome_pdv,
         observacoes:      `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
         forma_pagamento:  pedidoOriginal.forma_pagamento,
+        // Sem carrinho_id de propósito: é uma reimpressão grátis, não entra
+        // na cobrança do carrinho pendente nem bloqueia a finalização dele.
       });
     }
   }
@@ -4936,9 +5356,24 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     observacoes:   obs ? `[Conferência] ${obs}` : null,
   }).eq('id', pedidoId);
 
-  toast('🎉 Pedido entregue e finalizado! Estoque de folhas atualizado.', 'success', 4000);
   closeModal();
   await refreshFila();
+
+  // Se este pedido faz parte de um carrinho pendente, checa se TODAS as
+  // cópias daquele carrinho já estão prontas (concluído/cancelado). Só aí
+  // faz sentido cobrar — enquanto houver cópia pendente, o cliente ainda
+  // não pode levar o pedido completo.
+  if (carrinhoId) {
+    const { data: irmaos } = await sb.from('pedidos_copia').select('status').eq('carrinho_id', carrinhoId);
+    const todosProntos = (irmaos || []).every(x => x.status === 'concluido' || x.status === 'cancelado');
+    if (todosProntos) {
+      toast('🎉 Pedido pronto! Abrindo carrinho para pagamento...', 'success', 3000);
+      setTimeout(() => verCarrinhoPendente(pedidoId), 400);
+      return;
+    }
+  }
+
+  toast('🎉 Pedido entregue e finalizado! Estoque de folhas atualizado.', 'success', 4000);
 };
 
 // ── Filtro de status ──────────────────────────────────────
@@ -4962,18 +5397,41 @@ async function renderAssinatura(el) {
 }
 
 window.navigate = navigate;
+
+// Estado local da tabela de usuários (busca + paginação)
+const _usuariosState = { termo: '', pagina: 1, porPagina: 8, todos: [] };
+
 async function renderUsuarios(el) {
+  el.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
+
   // Carrega lista via RPC (função segura)
   const { data: usuarios, error } = await sb.rpc('get_usuarios');
   if (error) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-sub">Erro ao carregar usuários: ${error.message}</div></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-sub">${mensagemErroAmigavel(error, 'carregar usuários')}</div></div>`;
     return;
   }
 
   const isAdminMaster = State.userProfile?.role === 'adminMaster';
-  const usuariosExibidos = isAdminMaster 
-    ? usuarios 
+  _usuariosState.todos = isAdminMaster
+    ? (usuarios || [])
     : (usuarios || []).filter(u => u.role !== 'adminMaster');
+
+  _renderTabelaUsuarios(el);
+}
+
+function _renderTabelaUsuarios(el) {
+  const { termo, pagina, porPagina, todos } = _usuariosState;
+
+  const filtrados = termo
+    ? todos.filter(u =>
+        (u.nome || '').toLowerCase().includes(termo) ||
+        (u.email || '').toLowerCase().includes(termo))
+    : todos;
+
+  const totalPaginas = Math.max(1, Math.ceil(filtrados.length / porPagina));
+  const paginaAtual = Math.min(pagina, totalPaginas);
+  const inicio = (paginaAtual - 1) * porPagina;
+  const pagina_atual_itens = filtrados.slice(inicio, inicio + porPagina);
 
   el.innerHTML = `
     <div class="section-header">
@@ -4985,13 +5443,17 @@ async function renderUsuarios(el) {
     </div>
 
     <div class="card">
+      <div style="padding:var(--sp-4);border-bottom:1px solid var(--c-border)">
+        <input type="text" class="input" id="usuarios-busca" placeholder="🔎 Buscar por nome ou e-mail..."
+          value="${termo}" oninput="filtrarUsuarios(this.value)" style="max-width:320px" />
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Status</th><th>Criado em</th><th>Ações</th></tr>
           </thead>
           <tbody>
-            ${(usuariosExibidos||[]).map(u => `
+            ${pagina_atual_itens.map(u => `
               <tr>
                 <td><strong>${u.nome || '—'}</strong></td>
                 <td>${u.email || '—'}</td>
@@ -5005,7 +5467,7 @@ async function renderUsuarios(el) {
                 <td>
                   <div style="display:flex;gap:4px;flex-wrap:wrap">
                     <button class="btn btn--ghost btn--sm" onclick="editarUsuario('${u.id}')" title="Editar">✏️</button>
-                    ${u.ativo 
+                    ${u.ativo
                       ? `<button class="btn btn--ghost btn--sm" onclick="bloquearUsuario('${u.id}')" title="Bloquear">🔒</button>`
                       : `<button class="btn btn--ghost btn--sm" onclick="desbloquearUsuario('${u.id}')" title="Desbloquear">🔓</button>`
                     }
@@ -5013,13 +5475,35 @@ async function renderUsuarios(el) {
                   </div>
                 </td>
               </tr>
-            `).join('') || '<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum usuário cadastrado</div></div></td></tr>'}
+            `).join('') || `<tr><td colspan="6"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">${termo ? 'Nenhum usuário encontrado para "' + termo + '"' : 'Nenhum usuário cadastrado'}</div></div></td></tr>`}
           </tbody>
         </table>
       </div>
+      ${filtrados.length > porPagina ? `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:var(--sp-3) var(--sp-4);border-top:1px solid var(--c-border)">
+        <span style="font-size:var(--t-xs);color:var(--c-text-3)">Página ${paginaAtual} de ${totalPaginas} (${filtrados.length} usuário${filtrados.length !== 1 ? 's' : ''})</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn--ghost btn--sm" ${paginaAtual <= 1 ? 'disabled' : ''} onclick="mudarPaginaUsuarios(${paginaAtual - 1})">← Anterior</button>
+          <button class="btn btn--ghost btn--sm" ${paginaAtual >= totalPaginas ? 'disabled' : ''} onclick="mudarPaginaUsuarios(${paginaAtual + 1})">Próxima →</button>
+        </div>
+      </div>` : ''}
     </div>
   `;
 }
+
+window.filtrarUsuarios = debounce((valor) => {
+  _usuariosState.termo = (valor || '').trim().toLowerCase();
+  _usuariosState.pagina = 1;
+  _renderTabelaUsuarios(document.getElementById('page-content'));
+  // Mantém o foco no campo de busca após o re-render
+  const input = document.getElementById('usuarios-busca');
+  if (input) { input.focus(); input.selectionStart = input.selectionEnd = input.value.length; }
+}, 250);
+
+window.mudarPaginaUsuarios = function(novaPagina) {
+  _usuariosState.pagina = novaPagina;
+  _renderTabelaUsuarios(document.getElementById('page-content'));
+};
 
 window.abrirModalUsuario = function(usuarioId) {
   const isEdit = !!usuarioId;
@@ -5091,7 +5575,8 @@ window.salvarUsuario = async function(id) {
   if (id) {
     // Editar perfil existente
     const { error } = await sb.from('profiles').update({ nome, role, ativo }).eq('id', id);
-    if (error) { toast('Erro: ' + error.message, 'error'); return; }
+    if (error) { toast(mensagemErroAmigavel(error, 'editar usuário'), 'error'); return; }
+    await registrarLog('editar', 'usuario', id, { nome, role, ativo });
     toast('Usuário atualizado!', 'success');
     closeModal();
     navigate('usuarios');
@@ -5104,24 +5589,29 @@ window.salvarUsuario = async function(id) {
   if (!email) { toast('E-mail é obrigatório', 'warning'); return; }
   if (!password || password.length < 6) { toast('Senha deve ter pelo menos 6 caracteres', 'warning'); return; }
 
-  // Criar no Auth (usando signUp com autoConfirm)
-  const { data: authData, error: authError } = await sb.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-    user_metadata: { nome },
+  // A criação de usuário precisa de privilégio de service_role, que não pode
+  // ficar no navegador — por isso chamamos uma Edge Function que roda no servidor.
+  const { data: sessionData } = await sb.auth.getSession();
+  const { data: resultado, error: fnError } = await sb.functions.invoke('criar-usuario', {
+    body: { nome, email, password, role },
+    headers: { Authorization: `Bearer ${sessionData?.session?.access_token}` },
   });
 
-  if (authError) {
-    toast('Erro ao criar usuário: ' + authError.message, 'error');
+  if (fnError || resultado?.error) {
+    // FunctionsHttpError não traz a mensagem real automaticamente — precisa ler o corpo da resposta.
+    let mensagemReal = resultado?.error || fnError?.message;
+    if (fnError?.context && typeof fnError.context.json === 'function') {
+      try {
+        const body = await fnError.context.json();
+        mensagemReal = body?.error || mensagemReal;
+      } catch (_) { /* corpo não era JSON, mantém a mensagem padrão */ }
+    }
+    console.error('[criar-usuario] erro real:', mensagemReal);
+    toast(mensagemErroAmigavel({ message: mensagemReal }, 'criar usuário'), 'error');
     return;
   }
 
-  // O perfil será criado automaticamente pela trigger, mas vamos atualizar role se necessário
-  if (authData.user) {
-    await sb.from('profiles').update({ role }).eq('id', authData.user.id);
-  }
-
+  await registrarLog('criar', 'usuario', resultado?.id, { nome, email, role });
   toast('Usuário criado com sucesso!', 'success');
   closeModal();
   navigate('usuarios');
@@ -5131,24 +5621,27 @@ window.salvarUsuario = salvarUsuario;
 window.bloquearUsuario = async function(id) {
   if (!confirm('Bloquear este usuário? Ele não poderá mais acessar o sistema.')) return;
   const { error } = await sb.from('profiles').update({ ativo: false }).eq('id', id);
-  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  if (error) { toast(mensagemErroAmigavel(error, 'bloquear usuário'), 'error'); return; }
+  await registrarLog('bloquear', 'usuario', id);
   toast('Usuário bloqueado!', 'success');
   navigate('usuarios');
 };
 
 window.desbloquearUsuario = async function(id) {
   const { error } = await sb.from('profiles').update({ ativo: true }).eq('id', id);
-  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+  if (error) { toast(mensagemErroAmigavel(error, 'desbloquear usuário'), 'error'); return; }
+  await registrarLog('desbloquear', 'usuario', id);
   toast('Usuário desbloqueado!', 'success');
   navigate('usuarios');
 };
 
 window.excluirUsuario = async function(id) {
-  if (!confirm('Excluir este usuário permanentemente? Esta ação não pode ser desfeita.')) return;
-  // Excluir perfil (o usuário ainda existirá no Auth, mas sem perfil)
-  const { error } = await sb.from('profiles').delete().eq('id', id);
-  if (error) { toast('Erro: ' + error.message, 'error'); return; }
-  // Opcional: desabilitar usuário no Auth (requer admin API)
+  if (!confirm('Excluir este usuário? Ele perderá o acesso ao sistema, mas o histórico de ações dele será preservado.')) return;
+  // Soft delete: marca como arquivado em vez de apagar de verdade.
+  // Preserva histórico (vendas, pedidos, logs) e permite auditoria futura.
+  const { error } = await sb.from('profiles').update({ arquivado_em: new Date().toISOString(), ativo: false }).eq('id', id);
+  if (error) { toast(mensagemErroAmigavel(error, 'excluir usuário'), 'error'); return; }
+  await registrarLog('excluir', 'usuario', id);
   toast('Usuário excluído!', 'success');
   navigate('usuarios');
 };

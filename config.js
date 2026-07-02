@@ -75,6 +75,17 @@ function uuid() {
     return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
   });
 }
+
+// Adicione ao final do arquivo, antes de exportar
+async function loadEmpresaConfig() {
+  try {
+    const { data } = await sb.from('empresa').select('config').single();
+    if (data?.config) {
+      State.empresa.config = data.config;
+    }
+  } catch (_) {}
+}
+window.loadEmpresaConfig = loadEmpresaConfig;
  
 window.SUPABASE_URL = SUPABASE_URL;
 window.SUPABASE_ANON_KEY = SUPABASE_ANON_KEY;

@@ -10,11 +10,20 @@
 
 /**
  * Busca a data atual do servidor via Edge Function.
- * Fallback em cascata: Edge Function → API pública → relógio local.
+ * Fallback em cascata: Edge Function → Supabase RPC → offset salvo (última hora confiável) → relógio local.
  * @param {string} supabaseUrl  — ex: 'https://xxxx.supabase.co'
  * @param {string} supabaseKey  — anon key
  * @returns {Promise<Date>}
  */
+const _OFFSET_KEY = 'pm_server_offset_ms';
+
+function _salvarOffset(dataServidor) {
+  try {
+    const offset = dataServidor.getTime() - Date.now();
+    localStorage.setItem(_OFFSET_KEY, String(offset));
+  } catch (_) { /* localStorage indisponível — ignora */ }
+}
+
 async function getServerDate(supabaseUrl, supabaseKey) {
   // Tentativa 1: Edge Function própria (mais confiável)
   try {
@@ -24,23 +33,13 @@ async function getServerDate(supabaseUrl, supabaseKey) {
     });
     if (res.ok) {
       const data = await res.json();
-      return new Date(data.iso);
+      const d = new Date(data.iso);
+      _salvarOffset(d);
+      return d;
     }
   } catch (_) { /* silencioso */ }
 
-  // Tentativa 2: API pública de tempo
-  try {
-    const res = await fetch(
-      'https://worldtimeapi.org/api/timezone/America/Asuncion',
-      { signal: AbortSignal.timeout(4000) }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      return new Date(data.datetime);
-    }
-  } catch (_) { /* silencioso */ }
-
-  // Tentativa 3: Supabase RPC (SELECT now()) sem Edge Function
+  // Tentativa 2: Supabase RPC (SELECT now()) sem Edge Function
   try {
     const res = await fetch(`${supabaseUrl}/rest/v1/rpc/get_server_time`, {
       method:  'POST',
@@ -54,11 +53,24 @@ async function getServerDate(supabaseUrl, supabaseKey) {
     });
     if (res.ok) {
       const data = await res.json();
-      return new Date(data);
+      const d = new Date(data);
+      _salvarOffset(d);
+      return d;
     }
   } catch (_) { /* silencioso */ }
 
-  // Fallback: relógio local (aviso no console)
+  // Tentativa 3: offset salvo da última vez que o servidor respondeu com sucesso.
+  // Mais confiável que o relógio local puro (que o usuário pode adiantar/atrasar
+  // manualmente pra burlar o bloqueio), embora ainda seja uma estimativa.
+  try {
+    const offsetSalvo = localStorage.getItem(_OFFSET_KEY);
+    if (offsetSalvo !== null) {
+      console.warn('[Assinatura] Rede indisponível. Usando última hora do servidor conhecida (offset salvo).');
+      return new Date(Date.now() + parseInt(offsetSalvo, 10));
+    }
+  } catch (_) { /* silencioso */ }
+
+  // Fallback final: relógio local (aviso no console)
   console.warn('[Assinatura] Não foi possível obter hora do servidor. Usando relógio local.');
   return new Date();
 }

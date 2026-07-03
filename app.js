@@ -121,6 +121,7 @@ const NAV = [
   { group: 'Gestão' },
   { id: 'caixa',        label: 'Caixa',         icon: '💰', page: renderCaixa, roles: ['admin', 'funcionario'] },
   { id: 'fiado',        label: 'Fiado',         icon: '📒', page: renderFiado, roles: ['admin', 'funcionario'] },
+  { id: 'relatorios',   label: 'Relatórios',    icon: '📊', page: renderRelatorios, roles: ['admin', 'funcionario'] },
   { id: 'estoque',      label: 'Estoque',       icon: '📦', page: renderEstoque, roles: ['admin', 'funcionario'] },
   { id: 'contas',       label: 'Contas',        icon: '📋', page: renderContas, roles: ['admin'] },
   { id: 'compras',      label: 'Compras',       icon: '🛒', page: renderCompras, roles: ['admin'] },
@@ -456,6 +457,38 @@ function updateActiveNav(pageId) {
 
 
 // ── WIDGET DE COTAÇÃO BRL ─────────────────────────────────
+// ── WIDGET DE STATUS DO CAIXA (sempre visível na topbar) ──
+async function renderCaixaStatusWidget() {
+  const actions = document.getElementById('topbar-actions');
+  if (!actions) return;
+  if (document.getElementById('caixa-status-widget')) return; // evita duplicar
+
+  const { data: sessaoAberta } = await sb
+    .from('caixa_sessoes')
+    .select('id, travado')
+    .is('fechado_em', null)
+    .maybeSingle();
+
+  const widget = document.createElement('div');
+  widget.id = 'caixa-status-widget';
+  widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
+
+  if (sessaoAberta) {
+    widget.innerHTML = `
+      <span style="width:8px;height:8px;border-radius:50%;background:${sessaoAberta.travado ? 'var(--c-warning)' : 'var(--c-success)'}"></span>
+      <span style="white-space:nowrap">${sessaoAberta.travado ? '🔒 Caixa Travado' : '🟢 Caixa Aberto'}</span>
+    `;
+    widget.onclick = () => navigate('caixa');
+  } else {
+    widget.innerHTML = `
+      <span style="width:8px;height:8px;border-radius:50%;background:var(--c-danger)"></span>
+      <span style="white-space:nowrap;color:var(--c-danger);font-weight:600">🔴 Caixa Fechado — Abrir</span>
+    `;
+    widget.onclick = () => navigate('caixa');
+  }
+  actions.prepend(widget);
+}
+
 function renderCotacaoWidget() {
   console.log('renderCotacaoWidget chamada');
   const actions = document.getElementById('topbar-actions');
@@ -525,8 +558,9 @@ async function navigate(pageId) {
   // Topbar title
   document.getElementById('page-title').textContent = item.label;
   document.getElementById('topbar-actions').innerHTML = '';
-  // Recria o widget
+  // Recria os widgets (cotação + status do caixa, sempre visíveis)
   renderCotacaoWidget();
+  renderCaixaStatusWidget();
   // Render
   const content = document.getElementById('page-content');
   content.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
@@ -549,18 +583,37 @@ async function navigate(pageId) {
   }
 }
 
-async function isCaixaTravado() {
+async function getStatusCaixa() {
   const { data, error } = await sb
     .from('caixa_sessoes')
-    .select('travado')
-    .eq('fechado_em', null)
-    .maybeSingle(); // ← use maybeSingle() para não gerar erro
+    .select('id, travado')
+    .is('fechado_em', null)
+    .maybeSingle();
 
   if (error) {
     console.error('Erro ao verificar caixa:', error);
-    return false;
+    return { aberto: false, travado: false };
   }
-  return data?.travado || false;
+  return { aberto: !!data, travado: data?.travado || false };
+}
+
+// Mantido por compatibilidade com o nome antigo, onde ainda for chamado.
+async function isCaixaTravado() {
+  const status = await getStatusCaixa();
+  return status.travado;
+}
+
+function alertarCaixaFechado() {
+  openModal('🔴 Caixa Fechado', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4);text-align:center;padding:var(--sp-2)">
+      <div style="font-size:2.5rem">🔒</div>
+      <div style="font-weight:700;font-size:var(--t-lg)">Abra o caixa antes de vender</div>
+      <div style="color:var(--c-text-3);font-size:var(--t-sm)">Nenhuma sessão de caixa está aberta hoje. Toda venda (cópia ou produto) precisa de um caixa aberto para ser registrada.</div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="closeModal(); navigate('caixa');">
+        💰 Ir para o Caixa
+      </button>
+    </div>
+  `);
 }
 
 // ── MODAL ─────────────────────────────────────────────────
@@ -593,6 +646,25 @@ async function getTotalRealizado(tabela, dataInicioISO) {
               + (quitados || []).reduce((a, b) => a + (b.total || 0), 0);
   const count = (normais || []).length + (quitados || []).length;
   return { total, count };
+}
+
+// ── Breakdown por forma de pagamento num período ──────────
+// Mesma regra do getTotalRealizado: fiado pendente não entra; fiado
+// quitado entra no dia da quitação, sob a forma de pagamento real
+// usada pra quitar (forma_pagamento_quitacao).
+async function getBreakdownPagamento(dataInicioISO) {
+  const grupos = {};
+  const soma = (fp, valor) => { grupos[fp] = (grupos[fp] || 0) + (valor || 0); };
+
+  for (const tabela of ['pedidos_copia', 'vendas']) {
+    const [{ data: normais }, { data: quitados }] = await Promise.all([
+      sb.from(tabela).select('total,forma_pagamento').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO),
+      sb.from(tabela).select('total,forma_pagamento_quitacao').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO),
+    ]);
+    (normais || []).forEach(r => soma(r.forma_pagamento || 'dinheiro', r.total));
+    (quitados || []).forEach(r => soma(r.forma_pagamento_quitacao || 'dinheiro', r.total));
+  }
+  return grupos;
 }
 
 async function renderDashboard(el) {
@@ -790,10 +862,22 @@ async function renderCopias(el) {
     PdvState.impressoraSelecionada = online?.id || null;
   }
 
+  const statusCaixa = await getStatusCaixa();
+
   el.innerHTML = `
   <div class="pdv-layout">
     <!-- ESQUERDA -->
     <div class="pdv-left">
+      ${!statusCaixa.aberto ? `
+        <div style="background:var(--c-danger-s,rgba(239,68,68,.12));border:1.5px solid var(--c-danger);border-radius:var(--r-md);padding:var(--sp-3) var(--sp-4);margin-bottom:var(--sp-3);display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);flex-wrap:wrap">
+          <span style="color:var(--c-danger);font-weight:600">🔒 Caixa fechado — abra o caixa antes de vender.</span>
+          <button class="btn btn--danger btn--sm" onclick="navigate('caixa')">Ir para o Caixa</button>
+        </div>
+      ` : statusCaixa.travado ? `
+        <div style="background:var(--c-warning-s,rgba(245,158,11,.12));border:1.5px solid var(--c-warning);border-radius:var(--r-md);padding:var(--sp-3) var(--sp-4);margin-bottom:var(--sp-3)">
+          <span style="color:var(--c-warning);font-weight:600">🔒 Caixa travado — peça a um administrador para liberar.</span>
+        </div>
+      ` : ''}
       <div class="chip-row" style="margin-bottom:var(--sp-3)">
         <span class="chip ${PdvState.aba==='copia'?'active':''}" onclick="pdvMudarAba('copia',this)">🖨️ Impressões</span>
         <span class="chip ${PdvState.aba==='produto'?'active':''}" onclick="pdvMudarAba('produto',this)">📦 Produtos</span>
@@ -1298,7 +1382,12 @@ window.calcularTroco = function() {
 //    PROVISÓRIOS (a forma de pagamento real só é escolhida na
 //    retirada, depois da conferência — ver finalizarCarrinhoPendente).
 window.finalizarVenda = async function() {
-  if (await isCaixaTravado()) {
+  const statusCaixa = await getStatusCaixa();
+  if (!statusCaixa.aberto) {
+    alertarCaixaFechado();
+    return;
+  }
+  if (statusCaixa.travado) {
     toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
     return;
   }
@@ -1478,38 +1567,94 @@ async function processarVendaProdutos(itensProduto, subtotal, desconto, pagament
 }
 
 async function carregarHistoricoVendas() {
-  const { data: vendas } = await sb.from('vendas')
-    .select('*, clientes(nome)')
-    .order('created_at', { ascending: false })
-    .limit(30);
+  const [{ data: vendas }, { data: copias }] = await Promise.all([
+    sb.from('vendas').select('*, clientes(nome)').order('created_at', { ascending: false }).limit(30),
+    sb.from('pedidos_copia').select('*').eq('status', 'concluido').order('created_at', { ascending: false }).limit(30),
+  ]);
 
   const container = document.getElementById('historico-vendas');
   if (!container) return;
 
-  if (!vendas || vendas.length === 0) {
+  const linhas = [
+    ...(vendas || []).map(v => ({
+      origem: 'venda', id: v.id, numero: v.numero_venda,
+      cliente: v.clientes?.nome || v.cliente_nome_pdv || 'Consumidor',
+      pagamento: v.forma_pagamento, fiadoQuitado: v.fiado_quitado,
+      total: v.total, status: v.status, created_at: v.created_at,
+    })),
+    ...(copias || []).map(p => ({
+      origem: 'copia', id: p.id, numero: p.numero_pedido,
+      cliente: p.cliente_nome_pdv || 'Consumidor',
+      pagamento: p.forma_pagamento, fiadoQuitado: p.fiado_quitado,
+      total: p.total, status: p.status, created_at: p.created_at,
+    })),
+  ]
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, 30);
+
+  if (linhas.length === 0) {
     container.innerHTML = `<div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma venda registrada</div></div>`;
     return;
   }
 
   container.innerHTML = `
     <table>
-      <thead><tr><th>#</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Origem</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
       <tbody>
-        ${vendas.map(v => `
+        ${linhas.map(v => `
           <tr>
-            <td class="td-mono">#${v.numero_venda ?? '—'}</td>
-            <td>${v.clientes?.nome || v.cliente_nome_pdv || 'Consumidor'}</td>
-            <td><span class="badge badge--primary">${labelPagamento(v.forma_pagamento)}</span></td>
+            <td class="td-mono">#${v.numero ?? '—'}</td>
+            <td>${v.origem === 'venda' ? '📦 Produto' : '🖨️ Cópia'}</td>
+            <td>${v.cliente}</td>
+            <td>
+              <span class="badge badge--primary">${v.pagamento ? labelPagamento(v.pagamento) : '—'}</span>
+              ${v.pagamento === 'fiado' ? (v.fiadoQuitado ? ' <span class="badge badge--success">Quitado</span>' : ' <span class="badge badge--danger">Pendente</span>') : ''}
+            </td>
             <td style="color:var(--c-success);font-weight:600">${formatMoney(v.total)}</td>
             <td>${badgeStatus(v.status)}</td>
             <td class="td-mono">${formatDateTime(v.created_at)}</td>
-            <td><button class="btn btn--ghost btn--sm" onclick="verVenda('${v.id}')">Ver</button></td>
+            <td><button class="btn btn--ghost btn--sm" onclick="${v.origem === 'venda' ? `verVenda('${v.id}')` : `verPedidoCopiaHistorico('${v.id}')`}">Ver</button></td>
           </tr>
         `).join('')}
       </tbody>
     </table>
   `;
 }
+
+window.verPedidoCopiaHistorico = async function(pedidoId) {
+  const { data: p } = await sb.from('pedidos_copia').select('*, impressoras(nome)').eq('id', pedidoId).single();
+  if (!p) { toast('Pedido não encontrado', 'error'); return; }
+
+  openModal(`Cópia #${p.numero_pedido ?? '—'}`, `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div style="display:flex;justify-content:space-between">
+        <div>
+          <div style="color:var(--c-text-3)">Cliente</div>
+          <div style="font-weight:700">${p.cliente_nome_pdv || 'Consumidor'}</div>
+        </div>
+        <div>
+          <div style="color:var(--c-text-3)">Data</div>
+          <div>${formatDateTime(p.created_at)}</div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between">
+        <div>
+          <div style="color:var(--c-text-3)">Pagamento</div>
+          <div>${p.forma_pagamento ? labelPagamento(p.forma_pagamento) : '—'} ${p.forma_pagamento==='fiado' ? (p.fiado_quitado ? '✅ Quitado' : '⚠️ Pendente') : ''}</div>
+        </div>
+        <div>
+          <div style="color:var(--c-text-3)">Total</div>
+          <div style="font-size:var(--t-xl);font-weight:700;color:var(--c-success)">${formatMoney(p.total)}</div>
+        </div>
+      </div>
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-3)">
+        <div>${labelTipoCopia(p.tipo)} — ${p.quantidade} cópias${p.frente_verso ? ' (frente e verso)' : ''}</div>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">Impressora: ${p.impressoras?.nome || '—'} · ${p.total_folhas || 0} folhas</div>
+        ${p.desconto > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-danger)">Desconto: ${formatMoney(p.desconto)}</div>` : ''}
+      </div>
+    </div>
+  `);
+};
 
 // ── ITENS VISÍVEIS POR PERFIL ────────────────────────────
 function getVisibleNavItems() {
@@ -1877,71 +2022,8 @@ window.confirmarLiberacao = async function(sessaoId) {
   navigate('caixa');
 };
 
-// ── FECHAR CAIXA ──────────────────────────────────────────
-window.fecharCaixa = async function(sessaoId) {
-  // Calcula saldo esperado
-  const { data: saldoEsperado } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
-
-  // Busca totais de vendas em dinheiro
-  const { data: viewData } = await sb.from('vw_caixa_sessao_atual').select('*').eq('id', sessaoId).single();
-  const totalCopias = viewData?.total_vendas_copias_dinheiro || 0;
-  const totalVendas = viewData?.total_vendas_produtos_dinheiro || 0;
-  const totalGeral = totalCopias + totalVendas;
-
-  openModal('🔒 Fechar Caixa', `
-    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
-      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
-        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3)">Conferência final</div>
-        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
-          <span>Saldo esperado (sistema)</span>
-          <span style="font-weight:700;color:var(--c-accent)">${formatMoney(saldoEsperado)}</span>
-        </div>
-        <div class="field">
-          <label>Valor real em dinheiro (conferido) *</label>
-          <input type="number" class="input" id="valor-conferido" value="${saldoEsperado}" step="0.01" min="0" />
-        </div>
-      </div>
-
-      <div class="field">
-        <label>Observações do fechamento</label>
-        <textarea class="input" id="obs-fechamento" rows="3" placeholder="Ocorrências, divergências..."></textarea>
-      </div>
-
-      <button class="btn btn--danger btn--lg" style="width:100%;justify-content:center" onclick="confirmarFechamento('${sessaoId}', ${saldoEsperado}, ${totalCopias}, ${totalVendas})">
-        ✅ Confirmar Fechamento
-      </button>
-    </div>
-  `);
-};
-
-window.confirmarFechamento = async function(sessaoId, saldoEsperado, totalCopias, totalVendas) {
-  const valorConferido = parseFloat(document.getElementById('valor-conferido').value) || 0;
-  const quebra = saldoEsperado - valorConferido;
-  const obs = document.getElementById('obs-fechamento').value || '';
-
-  const { error } = await sb.from('caixa_sessoes').update({
-    fechado_em: new Date().toISOString(),
-    total_copias: totalCopias,
-    total_vendas: totalVendas,
-    valor_esperado: saldoEsperado,
-    valor_conferido: valorConferido,
-    quebra: quebra,
-    observacoes: obs,
-    saldo_atual: saldoEsperado
-  }).eq('id', sessaoId);
-
-  if (error) { toast('Erro: ' + error.message, 'error'); return; }
-
-  if (quebra > 0) {
-    toast(`✅ Caixa fechado com sobra de ${formatMoney(quebra)}!`, 'success');
-  } else if (quebra < 0) {
-    toast(`⚠️ Caixa fechado com falta de ${formatMoney(Math.abs(quebra))}!`, 'error');
-  } else {
-    toast('✅ Caixa fechado com saldo exato!', 'success');
-  }
-  closeModal();
-  navigate('caixa');
-};
+// (fecharCaixa foi movido pra baixo — versão completa com conferência,
+// breakdown por forma de pagamento e movimentações do dia)
 
 // ── CONFIGURAÇÕES (limite de sangria) ────────────────────
 window.irConfiguracoes = async function() {
@@ -1979,57 +2061,359 @@ window.salvarLimiteSangria = async function() {
 };
 
 window.fecharCaixa = async function(sessaoId) {
-  // Calcula totais do dia (fiado pendente não entra — só conta quando quitado)
-  const hoje = new Date(); hoje.setHours(0,0,0,0);
-  const [{ total: totalCopias }, { total: totalVendas }] = await Promise.all([
-    getTotalRealizado('pedidos_copia', hoje.toISOString()),
-    getTotalRealizado('vendas', hoje.toISOString()),
+  const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
+  const inicioHojeISO = hoje.toISOString();
+
+  const [
+    { total: totalCopias },
+    { total: totalVendas },
+    { data: saldoEsperado },
+    { data: movimentos },
+    { data: sessao },
+    breakdown,
+  ] = await Promise.all([
+    getTotalRealizado('pedidos_copia', inicioHojeISO),
+    getTotalRealizado('vendas', inicioHojeISO),
+    sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId }),
+    sb.from('caixa_movimentos').select('*').eq('sessao_id', sessaoId),
+    sb.from('caixa_sessoes').select('*').eq('id', sessaoId).single(),
+    getBreakdownPagamento(inicioHojeISO),
   ]);
 
   const totalGeral = totalCopias + totalVendas;
+  const totalSuprimentos = (movimentos || []).filter(m => m.tipo === 'suprimento').reduce((a, b) => a + b.valor, 0);
+  const totalRetiradas   = (movimentos || []).filter(m => m.tipo === 'retirada').reduce((a, b) => a + b.valor, 0);
+  const totalDespesas    = (movimentos || []).filter(m => m.tipo === 'despesa').reduce((a, b) => a + b.valor, 0);
+  const totalSangrias    = (movimentos || []).filter(m => m.tipo === 'sangria').reduce((a, b) => a + b.valor, 0);
+  const valorAbertura    = sessao?.valor_abertura || 0;
 
-  openModal('Fechar Caixa', `
+  openModal('🔒 Fechar Caixa', `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+
       <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
-        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">Resumo do período</div>
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">💰 Entradas do dia (todas as formas)</div>
         <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
-          <span style="color:var(--c-text-3)">Total Cópias</span>
+          <span style="color:var(--c-text-3)">🖨️ Cópias / Impressões</span>
           <span style="font-weight:600;color:var(--c-primary)">${formatMoney(totalCopias)}</span>
         </div>
         <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
-          <span style="color:var(--c-text-3)">Total Vendas</span>
+          <span style="color:var(--c-text-3)">📦 Produtos</span>
           <span style="font-weight:600;color:var(--c-success)">${formatMoney(totalVendas)}</span>
         </div>
         <div class="divider"></div>
         <div style="display:flex;justify-content:space-between">
-          <span style="font-weight:700">Total Geral</span>
+          <span style="font-weight:700">Total do dia</span>
           <span style="font-size:var(--t-xl);font-weight:800;color:var(--c-accent)">${formatMoney(totalGeral)}</span>
         </div>
       </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">💳 Por forma de pagamento</div>
+        ${Object.keys(breakdown).length === 0 ? `<div style="color:var(--c-text-3);font-size:var(--t-xs)">Nenhuma venda hoje</div>` :
+          Object.entries(breakdown).map(([fp, valor]) => `
+            <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+              <span>${labelPagamento(fp)}</span>
+              <span style="font-weight:600">${formatMoney(valor)}</span>
+            </div>
+          `).join('')}
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">🏦 Movimentações do caixa</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">Abertura (fundo de caixa)</span>
+          <span style="font-weight:600">${formatMoney(valorAbertura)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">+ Suprimentos</span>
+          <span style="font-weight:600;color:var(--c-success)">${formatMoney(totalSuprimentos)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Retiradas</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalRetiradas)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Despesas</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalDespesas)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Sangrias</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalSangrias)}</span>
+        </div>
+      </div>
+
+      <div style="background:var(--c-bg);border:1.5px solid var(--c-primary);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3)">🔍 Conferência final (dinheiro físico)</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-3)">
+          <span>Saldo esperado em caixa</span>
+          <span style="font-weight:700;color:var(--c-accent)" id="valor-esperado-display">${formatMoney(saldoEsperado || 0)}</span>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label>Valor real contado na gaveta *</label>
+          <input type="number" class="input" id="valor-conferido" value="${saldoEsperado || 0}" step="0.01" min="0"
+                 oninput="atualizarQuebraPreview(${saldoEsperado || 0})" />
+        </div>
+        <div id="quebra-preview" style="margin-top:var(--sp-2);font-size:var(--t-sm);color:var(--c-text-3)"></div>
+      </div>
+
       <div class="field">
-        <label>Observações</label>
+        <label>Observações do fechamento</label>
         <textarea class="input" id="obs-fechamento" rows="3" placeholder="Ocorrências, divergências..."></textarea>
       </div>
+
       <button class="btn btn--danger btn--lg" style="width:100%;justify-content:center"
-        onclick="confirmarFecharCaixa('${sessaoId}',${totalCopias},${totalVendas})">
-        🔒 Confirmar Fechamento
+        onclick="confirmarFecharCaixa('${sessaoId}', ${totalCopias}, ${totalVendas}, ${saldoEsperado || 0})">
+        ✅ Confirmar Fechamento
       </button>
     </div>
   `);
 };
 
-window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas) {
-  const obs = document.getElementById('obs-fechamento')?.value||'';
+window.atualizarQuebraPreview = function(saldoEsperado) {
+  const conferido = parseFloat(document.getElementById('valor-conferido')?.value) || 0;
+  const quebra = conferido - saldoEsperado; // positivo = sobra, negativo = falta
+  const el = document.getElementById('quebra-preview');
+  if (!el) return;
+  if (quebra === 0) el.innerHTML = `<span style="color:var(--c-text-3)">✅ Bate certinho com o esperado</span>`;
+  else if (quebra > 0) el.innerHTML = `<span style="color:var(--c-success)">✅ Sobra de ${formatMoney(quebra)}</span>`;
+  else el.innerHTML = `<span style="color:var(--c-danger)">⚠️ Falta ${formatMoney(Math.abs(quebra))}</span>`;
+};
+
+window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas, saldoEsperado) {
+  const obs = document.getElementById('obs-fechamento')?.value || '';
+  const valorConferido = parseFloat(document.getElementById('valor-conferido')?.value) || 0;
+  const quebra = valorConferido - saldoEsperado; // positivo = sobra, negativo = falta
+
   const { error } = await sb.from('caixa_sessoes').update({
     fechado_em: new Date().toISOString(),
     total_copias: totalCopias,
     total_vendas: totalVendas,
+    valor_esperado: saldoEsperado,
+    valor_conferido: valorConferido,
+    quebra: quebra,
     observacoes: obs,
   }).eq('id', sessaoId);
-  if (error) { toast('Erro: '+error.message,'error'); return; }
-  toast('Caixa fechado!','success');
+
+  if (error) { toast('Erro: ' + error.message, 'error'); return; }
+
+  if (quebra > 0) toast(`✅ Caixa fechado com sobra de ${formatMoney(quebra)}!`, 'success');
+  else if (quebra < 0) toast(`⚠️ Caixa fechado com falta de ${formatMoney(Math.abs(quebra))}!`, 'error');
+  else toast('✅ Caixa fechado — bateu certinho!', 'success');
+
   closeModal();
   navigate('caixa');
+};
+
+// ============================================================
+// ── MÓDULO: RELATÓRIOS ────────────────────────────────────
+// ============================================================
+// Exportação em CSV (abre certinho no Excel/Sheets, separador ";" pra
+// não conflitar com vírgula decimal do pt-BR/es-PY).
+function exportarCSV(filename, headers, linhas) {
+  const escapar = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const csv = [headers.map(escapar).join(';'), ...linhas.map(l => l.map(escapar).join(';'))].join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+let _ultimoRelatorioVendas = [];
+let _ultimoRelatorioCaixas = [];
+
+async function renderRelatorios(el) {
+  const hoje = new Date().toISOString().split('T')[0];
+  const f = State.relatorioFiltro || { inicio: hoje, fim: hoje, tipo: 'todos', pagamento: 'todos' };
+  State.relatorioFiltro = f;
+
+  el.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">📊 Relatórios</div>
+        <div class="section-sub">Vendas, cópias e caixa — filtre e exporte em CSV</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:var(--sp-4)">
+      <div class="card-body" style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
+        <div class="field" style="margin-bottom:0"><label>De</label><input type="date" class="input" id="rel-data-inicio" value="${f.inicio}" /></div>
+        <div class="field" style="margin-bottom:0"><label>Até</label><input type="date" class="input" id="rel-data-fim" value="${f.fim}" /></div>
+        <div class="field" style="margin-bottom:0">
+          <label>Tipo</label>
+          <select class="input" id="rel-tipo">
+            <option value="todos" ${f.tipo==='todos'?'selected':''}>Todos</option>
+            <option value="copia" ${f.tipo==='copia'?'selected':''}>🖨️ Só Impressões</option>
+            <option value="produto" ${f.tipo==='produto'?'selected':''}>📦 Só Produtos</option>
+          </select>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label>Pagamento</label>
+          <select class="input" id="rel-pagamento">
+            <option value="todos" ${f.pagamento==='todos'?'selected':''}>Todos</option>
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `<option value="${p}" ${f.pagamento===p?'selected':''}>${labelPagamento(p)}</option>`).join('')}
+          </select>
+        </div>
+        <button class="btn btn--primary" onclick="aplicarFiltroRelatorio()">🔍 Filtrar</button>
+        <button class="btn btn--ghost" onclick="exportarRelatorioVendas()">⬇️ Exportar Vendas CSV</button>
+      </div>
+    </div>
+
+    <div id="relatorio-resumo"></div>
+    <div class="card" style="margin-bottom:var(--sp-4)">
+      <div class="card-header"><span class="card-title">Vendas no período</span></div>
+      <div class="table-wrap" id="relatorio-vendas-tabela"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Aberturas e Fechamentos de Caixa</span>
+        <button class="btn btn--ghost btn--sm" onclick="exportarRelatorioCaixas()">⬇️ Exportar CSV</button>
+      </div>
+      <div class="table-wrap" id="relatorio-caixas-tabela"></div>
+    </div>
+  `;
+
+  await aplicarFiltroRelatorio();
+}
+
+window.aplicarFiltroRelatorio = async function() {
+  const inicio = document.getElementById('rel-data-inicio')?.value || State.relatorioFiltro.inicio;
+  const fim    = document.getElementById('rel-data-fim')?.value    || State.relatorioFiltro.fim;
+  const tipo      = document.getElementById('rel-tipo')?.value      || 'todos';
+  const pagamento = document.getElementById('rel-pagamento')?.value || 'todos';
+  State.relatorioFiltro = { inicio, fim, tipo, pagamento };
+
+  const inicioISO = new Date(inicio + 'T00:00:00').toISOString();
+  const fimISO    = new Date(fim + 'T23:59:59').toISOString();
+
+  const [{ data: copias }, { data: vendas }, { data: sessoes }] = await Promise.all([
+    sb.from('pedidos_copia').select('*').eq('status', 'concluido').gte('created_at', inicioISO).lte('created_at', fimISO),
+    sb.from('vendas').select('*, clientes(nome)').eq('status', 'concluido').gte('created_at', inicioISO).lte('created_at', fimISO),
+    sb.from('caixa_sessoes').select('*, funcionarios(nome)').gte('aberto_em', inicioISO).lte('aberto_em', fimISO).order('aberto_em', { ascending: false }),
+  ]);
+
+  let linhas = [
+    ...(tipo !== 'produto' ? (copias || []).map(p => ({
+      origem: 'copia', numero: p.numero_pedido, cliente: p.cliente_nome_pdv || 'Consumidor',
+      descricao: `${labelTipoCopia(p.tipo)} × ${p.quantidade}`, pagamento: p.forma_pagamento,
+      fiadoQuitado: p.fiado_quitado, total: p.total || 0, data: p.created_at,
+    })) : []),
+    ...(tipo !== 'copia' ? (vendas || []).map(v => ({
+      origem: 'venda', numero: v.numero_venda, cliente: v.clientes?.nome || v.cliente_nome_pdv || 'Consumidor',
+      descricao: 'Venda de produto(s)', pagamento: v.forma_pagamento,
+      fiadoQuitado: v.fiado_quitado, total: v.total || 0, data: v.created_at,
+    })) : []),
+  ];
+
+  if (pagamento !== 'todos') linhas = linhas.filter(l => l.pagamento === pagamento);
+  linhas.sort((a, b) => new Date(b.data) - new Date(a.data));
+  _ultimoRelatorioVendas = linhas;
+  _ultimoRelatorioCaixas = sessoes || [];
+
+  // ── Resumo ──
+  const totalGeral = linhas.reduce((a, b) => a + b.total, 0);
+  const totalCopia = linhas.filter(l => l.origem === 'copia').reduce((a, b) => a + b.total, 0);
+  const totalVenda = linhas.filter(l => l.origem === 'venda').reduce((a, b) => a + b.total, 0);
+  const resumoEl = document.getElementById('relatorio-resumo');
+  if (resumoEl) {
+    resumoEl.innerHTML = `
+      <div class="stat-grid" style="margin-bottom:var(--sp-4)">
+        <div class="stat-card">
+          <div class="stat-card-label">Total no período</div>
+          <div class="stat-card-value" style="color:var(--c-accent)">${formatMoney(totalGeral)}</div>
+          <div class="stat-card-sub">${linhas.length} transações</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-label">🖨️ Cópias</div>
+          <div class="stat-card-value" style="color:var(--c-primary)">${formatMoney(totalCopia)}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-label">📦 Produtos</div>
+          <div class="stat-card-value" style="color:var(--c-success)">${formatMoney(totalVenda)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Tabela de vendas ──
+  const tabelaEl = document.getElementById('relatorio-vendas-tabela');
+  if (tabelaEl) {
+    tabelaEl.innerHTML = linhas.length === 0
+      ? `<div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma transação no período/filtro selecionado</div></div>`
+      : `
+      <table>
+        <thead><tr><th>#</th><th>Origem</th><th>Cliente</th><th>Descrição</th><th>Pagamento</th><th>Total</th><th>Data</th></tr></thead>
+        <tbody>
+          ${linhas.map(l => `
+            <tr>
+              <td class="td-mono">#${l.numero ?? '—'}</td>
+              <td>${l.origem === 'copia' ? '🖨️ Cópia' : '📦 Produto'}</td>
+              <td>${l.cliente}</td>
+              <td>${l.descricao}</td>
+              <td>
+                <span class="badge badge--primary">${l.pagamento ? labelPagamento(l.pagamento) : '—'}</span>
+                ${l.pagamento === 'fiado' ? (l.fiadoQuitado ? ' <span class="badge badge--success">Quitado</span>' : ' <span class="badge badge--danger">Pendente</span>') : ''}
+              </td>
+              <td style="color:var(--c-success);font-weight:600">${formatMoney(l.total)}</td>
+              <td class="td-mono">${formatDateTime(l.data)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  // ── Tabela de caixas ──
+  const caixasEl = document.getElementById('relatorio-caixas-tabela');
+  if (caixasEl) {
+    caixasEl.innerHTML = (sessoes || []).length === 0
+      ? `<div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa aberto no período</div></div>`
+      : `
+      <table>
+        <thead><tr><th>Operador</th><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
+        <tbody>
+          ${sessoes.map(s => `
+            <tr>
+              <td>${s.funcionarios?.nome || '—'}</td>
+              <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
+              <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
+              <td>${formatMoney(s.valor_abertura)}</td>
+              <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
+              <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
+              <td style="color:${(s.quebra||0)>0?'var(--c-success)':(s.quebra||0)<0?'var(--c-danger)':'var(--c-text-3)'}">${formatMoney(s.quebra||0)}</td>
+              <td>${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+};
+
+window.exportarRelatorioVendas = function() {
+  if (_ultimoRelatorioVendas.length === 0) { toast('Nada para exportar neste filtro', 'warning'); return; }
+  const linhas = _ultimoRelatorioVendas.map(l => [
+    l.numero ?? '', l.origem === 'copia' ? 'Cópia' : 'Produto', l.cliente, l.descricao,
+    l.pagamento ? labelPagamento(l.pagamento).replace(/[^\w\s()À-ú]/g, '').trim() : '',
+    l.pagamento === 'fiado' ? (l.fiadoQuitado ? 'Quitado' : 'Pendente') : '',
+    l.total, formatDateTime(l.data),
+  ]);
+  const f = State.relatorioFiltro;
+  exportarCSV(`vendas_${f.inicio}_a_${f.fim}.csv`,
+    ['#', 'Origem', 'Cliente', 'Descrição', 'Pagamento', 'Status Fiado', 'Total (₲)', 'Data'], linhas);
+};
+
+window.exportarRelatorioCaixas = function() {
+  if (_ultimoRelatorioCaixas.length === 0) { toast('Nada para exportar neste período', 'warning'); return; }
+  const linhas = _ultimoRelatorioCaixas.map(s => [
+    s.funcionarios?.nome || '', formatDateTime(s.aberto_em), s.fechado_em ? formatDateTime(s.fechado_em) : '',
+    s.valor_abertura, s.total_copias || 0, s.total_vendas || 0, s.valor_conferido ?? '', s.quebra ?? '', s.observacoes || '',
+  ]);
+  const f = State.relatorioFiltro;
+  exportarCSV(`caixas_${f.inicio}_a_${f.fim}.csv`,
+    ['Operador', 'Abertura', 'Fechamento', 'Fundo Abertura', 'Total Cópias', 'Total Vendas', 'Valor Conferido', 'Quebra', 'Observações'], linhas);
 };
 
 // ============================================================

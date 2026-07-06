@@ -583,6 +583,16 @@ async function navigate(pageId) {
   }
 }
 
+async function loadFolhasDisponiveis() {
+  const { data } = await sb
+    .from('produtos')
+    .select('id, nome, unidade, estoque_atual')
+    .eq('tipo', 'insumo')
+    .eq('usado_na_impressao', true)
+    .order('nome');
+  State.folhasDisponiveis = data || [];
+}
+
 async function getStatusCaixa() {
   const { data, error } = await sb
     .from('caixa_sessoes')
@@ -816,6 +826,7 @@ const PdvState = {
   tipoCopia: null,
   quantidade: 1,
   frenteVerso: false,
+  folhaSelecionada: null,
   paginasPorDocumento: 1,
   // passo do "mini-stepper" de impressão: 1 = tipo, 2 = quantidade
   // (o antigo passo 1 — escolher impressora — foi removido; a
@@ -850,6 +861,7 @@ async function renderCopias(el) {
   await loadImpressoras();
   await loadPrecosCopia();
   await carregarProdutosPdv();
+  await loadFolhasDisponiveis();
 
   if (!PdvState.impressoraSelecionada) {
     const online = State.impressoras.find(i => i.status === 'online') || State.impressoras[0];
@@ -1112,6 +1124,14 @@ window.adicionarAoCarrinho = function() {
   const paginasPorDoc = PdvState.paginasPorDocumento || 1;
   const totalPaginas = PdvState.quantidade * paginasPorDoc;
   const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
+  const folhaSelect = document.getElementById('select-folha');
+  const folhaId = folhaSelect?.value;
+  const folhaNome = folhaSelect?.options[folhaSelect.selectedIndex]?.dataset?.nome || null;
+
+  if (!folhaId) {
+    toast('Selecione o tipo de folha', 'warning');
+    return;
+  }
 
   PdvState.carrinho.push({
     id: uuid(),
@@ -1126,6 +1146,8 @@ window.adicionarAoCarrinho = function() {
     preco_cartao: cartao,
     paginas_por_documento: paginasPorDoc,
     total_folhas: folhas,
+    folha_id: folhaId,
+    folha_nome: folhaNome,
   });
 
   atualizarCarrinhoUI();
@@ -1135,6 +1157,7 @@ window.adicionarAoCarrinho = function() {
   PdvState.step = 1;
   PdvState.tipoCopia = null;
   PdvState.quantidade = 1;
+  PdvState.folhaSelecionada = null;
   renderAbaCopia_refresh();
   salvarEstadoPdv()
 };
@@ -1286,6 +1309,7 @@ function atualizarCarrinhoUI() {
           <div class="pdv-item-info">
             <div class="pdv-item-name">🖨️ ${item.tipo_label}</div>
             <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
+            <div class="pdv-item-sub">📄 Folha: ${item.folha_nome || '—'}</div>
             <div class="pdv-item-sub">${formatMoney(precoUnit)}/un</div>
           </div>
           <div class="pdv-item-price">${formatMoney(tot)}</div>
@@ -1456,6 +1480,8 @@ window.finalizarVenda = async function() {
         paginas_por_documento: item.paginas_por_documento || 1,
         total_folhas:    item.total_folhas,
         carrinho_id:     carrinho.id,
+        insumo_folha_id: item.folha_id || null,
+        insumo_folha_nome: item.folha_nome || null,
       });
       if (error) throw error;
     }
@@ -2587,6 +2613,7 @@ async function renderEstoque(el) {
       <button class="tab-btn active" data-tipo="todos" onclick="filtrarEstoquePorTipo('todos', this)">Todos</button>
       <button class="tab-btn" data-tipo="produto" onclick="filtrarEstoquePorTipo('produto', this)">Produtos</button>
       <button class="tab-btn" data-tipo="insumo" onclick="filtrarEstoquePorTipo('insumo', this)">Insumos</button>
+      <button class="tab-btn" data-tipo="folha" onclick="filtrarEstoquePorTipo('folha', this)">📄 Folhas</button>
     </div>
 
     <div class="card" style="margin-bottom:var(--sp-4); height: auto;">
@@ -2607,28 +2634,28 @@ async function renderEstoque(el) {
           </thead>
           <tbody>
             ${(produtos||[]).map(p => `
-              <tr data-tipo="${p.tipo || 'produto'}">
-                <td style="font-weight:500">${p.nome}</td>
-                <td><span class="badge badge--primary">${p.categoria}</span></td>
-                <td>
-                  <span style="font-family:var(--font-mono);font-weight:600;color:${p.estoque_atual <= p.estoque_minimo ? 'var(--c-danger)' : 'var(--c-success)'}">
-                    ${p.estoque_atual} ${p.unidade}
-                  </span>
-                  ${p.estoque_atual <= p.estoque_minimo ? '<span class="badge badge--danger" style="margin-left:4px">Crítico</span>' : ''}
-                </td>
-                <td class="td-mono">${p.estoque_minimo} ${p.unidade}</td>
-                <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_venda)}</td>
-                <td class="td-mono">${formatMoney(p.preco_custo)}</td>
-                <td style="color:var(--c-text-3)">${p.fornecedores?.nome||'—'}</td>
-                <td>
-                  <div style="display:flex;gap:4px">
-                    <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
-                    <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}')">±</button>
-                    <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}')" title="Gerenciar insumos">🧩</button>
-                  </div>
-                </td>
-              </tr>
-            `).join('') || '<tr><td colspan="8"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📦</div><div class="empty-state-sub">Nenhum produto cadastrado</div></div></td></tr>'}
+  <tr data-tipo="${p.tipo || 'produto'}" data-usado-impressao="${p.usado_na_impressao || false}">
+    <td style="font-weight:500">${p.nome}${p.tipo === 'insumo' && p.usado_na_impressao ? '<span class="badge badge--accent">📄 Folha</span>' : ''}</td>
+    <td><span class="badge badge--primary">${p.categoria}</span></td>
+    <td>
+      <span style="font-family:var(--font-mono);font-weight:600;color:${p.estoque_atual <= p.estoque_minimo ? 'var(--c-danger)' : 'var(--c-success)'}">
+        ${p.estoque_atual} ${p.unidade}
+      </span>
+      ${p.estoque_atual <= p.estoque_minimo ? '<span class="badge badge--danger" style="margin-left:4px">Crítico</span>' : ''}
+    </td>
+    <td class="td-mono">${p.estoque_minimo} ${p.unidade}</td>
+    <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_venda)}</td>
+    <td class="td-mono">${formatMoney(p.preco_custo)}</td>
+    <td style="color:var(--c-text-3)">${p.fornecedores?.nome||'—'}</td>
+    <td>
+      <div style="display:flex;gap:4px">
+        <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
+        <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}')">±</button>
+        <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}')" title="Gerenciar insumos">🧩</button>
+      </div>
+    </td>
+  </tr>
+`).join('') || '<tr><td colspan="8"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📦</div><div class="empty-state-sub">Nenhum produto cadastrado</div></div></td></tr>'}
           </tbody>
         </table>
       </div>
@@ -2637,20 +2664,24 @@ async function renderEstoque(el) {
 
   // Adiciona a função de filtro por tipo
   window.filtrarEstoquePorTipo = function(tipo, btn) {
-    // Atualiza classe ativa das abas
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
+  // Atualiza classe ativa das abas
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
 
-    // Filtra as linhas da tabela
-    document.querySelectorAll('#tabela-produtos tbody tr').forEach(tr => {
-      if (tipo === 'todos') {
-        tr.style.display = '';
-      } else {
-        const tipoProduto = tr.dataset.tipo || 'produto';
-        tr.style.display = tipoProduto === tipo ? '' : 'none';
-      }
-    });
-  };
+  // Filtra as linhas da tabela
+  document.querySelectorAll('#tabela-produtos tbody tr').forEach(tr => {
+    if (tipo === 'todos') {
+      tr.style.display = '';
+    } else if (tipo === 'folha') {
+      const tipoProduto = tr.dataset.tipo || 'produto';
+      const usadoNaImpressao = tr.dataset.usadoImpressao === 'true';
+      tr.style.display = (tipoProduto === 'insumo' && usadoNaImpressao) ? '' : 'none';
+    } else {
+      const tipoProduto = tr.dataset.tipo || 'produto';
+      tr.style.display = tipoProduto === tipo ? '' : 'none';
+    }
+  });
+};
 
   // Inicializa com a aba 'Todos' ativa (já está ativa por padrão)
 }
@@ -2773,6 +2804,12 @@ window.filtrarEtiquetasLista = function(q) {
   });
 };
 
+window.toggleCampoImpressao = function() {
+  const tipo = document.getElementById('prod-tipo').value;
+  const campo = document.getElementById('campo-usado-impressao');
+  if (campo) campo.style.display = tipo === 'insumo' ? '' : 'none';
+};
+
 window.gerarFolhaEtiquetas = function() {
   if (typeof JsBarcode === 'undefined') {
     toast('Biblioteca de código de barras não carregou. Verifique sua conexão.', 'error');
@@ -2861,10 +2898,16 @@ window.abrirModalProduto = async function(produtoId) {
       </div>
       <div class="field">
         <label>Tipo</label>
-        <select class="input" id="prod-tipo">
+        <select class="input" id="prod-tipo" onchange="toggleCampoImpressao()">
           <option value="produto" ${(!p.tipo || p.tipo==='produto')?'selected':''}>Produto (venda)</option>
           <option value="insumo" ${p.tipo==='insumo'?'selected':''}>Insumo (consumo)</option>
         </select>
+        <div class="field" id="campo-usado-impressao" style="${p.tipo === 'insumo' ? '' : 'display:none'}">
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-border);border-radius:var(--r-md);background:var(--c-bg)">
+            <input type="checkbox" id="prod-usado-impressao" ${p.usado_na_impressao ? 'checked' : ''}>
+            <span>Este insumo pode ser usado como <strong>folha</strong> nas impressões (ex: papel A4, ofício, adesivo)</span>
+          </label>
+        </div>
       </div>
       <div class="form-row form-row--3">
         <div class="field"><label>Categoria</label>
@@ -3020,6 +3063,7 @@ window.gerenciarInsumosCopia = async function(tipoCopia, descricao) {
   const { data: insumos } = await sb.from('produtos')
     .select('id, nome, unidade, estoque_atual')
     .eq('tipo', 'insumo')
+    .eq('usado_na_impressao', false)
     .order('nome');
 
   openModal(`Insumos de "${descricao}"`, `
@@ -3113,7 +3157,8 @@ window.salvarProduto = async function(id) {
     estoque_atual: parseFloat(document.getElementById('prod-estoque').value)||0,
     estoque_minimo: parseFloat(document.getElementById('prod-estoque-min').value)||0,
     descricao: document.getElementById('prod-desc').value||null,
-    tipo: document.getElementById('prod-tipo').value
+    tipo: document.getElementById('prod-tipo').value,
+    usado_na_impressao: document.getElementById('prod-usado-impressao')?.checked || false,
   };
   if (!payload.nome) { toast('Nome obrigatório','warning'); return; }
   const { error } = id
@@ -3860,6 +3905,17 @@ function renderStepQuantidade() {
               <button class="qty-btn" onclick="ajustarQtd(1)">+</button>
               <button class="qty-btn" onclick="ajustarQtd(10)">+10</button>
             </div>
+            <div class="field">
+          <label>📄 Tipo de Folha *</label>
+          <select class="input" id="select-folha" onchange="selecionarFolha(this.value)">
+            <option value="">— Selecione uma folha —</option>
+            ${(State.folhasDisponiveis || []).map(f => `
+              <option value="${f.id}" data-nome="${f.nome}" ${PdvState.folhaSelecionada === f.id ? 'selected' : ''}>
+                ${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})
+              </option>
+            `).join('')}
+          </select>
+        </div>
           </div>
           <div class="field">
             <label>Frente e Verso?</label>
@@ -3961,6 +4017,11 @@ async function renderImpressoras(el) {
     </div>
   `;
 }
+
+window.selecionarFolha = function(folhaId) {
+  PdvState.folhaSelecionada = folhaId;
+  salvarEstadoPdv();
+};
 
 window.abrirModalImpressora = function(imp={}) {
   openModal(imp.id?'Editar Impressora':'Nova Impressora',`
@@ -5792,6 +5853,22 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     return;
   }
 
+  // Consumo da folha específica
+  if (pedidoAtual.insumo_folha_id) {
+    const { data: folhaProd } = await sb
+      .from('produtos')
+      .select('estoque_atual')
+      .eq('id', pedidoAtual.insumo_folha_id)
+      .single();
+
+    if (folhaProd) {
+      const novoEstoque = Math.max(0, folhaProd.estoque_atual - folhasReal);
+      await sb.from('produtos')
+        .update({ estoque_atual: novoEstoque })
+        .eq('id', pedidoAtual.insumo_folha_id);
+    }
+  }
+
   if (resultado === 'parcial' && qtdReimp > 0) {
     // Cria um novo pedido de reimpressão para as páginas ruins
     const { data: pedidoOriginal } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
@@ -5831,6 +5908,20 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   // Consumo de insumos vinculados a este tipo de cópia (papel, toner, etc.),
   // proporcional às folhas REALMENTE usadas (não a quantidade solicitada).
   const { data: pedidoAtual } = await sb.from('pedidos_copia').select('tipo').eq('id', pedidoId).single();
+  if (pedidoAtual?.insumo_folha_id) {
+    const { data: folhaProd } = await sb
+      .from('produtos')
+      .select('estoque_atual')
+      .eq('id', pedidoAtual.insumo_folha_id)
+      .single();
+
+    if (folhaProd) {
+      const novoEstoque = Math.max(0, folhaProd.estoque_atual - folhasReal);
+      await sb.from('produtos')
+        .update({ estoque_atual: novoEstoque })
+        .eq('id', pedidoAtual.insumo_folha_id);
+    }
+  }
   if (pedidoAtual?.tipo) {
     const { data: vinculosInsumo } = await sb.from('copia_insumos')
       .select('*, insumos:insumo_id(id, nome, estoque_atual)')

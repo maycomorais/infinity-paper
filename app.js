@@ -1078,8 +1078,9 @@ function getPrecoCopiaAtual() {
 // quando ele existir; caso contrário cai no preço normal.
 function precoComPagamento(base, precoCartao, pagamento) {
   const ehCartao = pagamento === 'cartao_debito' || pagamento === 'cartao_credito';
+  const valorBase = parseFloat(base) || 0;
   if (ehCartao && precoCartao != null && precoCartao > 0) return precoCartao;
-  return base;
+  return valorBase;
 }
 
 function atualizarPreviewPdv() {
@@ -1479,7 +1480,7 @@ window.finalizarVenda = async function() {
         cliente_nome_pdv: clienteNomePDV,
         paginas_por_documento: item.paginas_por_documento || 1,
         total_folhas:    item.total_folhas,
-        carrinho_id:     carrinho.id,
+        carrinho_id: carrinho.id,
         insumo_folha_id: item.folha_id || null,
         insumo_folha_nome: item.folha_nome || null,
       });
@@ -1496,6 +1497,11 @@ window.finalizarVenda = async function() {
   } catch (err) {
     toast('Erro ao enviar: ' + err.message, 'error');
     if (btn) { btn.disabled = false; }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '📋 Enviar para Fila';
+    }
   }
 };
 
@@ -5066,7 +5072,7 @@ window.salvarConfigPassagens = async function(id) {
 // ============================================================
 
 // Intervalo de auto-refresh da fila (ms)
-const FILA_REFRESH_MS = 8000;
+const FILA_REFRESH_MS = 60000;
 let _filaRefreshTimer = null;
 
 async function renderFilaProducao(el) {
@@ -5325,27 +5331,20 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
     const subtotalProduto = itensProduto.reduce(
       (a, i) => a + precoComPagamento(i.preco_base, i.preco_cartao, pagamentoDb) * i.quantidade, 0);
     const subtotalGeral = subtotalCopia + subtotalProduto;
-
     const descontoTotal   = Math.min(carrinho.desconto || 0, subtotalGeral);
-    const descontoCopia   = subtotalGeral > 0 ? Math.round(descontoTotal * (subtotalCopia / subtotalGeral)) : 0;
-    const descontoProduto = descontoTotal - descontoCopia;
 
-    // ── Atualiza os pedidos de cópia com o preço/forma de pagamento definitivos ──
+    let descontoPorPedido = []; // array para armazenar descontos de cada pedido
+    let descontoProduto   = 0;
+
     if (pedidosCopia && pedidosCopia.length > 0) {
       const pesos = pedidosCopia.map(p => precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb) * p.quantidade);
-      const descontoPorPedido = distribuirValor(descontoCopia, pesos);
-      for (let idx = 0; idx < pedidosCopia.length; idx++) {
-        const p = pedidosCopia[idx];
-        const precoUnit = precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb);
-        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx];
-        const { error } = await sb.from('pedidos_copia').update({
-          preco_unitario:  Math.round(precoUnit),
-          desconto:        descontoPorPedido[idx],
-          total:           totalItem,
-          forma_pagamento: pagamentoDb,
-        }).eq('id', p.id);
-        if (error) throw error;
-      }
+      descontoPorPedido = distribuirValor(descontoTotal, pesos); // distribui o desconto total entre as cópias
+      // O desconto para produtos é o restante (se houver sobra por arredondamento)
+      const somaDescontoCopias = descontoPorPedido.reduce((a, b) => a + b, 0);
+      descontoProduto = descontoTotal - somaDescontoCopias;
+    } else {
+      // Se não houver cópias, todo o desconto vai para produtos
+      descontoProduto = descontoTotal;
     }
 
     // ── Registra a venda dos produtos, se houver ──
@@ -5835,14 +5834,25 @@ window.calcularFolhasConferencia = function(frenteVerso) {
 
 // ── Confirmar conferência e finalizar pedido ──────────────
 window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEsperadas, impressoraId, isColor, carrinhoId) {
-  const resultado    = document.querySelector('input[name="conf-resultado"]:checked')?.value || 'ok';
-  const qtdReal      = parseInt(document.getElementById('conf-qtd-real')?.value || qtdOriginal);
-  const folhasReal   = parseInt(document.getElementById('conf-folhas-real')?.value || folhasEsperadas);
-  const qtdReimp     = parseInt(document.getElementById('conf-qtd-reimp')?.value || 0);
-  const obs          = document.getElementById('conf-obs')?.value || null;
+  // 🔍 Busca o pedido atual
+  const { data: pedidoAtual, error: errPed } = await sb
+    .from('pedidos_copia')
+    .select('tipo, insumo_folha_id')
+    .eq('id', pedidoId)
+    .single();
+
+  if (errPed) {
+    toast('Erro ao buscar pedido: ' + errPed.message, 'error');
+    return;
+  }
+
+  const resultado = document.querySelector('input[name="conf-resultado"]:checked')?.value || 'ok';
+  const qtdReal = parseInt(document.getElementById('conf-qtd-real')?.value || qtdOriginal);
+  const folhasReal = parseInt(document.getElementById('conf-folhas-real')?.value || folhasEsperadas);
+  const qtdReimp = parseInt(document.getElementById('conf-qtd-reimp')?.value || 0);
+  const obs = document.getElementById('conf-obs')?.value || null;
 
   if (resultado === 'refazer') {
-    // Volta tudo para a fila
     await sb.from('pedidos_copia').update({
       status: 'na_fila',
       observacoes: `[REIMPRESSÃO TOTAL] ${obs || ''}`.trim(),
@@ -5853,7 +5863,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     return;
   }
 
-  // Consumo da folha específica
+  // Consumo da folha específica (se houver)
   if (pedidoAtual.insumo_folha_id) {
     const { data: folhaProd } = await sb
       .from('produtos')
@@ -5870,59 +5880,42 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   }
 
   if (resultado === 'parcial' && qtdReimp > 0) {
-    // Cria um novo pedido de reimpressão para as páginas ruins
+    // Cria novo pedido de reimpressão
     const { data: pedidoOriginal } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
     if (pedidoOriginal) {
       await sb.from('pedidos_copia').insert({
-        impressora_id:    pedidoOriginal.impressora_id,
-        tipo:             pedidoOriginal.tipo,
-        quantidade:       qtdReimp,
-        frente_verso:     pedidoOriginal.frente_verso,
-        preco_unitario:   0,          // reimpressão sem custo extra
-        total:            0,
-        status:           'na_fila',
+        impressora_id: pedidoOriginal.impressora_id,
+        tipo: pedidoOriginal.tipo,
+        quantidade: qtdReimp,
+        frente_verso: pedidoOriginal.frente_verso,
+        preco_unitario: 0,
+        total: 0,
+        status: 'na_fila',
         cliente_nome_pdv: pedidoOriginal.cliente_nome_pdv,
-        observacoes:      `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
-        forma_pagamento:  pedidoOriginal.forma_pagamento,
-        // Sem carrinho_id de propósito: é uma reimpressão grátis, não entra
-        // na cobrança do carrinho pendente nem bloqueia a finalização dele.
+        observacoes: `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
+        forma_pagamento: pedidoOriginal.forma_pagamento,
+        // sem carrinho_id para reimpressão gratuita
       });
     }
   }
 
-  // ★ FINALIZAÇÃO: aqui sim atualiza contadores e conclui
-  const campo      = isColor ? 'contador_cor_sessao' : 'contador_pb_sesssao';
-  const campoTotal = isColor ? 'contador_cor_total'  : 'contador_pb_total';
-  const imp        = State.impressoras.find(i => i.id === impressoraId);
+  // ★ Atualiza contadores da impressora
+  const campo = isColor ? 'contador_cor_sessao' : 'contador_pb_sesssao';
+  const campoTotal = isColor ? 'contador_cor_total' : 'contador_pb_total';
+  const imp = State.impressoras.find(i => i.id === impressoraId);
 
   if (imp) {
     await sb.from('impressoras').update({
-      [campo]:      (imp[campo]      || 0) + folhasReal,
+      [campo]: (imp[campo] || 0) + folhasReal,
       [campoTotal]: (imp[campoTotal] || 0) + folhasReal,
     }).eq('id', impressoraId);
-    // Atualiza state local também
-    if (imp[campo]      !== undefined) imp[campo]      += folhasReal;
+    // atualiza state local
+    if (imp[campo] !== undefined) imp[campo] += folhasReal;
     if (imp[campoTotal] !== undefined) imp[campoTotal] += folhasReal;
   }
 
-  // Consumo de insumos vinculados a este tipo de cópia (papel, toner, etc.),
-  // proporcional às folhas REALMENTE usadas (não a quantidade solicitada).
-  const { data: pedidoAtual } = await sb.from('pedidos_copia').select('tipo').eq('id', pedidoId).single();
-  if (pedidoAtual?.insumo_folha_id) {
-    const { data: folhaProd } = await sb
-      .from('produtos')
-      .select('estoque_atual')
-      .eq('id', pedidoAtual.insumo_folha_id)
-      .single();
-
-    if (folhaProd) {
-      const novoEstoque = Math.max(0, folhaProd.estoque_atual - folhasReal);
-      await sb.from('produtos')
-        .update({ estoque_atual: novoEstoque })
-        .eq('id', pedidoAtual.insumo_folha_id);
-    }
-  }
-  if (pedidoAtual?.tipo) {
+  // Consumo de insumos vinculados ao tipo de cópia
+  if (pedidoAtual.tipo) {
     const { data: vinculosInsumo } = await sb.from('copia_insumos')
       .select('*, insumos:insumo_id(id, nome, estoque_atual)')
       .eq('tipo_copia', pedidoAtual.tipo);
@@ -5938,18 +5931,15 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
 
   // Marca pedido como concluído
   await sb.from('pedidos_copia').update({
-    status:        'concluido',
-    concluido_at:  new Date().toISOString(),
-    observacoes:   obs ? `[Conferência] ${obs}` : null,
+    status: 'concluido',
+    concluido_at: new Date().toISOString(),
+    observacoes: obs ? `[Conferência] ${obs}` : null,
   }).eq('id', pedidoId);
 
   closeModal();
   await refreshFila();
 
-  // Se este pedido faz parte de um carrinho pendente, checa se TODAS as
-  // cópias daquele carrinho já estão prontas (concluído/cancelado). Só aí
-  // faz sentido cobrar — enquanto houver cópia pendente, o cliente ainda
-  // não pode levar o pedido completo.
+  // Verifica se todos os pedidos do carrinho estão prontos
   if (carrinhoId) {
     const { data: irmaos } = await sb.from('pedidos_copia').select('status').eq('carrinho_id', carrinhoId);
     const todosProntos = (irmaos || []).every(x => x.status === 'concluido' || x.status === 'cancelado');
@@ -6232,4 +6222,3 @@ window.excluirUsuario = async function(id) {
   toast('Usuário excluído!', 'success');
   navigate('usuarios');
 };
-

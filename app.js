@@ -587,8 +587,7 @@ async function loadFolhasDisponiveis() {
   const { data } = await sb
     .from('produtos')
     .select('id, nome, unidade, estoque_atual')
-    .eq('tipo', 'insumo')
-    .eq('usado_na_impressao', true)
+    .eq('usado_na_impressao', true)  // apenas o flag
     .order('nome');
   State.folhasDisponiveis = data || [];
 }
@@ -1200,6 +1199,7 @@ function renderAbaProduto() {
           ${p.preco_cartao ? `<div style="font-size:10px;color:var(--c-text-3)">💳 ${formatMoney(p.preco_cartao)}</div>` : ''}
           <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
         </div>
+        <div style="font-weight:600;font-size:var(--t-sm)">${p.nome} ${p.usado_na_impressao ? '<span class="badge badge--accent" style="font-size:8px;padding:1px 6px">📄</span>' : ''}</div>
       `).join('') || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
     </div>
   `;
@@ -2641,7 +2641,7 @@ async function renderEstoque(el) {
           <tbody>
             ${(produtos||[]).map(p => `
   <tr data-tipo="${p.tipo || 'produto'}" data-usado-impressao="${p.usado_na_impressao || false}">
-    <td style="font-weight:500">${p.nome}${p.tipo === 'insumo' && p.usado_na_impressao ? '<span class="badge badge--accent">📄 Folha</span>' : ''}</td>
+    <td style="font-weight:500">${p.nome}${p.usado_na_impressao ? '<span class="badge badge--accent">📄 Folha</span>' : ''}</td>
     <td><span class="badge badge--primary">${p.categoria}</span></td>
     <td>
       <span style="font-family:var(--font-mono);font-weight:600;color:${p.estoque_atual <= p.estoque_minimo ? 'var(--c-danger)' : 'var(--c-success)'}">
@@ -2679,9 +2679,8 @@ async function renderEstoque(el) {
     if (tipo === 'todos') {
       tr.style.display = '';
     } else if (tipo === 'folha') {
-      const tipoProduto = tr.dataset.tipo || 'produto';
       const usadoNaImpressao = tr.dataset.usadoImpressao === 'true';
-      tr.style.display = (tipoProduto === 'insumo' && usadoNaImpressao) ? '' : 'none';
+      tr.style.display = usadoNaImpressao ? '' : 'none';
     } else {
       const tipoProduto = tr.dataset.tipo || 'produto';
       tr.style.display = tipoProduto === tipo ? '' : 'none';
@@ -2811,9 +2810,9 @@ window.filtrarEtiquetasLista = function(q) {
 };
 
 window.toggleCampoImpressao = function() {
-  const tipo = document.getElementById('prod-tipo').value;
-  const campo = document.getElementById('campo-usado-impressao');
-  if (campo) campo.style.display = tipo === 'insumo' ? '' : 'none';
+  // const tipo = document.getElementById('prod-tipo').value;
+  // const campo = document.getElementById('campo-usado-impressao');
+  // if (campo) campo.style.display = tipo === 'insumo' ? '' : 'none';
 };
 
 window.gerarFolhaEtiquetas = function() {
@@ -2908,7 +2907,7 @@ window.abrirModalProduto = async function(produtoId) {
           <option value="produto" ${(!p.tipo || p.tipo==='produto')?'selected':''}>Produto (venda)</option>
           <option value="insumo" ${p.tipo==='insumo'?'selected':''}>Insumo (consumo)</option>
         </select>
-        <div class="field" id="campo-usado-impressao" style="${p.tipo === 'insumo' ? '' : 'display:none'}">
+        <div class="field" id="campo-usado-impressao" style="display:block"}">
           <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-border);border-radius:var(--r-md);background:var(--c-bg)">
             <input type="checkbox" id="prod-usado-impressao" ${p.usado_na_impressao ? 'checked' : ''}>
             <span>Este insumo pode ser usado como <strong>folha</strong> nas impressões (ex: papel A4, ofício, adesivo)</span>

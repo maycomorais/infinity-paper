@@ -216,12 +216,10 @@ async function initApp() {
     State.userProfile = { id: State.user.id, role: 'funcionario', nome: 'Operador', ativo: true };
   }
 
-  
-
   if (State.userProfile) {
     console.log('🎯 Perfil OK, role:', State.userProfile.role);
-  window.perfilUsuario = State.userProfile.role;
-  window._operadorNome = State.user.email; // para registrar quem confirma pagamento
+    window.perfilUsuario = State.userProfile.role;
+    window._operadorNome = State.user.email; // para registrar quem confirma pagamento
 
   // Inicializa a UI de assinatura (não bloqueia o fluxo)
   window.SubscriptionUI.inicializar({
@@ -249,9 +247,10 @@ async function initApp() {
 
   // Widget de cotação BRL na topbar
   renderCotacaoWidget();
-
   const lastPage = localStorage.getItem(STORAGE_KEY) || 'dashboard';
   navigate(lastPage);
+  
+  renderCaixaStatusWidget();
   
   // Sidebar collapse
   const collapseBtn = document.getElementById('sidebar-collapse-btn');
@@ -460,33 +459,46 @@ function updateActiveNav(pageId) {
 // ── WIDGET DE STATUS DO CAIXA (sempre visível na topbar) ──
 async function renderCaixaStatusWidget() {
   const actions = document.getElementById('topbar-actions');
-  if (!actions) return;
-  if (document.getElementById('caixa-status-widget')) return; // evita duplicar
-
-  const { data: sessaoAberta } = await sb
-    .from('caixa_sessoes')
-    .select('id, travado')
-    .is('fechado_em', null)
-    .maybeSingle();
-
-  const widget = document.createElement('div');
-  widget.id = 'caixa-status-widget';
-  widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
-
-  if (sessaoAberta) {
-    widget.innerHTML = `
-      <span style="width:8px;height:8px;border-radius:50%;background:${sessaoAberta.travado ? 'var(--c-warning)' : 'var(--c-success)'}"></span>
-      <span style="white-space:nowrap">${sessaoAberta.travado ? '🔒 Caixa Travado' : '🟢 Caixa Aberto'}</span>
-    `;
-    widget.onclick = () => navigate('caixa');
-  } else {
-    widget.innerHTML = `
-      <span style="width:8px;height:8px;border-radius:50%;background:var(--c-danger)"></span>
-      <span style="white-space:nowrap;color:var(--c-danger);font-weight:600">🔴 Caixa Fechado — Abrir</span>
-    `;
-    widget.onclick = () => navigate('caixa');
+  if (!actions) {
+    console.warn('[CaixaStatus] topbar-actions não encontrado');
+    return;
   }
-  actions.prepend(widget);
+
+  const oldWidget = document.getElementById('caixa-status-widget');
+  if (oldWidget) oldWidget.remove();
+
+  try {
+    const status = await getStatusCaixa();
+
+    const widget = document.createElement('div');
+    widget.id = 'caixa-status-widget';
+    widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
+
+    if (status.aberto) {
+      const cor = status.travado ? 'var(--c-warning)' : 'var(--c-success)';
+      const texto = status.travado ? '🔒 Caixa Travado' : '🟢 Caixa Aberto';
+      widget.innerHTML = `
+        <span style="width:8px;height:8px;border-radius:50%;background:${cor};display:inline-block;"></span>
+        <span style="white-space:nowrap">${texto}</span>
+      `;
+      widget.onclick = () => navigate('caixa');
+    } else {
+      widget.innerHTML = `
+        <span style="width:8px;height:8px;border-radius:50%;background:var(--c-danger);display:inline-block;"></span>
+        <span style="white-space:nowrap;color:var(--c-danger);font-weight:600">🔴 Caixa Fechado — Abrir</span>
+      `;
+      widget.onclick = () => navigate('caixa');
+    }
+
+    actions.prepend(widget);
+  } catch (error) {
+    console.error('[CaixaStatus] Erro ao renderizar widget:', error);
+    const widget = document.createElement('div');
+    widget.id = 'caixa-status-widget';
+    widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
+    widget.innerHTML = `<span>⚠️ Status do caixa indisponível</span>`;
+    actions.prepend(widget);
+  }
 }
 
 function renderCotacaoWidget() {
@@ -593,17 +605,27 @@ async function loadFolhasDisponiveis() {
 }
 
 async function getStatusCaixa() {
-  const { data, error } = await sb
-    .from('caixa_sessoes')
-    .select('id, travado')
-    .is('fechado_em', null)
-    .maybeSingle();
+  try {
+    // Busca a sessão aberta mais recente (ordena por data de abertura desc)
+    const { data, error } = await sb
+      .from('caixa_sessoes')
+      .select('id, travado')
+      .is('fechado_em', null)
+      .order('aberto_em', { ascending: false })
+      .limit(1);
 
-  if (error) {
-    console.error('Erro ao verificar caixa:', error);
+    if (error) {
+      console.error('[getStatusCaixa] Erro na consulta:', error);
+      return { aberto: false, travado: false };
+    }
+
+    // Se houver dados, pega o primeiro (mais recente)
+    const sessao = data && data.length > 0 ? data[0] : null;
+    return { aberto: !!sessao, travado: sessao?.travado || false };
+  } catch (e) {
+    console.error('[getStatusCaixa] Exceção:', e);
     return { aberto: false, travado: false };
   }
-  return { aberto: !!data, travado: data?.travado || false };
 }
 
 // Mantido por compatibilidade com o nome antigo, onde ainda for chamado.
@@ -1970,6 +1992,7 @@ window.confirmarAbrirCaixa = async function() {
   if (error) { toast('Erro: '+error.message, 'error'); return; }
   toast('Caixa aberto com sucesso!', 'success');
   closeModal();
+  renderCaixaStatusWidget();
   navigate('caixa');
 };
 
@@ -2324,6 +2347,7 @@ window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas,
   else toast('✅ Caixa fechado — bateu certinho!', 'success');
 
   closeModal();
+  renderCaixaStatusWidget();
   navigate('caixa');
 };
 

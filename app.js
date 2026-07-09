@@ -251,7 +251,7 @@ async function initApp() {
   navigate(lastPage);
   
   renderCaixaStatusWidget();
-  
+
   // Sidebar collapse
   const collapseBtn = document.getElementById('sidebar-collapse-btn');
 if (collapseBtn) {
@@ -457,13 +457,24 @@ function updateActiveNav(pageId) {
 
 // ── WIDGET DE COTAÇÃO BRL ─────────────────────────────────
 // ── WIDGET DE STATUS DO CAIXA (sempre visível na topbar) ──
+let _renderingWidget = false; // flag para evitar duplicação
+
 async function renderCaixaStatusWidget() {
+  // Evita execução concorrente
+  if (_renderingWidget) {
+    console.log('[CaixaStatus] Já está renderizando, ignorando chamada.');
+    return;
+  }
+  _renderingWidget = true;
+
   const actions = document.getElementById('topbar-actions');
   if (!actions) {
     console.warn('[CaixaStatus] topbar-actions não encontrado');
+    _renderingWidget = false;
     return;
   }
 
+  // Remove qualquer widget existente de forma segura
   const oldWidget = document.getElementById('caixa-status-widget');
   if (oldWidget) oldWidget.remove();
 
@@ -493,11 +504,14 @@ async function renderCaixaStatusWidget() {
     actions.prepend(widget);
   } catch (error) {
     console.error('[CaixaStatus] Erro ao renderizar widget:', error);
+    // Fallback: widget de erro
     const widget = document.createElement('div');
     widget.id = 'caixa-status-widget';
     widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
     widget.innerHTML = `<span>⚠️ Status do caixa indisponível</span>`;
     actions.prepend(widget);
+  } finally {
+    _renderingWidget = false;
   }
 }
 
@@ -606,10 +620,10 @@ async function loadFolhasDisponiveis() {
 
 async function getStatusCaixa() {
   try {
-    // Busca a sessão aberta mais recente (ordena por data de abertura desc)
+    // Busca a sessão mais recente que esteja aberta (fechado_em IS NULL)
     const { data, error } = await sb
       .from('caixa_sessoes')
-      .select('id, travado')
+      .select('id, travado, aberto_em')
       .is('fechado_em', null)
       .order('aberto_em', { ascending: false })
       .limit(1);
@@ -619,9 +633,18 @@ async function getStatusCaixa() {
       return { aberto: false, travado: false };
     }
 
-    // Se houver dados, pega o primeiro (mais recente)
-    const sessao = data && data.length > 0 ? data[0] : null;
-    return { aberto: !!sessao, travado: sessao?.travado || false };
+    // Se data for um array, pega o primeiro (ou null)
+    const sessao = Array.isArray(data) ? data[0] : data;
+
+    // Se encontrou mais de uma (o limit(1) já garante 1, mas só por segurança)
+    if (Array.isArray(data) && data.length > 1) {
+      console.warn('[getStatusCaixa] Atenção: múltiplas sessões abertas encontradas. Usando a mais recente.');
+    }
+
+    return {
+      aberto: !!sessao,
+      travado: sessao?.travado || false,
+    };
   } catch (e) {
     console.error('[getStatusCaixa] Exceção:', e);
     return { aberto: false, travado: false };
@@ -1992,8 +2015,8 @@ window.confirmarAbrirCaixa = async function() {
   if (error) { toast('Erro: '+error.message, 'error'); return; }
   toast('Caixa aberto com sucesso!', 'success');
   closeModal();
-  renderCaixaStatusWidget();
   navigate('caixa');
+  renderCaixaStatusWidget();
 };
 
 // ── MODAL SUPRIMENTO ──────────────────────────────────────
@@ -2126,6 +2149,7 @@ window.registrarMovimento = async function(sessaoId, tipo) {
   toast('Movimento registrado!', 'success');
   closeModal();
   navigate('caixa');
+  renderCaixaStatusWidget()
 };
 
 // ── LIBERAR CAIXA (SENHA ADMIN) ─────────────────────────
@@ -2166,6 +2190,7 @@ window.confirmarLiberacao = async function(sessaoId) {
   toast('Caixa liberado!', 'success');
   closeModal();
   navigate('caixa');
+  renderCaixaStatusWidget()
 };
 
 // (fecharCaixa foi movido pra baixo — versão completa com conferência,
@@ -2313,6 +2338,7 @@ window.fecharCaixa = async function(sessaoId) {
       </button>
     </div>
   `);
+  renderCaixaStatusWidget()
 };
 
 window.atualizarQuebraPreview = function(saldoEsperado) {

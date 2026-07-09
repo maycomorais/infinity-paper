@@ -683,7 +683,6 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
   gap: var(--sp-4);
   padding: var(--sp-4);
   overflow: hidden;
-  /* REMOVA height:100% daqui, o flex já controla */
 }
 
 .pdv-left {
@@ -694,28 +693,6 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
-}
-
-.pdv-right {
-  width: 360px;
-  flex-shrink: 0;
-  background: var(--c-card);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-lg);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.pdv-panel-header {
-  padding: var(--sp-4) var(--sp-5);
-  border-bottom: 1px solid var(--c-border);
-}
-
-.pdv-panel-items {
-  flex: 1;                   /* ocupa todo o espaço disponível */
-  overflow-y: auto;          /* scroll apenas nos itens */
-  padding: var(--sp-3);
 }
 
 .pdv-item {
@@ -729,7 +706,13 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
 .pdv-item:hover { background: var(--c-bg); }
 .pdv-item-info { flex: 1; min-width: 0; }
 .pdv-item-name { font-size: var(--t-sm); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pdv-item-sub { font-size: var(--t-xs); color: var(--c-text-3); }
+.pdv-item-sub {
+    font-size: var(--t-xs);
+    color: var(--c-text-3);
+    display: flex;
+    justify-content: space-around;
+    align-items: center;
+}
 .pdv-item-price { font-family: var(--font-mono); font-size: var(--t-sm); font-weight: 600; color: var(--c-accent); white-space: nowrap; }
 .pdv-remove-btn {
   background: transparent;
@@ -743,6 +726,32 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
 }
 .pdv-remove-btn:hover { color: var(--c-danger); }
 
+.pdv-right {
+  width: 360px;
+  flex-shrink: 0;
+  background: var(--c-card);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: auto;          /* sem scroll no container principal */
+  height: 100%;              /* ← força a ocupar a altura total do pai */
+  min-height: 0;             /* ← evita que o flex ignore a altura */
+}
+
+.pdv-panel-header {
+  flex-shrink: 0;
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.pdv-panel-items {
+  flex: 1 1 0;               /* ← força a ocupar o espaço disponível */
+  overflow-y: auto;
+  padding: var(--sp-3);
+  min-height:100px;             /* ← essencial para o overflow funcionar */
+}
+
 .pdv-panel-footer {
   flex-shrink: 0;            /* não encolhe */
   padding: var(--sp-4) var(--sp-5);
@@ -750,6 +759,8 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
+  /* se quiser uma altura mínima para garantir espaço */
+  min-height: 240px;         /* ajuste conforme necessário (ou remova) */
 }
 
 .pdv-total-row {

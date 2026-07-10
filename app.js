@@ -252,6 +252,9 @@ async function initApp() {
   
   renderCaixaStatusWidget();
 
+  // Alerta de contas próximas do vencimento (não bloqueia o carregamento)
+  verificarContasProximasVencimento();
+
   // Sidebar collapse
   const collapseBtn = document.getElementById('sidebar-collapse-btn');
 if (collapseBtn) {
@@ -457,29 +460,36 @@ function updateActiveNav(pageId) {
 
 // ── WIDGET DE COTAÇÃO BRL ─────────────────────────────────
 // ── WIDGET DE STATUS DO CAIXA (sempre visível na topbar) ──
-let _renderingWidget = false; // flag para evitar duplicação
+// Antes havia um mutex booleano (`_renderingWidget`) que simplesmente
+// ABORTAVA chamadas concorrentes em vez de enfileirá-las. Como várias
+// partes do app chamam renderCaixaStatusWidget() sem `await`
+// (fecharCaixa, registrarMovimento, navigate()...), era comum a segunda
+// chamada ser descartada silenciosamente e o widget ficar mostrando o
+// status antigo ("Caixa Aberto") até a próxima navegação manual.
+//
+// Agora usamos um "request token": cada chamada gera um número; só a
+// resposta da chamada MAIS RECENTE tem permissão de atualizar o DOM.
+// Chamadas concorrentes não são mais descartadas, e uma resposta lenta
+// e desatualizada nunca sobrescreve uma mais nova.
+let _widgetRequestId = 0;
 
 async function renderCaixaStatusWidget() {
-  // Evita execução concorrente
-  if (_renderingWidget) {
-    console.log('[CaixaStatus] Já está renderizando, ignorando chamada.');
-    return;
-  }
-  _renderingWidget = true;
+  const meuId = ++_widgetRequestId;
 
   const actions = document.getElementById('topbar-actions');
   if (!actions) {
     console.warn('[CaixaStatus] topbar-actions não encontrado');
-    _renderingWidget = false;
     return;
   }
 
-  // Remove qualquer widget existente de forma segura
-  const oldWidget = document.getElementById('caixa-status-widget');
-  if (oldWidget) oldWidget.remove();
-
   try {
     const status = await getStatusCaixa();
+
+    // Chegou uma resposta mais nova enquanto esperávamos essa — descarta.
+    if (meuId !== _widgetRequestId) return;
+
+    const oldWidget = document.getElementById('caixa-status-widget');
+    if (oldWidget) oldWidget.remove();
 
     const widget = document.createElement('div');
     widget.id = 'caixa-status-widget';
@@ -503,15 +513,15 @@ async function renderCaixaStatusWidget() {
 
     actions.prepend(widget);
   } catch (error) {
+    if (meuId !== _widgetRequestId) return;
     console.error('[CaixaStatus] Erro ao renderizar widget:', error);
-    // Fallback: widget de erro
+    const oldWidget = document.getElementById('caixa-status-widget');
+    if (oldWidget) oldWidget.remove();
     const widget = document.createElement('div');
     widget.id = 'caixa-status-widget';
     widget.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--c-card);border:1px solid var(--c-border);border-radius:var(--r-md);padding:6px 12px;font-size:var(--t-xs);cursor:pointer';
     widget.innerHTML = `<span>⚠️ Status do caixa indisponível</span>`;
     actions.prepend(widget);
-  } finally {
-    _renderingWidget = false;
   }
 }
 
@@ -878,7 +888,7 @@ const PdvState = {
   step: 1,
   // carrinho único
   carrinho: [],
-  pagamento: 'dinheiro',
+  pagamento: null, // nenhuma forma pré-selecionada — usuário precisa escolher
   desconto: 0,
   clienteId: null,
 };
@@ -893,7 +903,7 @@ async function renderCopias(el) {
     PdvState.step = 1;
     PdvState.carrinho = [];
     PdvState.desconto = 0;
-    PdvState.pagamento = 'dinheiro';
+    PdvState.pagamento = null; // nenhuma forma pré-selecionada — usuário precisa escolher
     PdvState.impressoraSelecionada = null;
     PdvState.tipoCopia = null;
     PdvState.quantidade = 1;
@@ -988,9 +998,12 @@ async function renderCopias(el) {
         </div>
         <div id="troco-row" style="display:none">...</div>
         <div id="pix-brl-row" style="display:none">...</div>
-        <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" id="btn-finalizar-venda" onclick="finalizarVenda()">
+        <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" id="btn-finalizar-venda" onclick="finalizarVenda()" ${(!PdvState.carrinho.some(i=>i.tipo_item==='copia') && !PdvState.pagamento) ? 'disabled' : ''}>
           <span id="btn-finalizar-label">📋 Enviar para Fila</span> — <span id="btn-total">${formatMoney(0)}</span>
         </button>
+        <div id="pdv-pagamento-aviso" style="display:${(!PdvState.carrinho.some(i=>i.tipo_item==='copia') && !PdvState.pagamento) ? 'block' : 'none'};font-size:var(--t-xs);color:var(--c-warning);text-align:center;margin-top:-4px">
+          ⚠ Selecione a forma de pagamento para continuar
+        </div>
         <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center" onclick="limparCarrinho()">
           🗑️ Limpar carrinho
         </button>
@@ -1332,6 +1345,16 @@ function atualizarCarrinhoUI() {
   const temCopia = PdvState.carrinho.some(i => i.tipo_item === 'copia');
   if (btnLabelEl) btnLabelEl.textContent = temCopia ? '📋 Enviar para Fila' : '✅ Finalizar Venda';
 
+  // A forma de pagamento só é obrigatória aqui quando a venda é finalizada
+  // na hora (carrinho só com produtos). Quando há impressão, o pedido vai
+  // para a fila e a forma de pagamento real só é escolhida na retirada
+  // (depois da conferência) — exigir aqui não faz sentido.
+  const btnFinalizarEl = document.getElementById('btn-finalizar-venda');
+  const avisoPagEl = document.getElementById('pdv-pagamento-aviso');
+  const faltaPagamento = !temCopia && !PdvState.pagamento;
+  if (btnFinalizarEl) btnFinalizarEl.disabled = faltaPagamento || PdvState.carrinho.length === 0;
+  if (avisoPagEl) avisoPagEl.style.display = (faltaPagamento && PdvState.carrinho.length > 0) ? 'block' : 'none';
+
   const brlEl = document.getElementById('pdv-total-brl');
   const brlValEl = document.getElementById('pdv-total-brl-value');
   if (brlEl && brlValEl) {
@@ -1421,6 +1444,7 @@ window.selecionarPagamento = function(pag) {
   if (pixBrlRow) pixBrlRow.style.display = pag === 'pix_brl'  ? 'block' : 'none';
   if (cotEl)     cotEl.textContent = APP_CONFIG.cotacaoBRL.toLocaleString('es-PY');
   // Recalcula preços do carrinho e da prévia de impressão (preço cartão!)
+  // (atualizarCarrinhoUI() logo abaixo também libera o botão de finalizar)
   atualizarCarrinhoUI();
   atualizarPreviewPdv();
   salvarEstadoPdv()
@@ -1465,6 +1489,11 @@ window.finalizarVenda = async function() {
   }
   if (PdvState.carrinho.length === 0) {
     toast('Carrinho vazio', 'warning');
+    return;
+  }
+  const temCopiaCheck = PdvState.carrinho.some(i => i.tipo_item === 'copia');
+  if (!temCopiaCheck && !PdvState.pagamento) {
+    toast('Selecione a forma de pagamento antes de finalizar.', 'warning');
     return;
   }
 
@@ -1996,7 +2025,7 @@ window.abrirCaixa = function() {
         <label>Observações (opcional)</label>
         <input type="text" class="input" id="obs-abertura" placeholder="Ex: Início do expediente" />
       </div>
-      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="confirmarAbrirCaixa()">
+      <button class="btn btn--success btn--lg" id="btn-confirmar-abertura" style="width:100%;justify-content:center" onclick="confirmarAbrirCaixa()">
         🔓 Confirmar Abertura
       </button>
     </div>
@@ -2007,16 +2036,48 @@ window.confirmarAbrirCaixa = async function() {
   const valorAbertura = parseFloat(document.getElementById('fundo-caixa').value) || 0;
   if (valorAbertura <= 0) { toast('Informe um valor válido', 'warning'); return; }
   const obs = document.getElementById('obs-abertura').value || null;
-  const { data, error } = await sb.from('caixa_sessoes').insert({
-    valor_abertura: valorAbertura,
-    observacoes: obs,
-    saldo_atual: valorAbertura // já define saldo inicial
-  }).select().single();
-  if (error) { toast('Erro: '+error.message, 'error'); return; }
-  toast('Caixa aberto com sucesso!', 'success');
-  closeModal();
-  navigate('caixa');
-  renderCaixaStatusWidget();
+
+  const btn = document.getElementById('btn-confirmar-abertura');
+  if (btn) { btn.disabled = true; btn.textContent = 'Abrindo...'; }
+
+  try {
+    // Trava de segurança no client: nunca abrir um novo caixa se já existe
+    // um aberto (evita sessões órfãs / "caixa que nunca fecha").
+    // A garantia definitiva fica por conta do índice único no banco
+    // (ux_caixa_sessoes_uma_aberta) — se cair aqui, o insert vai falhar
+    // com erro de constraint mesmo que essa checagem passe por uma corrida.
+    const statusAtual = await getStatusCaixa();
+    if (statusAtual.aberto) {
+      toast('Já existe um caixa aberto. Feche-o antes de abrir outro.', 'error');
+      closeModal();
+      navigate('caixa');
+      return;
+    }
+
+    const { data, error } = await sb.from('caixa_sessoes').insert({
+      valor_abertura: valorAbertura,
+      observacoes: obs,
+      saldo_atual: valorAbertura // já define saldo inicial
+    }).select().single();
+
+    if (error) {
+      // Se bateu no índice único (23505), é porque outra sessão já abriu
+      // o caixa entre a checagem acima e este insert — mensagem amigável.
+      if (error.code === '23505') {
+        toast('Já existe um caixa aberto (detectado no banco). Recarregando...', 'error');
+      } else {
+        toast('Erro: ' + error.message, 'error');
+      }
+      return;
+    }
+
+    toast('Caixa aberto com sucesso!', 'success');
+    closeModal();
+    navigate('caixa');
+    await renderCaixaStatusWidget();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔓 Confirmar Abertura'; }
+  }
 };
 
 // ── MODAL SUPRIMENTO ──────────────────────────────────────
@@ -2125,28 +2186,23 @@ window.registrarMovimento = async function(sessaoId, tipo) {
   
   const { error } = await sb.from('caixa_movimentos').insert(payload);
   if (error) { toast('Erro: ' + error.message, 'error'); return; }
-  
-  // Recalcular saldo e verificar trava
-  const { data: saldo } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
-  const { data: empresa } = await sb.from('empresa').select('config').single();
-  const limite = empresa?.config?.limite_sangria || 1000000;
-  
-  // Atualiza saldo na sessão
-  await sb.from('caixa_sessoes').update({ saldo_atual: saldo }).eq('id', sessaoId);
-  
-  // const saldo = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
-  console.log('Saldo atual:', saldo, 'Limite:', limite);
 
-  // Verifica se atingiu o limite (apenas se não for uma sangria, pois sangria reduz saldo)
-  if (tipo !== 'sangria' && saldo >= limite) {
-    await sb.from('caixa_sessoes').update({ travado: true }).eq('id', sessaoId);
+  // A trava (travado = true/false) agora é decidida pelo trigger do banco
+  // (fn_verificar_trava_caixa, disparado por este INSERT em caixa_movimentos)
+  // — assim ela vale pra qualquer inserção, inclusive vendas feitas pelo
+  // PDV, e não depende do client rodar o JS certo. Aqui só recalculamos
+  // o saldo pra manter o campo de exibição atualizado.
+  const { data: saldo } = await sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId });
+  await sb.from('caixa_sessoes').update({ saldo_atual: saldo }).eq('id', sessaoId);
+
+  // Relê o status já refletindo a decisão do trigger.
+  const statusPosMovimento = await getStatusCaixa();
+  if (statusPosMovimento.travado) {
     toast('⚠️ Atingiu o limite de sangria! O caixa foi travado. Libere com senha de admin.', 'error');
-  } else if (tipo === 'sangria' && saldo < limite) {
-    // Após sangria, se saldo ficou abaixo do limite, desbloqueia automaticamente
-    await sb.from('caixa_sessoes').update({ travado: false }).eq('id', sessaoId);
+  } else {
+    toast('Movimento registrado!', 'success');
   }
 
-  toast('Movimento registrado!', 'success');
   closeModal();
   navigate('caixa');
   renderCaixaStatusWidget()
@@ -2185,8 +2241,16 @@ window.confirmarLiberacao = async function(sessaoId) {
     return;
   }
 
-  // Libera caixa
-  await sb.from('caixa_sessoes').update({ travado: false }).eq('id', sessaoId);
+  // Libera caixa. `liberado_manualmente: true` avisa o trigger do banco
+  // (fn_verificar_trava_caixa) pra não travar de novo automaticamente
+  // nesta sessão, mesmo que o saldo continue acima do limite — a
+  // liberação do admin vale até o fechamento do caixa.
+  const { error: errLiberar } = await sb.from('caixa_sessoes')
+    .update({ travado: false, liberado_manualmente: true })
+    .eq('id', sessaoId);
+  if (errLiberar) { toast('Erro ao liberar: ' + errLiberar.message, 'error'); return; }
+
+  await registrarLog('liberar_caixa', 'caixa_sessoes', sessaoId, {});
   toast('Caixa liberado!', 'success');
   closeModal();
   navigate('caixa');
@@ -2235,21 +2299,28 @@ window.fecharCaixa = async function(sessaoId) {
   const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
   const inicioHojeISO = hoje.toISOString();
 
-  const [
-    { total: totalCopias },
-    { total: totalVendas },
-    { data: saldoEsperado },
-    { data: movimentos },
-    { data: sessao },
-    breakdown,
-  ] = await Promise.all([
-    getTotalRealizado('pedidos_copia', inicioHojeISO),
-    getTotalRealizado('vendas', inicioHojeISO),
-    sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId }),
-    sb.from('caixa_movimentos').select('*').eq('sessao_id', sessaoId),
-    sb.from('caixa_sessoes').select('*').eq('id', sessaoId).single(),
-    getBreakdownPagamento(inicioHojeISO),
-  ]);
+  let totalCopias, totalVendas, saldoEsperado, movimentos, sessao, breakdown;
+  try {
+    [
+      { total: totalCopias },
+      { total: totalVendas },
+      { data: saldoEsperado },
+      { data: movimentos },
+      { data: sessao },
+      breakdown,
+    ] = await Promise.all([
+      getTotalRealizado('pedidos_copia', inicioHojeISO),
+      getTotalRealizado('vendas', inicioHojeISO),
+      sb.rpc('calcular_saldo_esperado', { sessao_id: sessaoId }),
+      sb.from('caixa_movimentos').select('*').eq('sessao_id', sessaoId),
+      sb.from('caixa_sessoes').select('*').eq('id', sessaoId).single(),
+      getBreakdownPagamento(inicioHojeISO),
+    ]);
+  } catch (err) {
+    console.error('[fecharCaixa] Erro ao carregar dados de fechamento:', err);
+    toast('Não foi possível carregar os dados do fechamento. Verifique sua conexão e tente novamente.', 'error');
+    return;
+  }
 
   const totalGeral = totalCopias + totalVendas;
   const totalSuprimentos = (movimentos || []).filter(m => m.tipo === 'suprimento').reduce((a, b) => a + b.valor, 0);
@@ -2743,6 +2814,10 @@ async function renderEstoque(el) {
     .select('*, fornecedores(nome)')
     .order('nome');
 
+  // Funcionário pode VER a aba Insumos, mas não pode editar/ajustar/compor
+  // insumos — apenas administradores. Produtos e Folhas continuam liberados.
+  const isFuncionario = State.userProfile?.role === 'funcionario';
+
   el.innerHTML = `
     <div class="section-header">
       <div>
@@ -2795,11 +2870,15 @@ async function renderEstoque(el) {
     <td class="td-mono">${formatMoney(p.preco_custo)}</td>
     <td style="color:var(--c-text-3)">${p.fornecedores?.nome||'—'}</td>
     <td>
+      ${(p.tipo === 'insumo' && isFuncionario) ? `
+        <span class="badge" style="color:var(--c-text-3)" title="Apenas administradores podem editar insumos">🔒 Somente visualização</span>
+      ` : `
       <div style="display:flex;gap:4px">
         <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
-        <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}')">±</button>
-        <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}')" title="Gerenciar insumos">🧩</button>
+        <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}','${p.tipo||'produto'}')">±</button>
+        <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}','${p.tipo||'produto'}')" title="Gerenciar insumos">🧩</button>
       </div>
+      `}
     </td>
   </tr>
 `).join('') || '<tr><td colspan="8"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📦</div><div class="empty-state-sub">Nenhum produto cadastrado</div></div></td></tr>'}
@@ -3034,6 +3113,10 @@ window.abrirModalProduto = async function(produtoId) {
   if (produtoId) {
     const { data } = await sb.from('produtos').select('*').eq('id',produtoId).single();
     p = data || {};
+    if (p.tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+      toast('Apenas administradores podem editar insumos.', 'warning');
+      return;
+    }
   }
 
   openModal(produtoId ? 'Editar Produto' : 'Novo Produto', `
@@ -3092,7 +3175,11 @@ window.abrirModalProduto = async function(produtoId) {
   `, 'modal--lg');
 };
 
-window.gerenciarComposicao = async function(produtoId, nomeProduto) {
+window.gerenciarComposicao = async function(produtoId, nomeProduto, tipo = 'produto') {
+  if (tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+    toast('Apenas administradores podem editar insumos.', 'warning');
+    return;
+  }
   // Busca insumos já vinculados
   const { data: vinculos } = await sb.from('produto_insumos')
     .select('*, insumos:insumo_id(id, nome, unidade, estoque_atual)')
@@ -3493,7 +3580,11 @@ window.confirmarProducao = async function() {
   }
 };
 
-window.ajusteEstoque = function(id, nome, atual, unidade) {
+window.ajusteEstoque = function(id, nome, atual, unidade, tipo = 'produto') {
+  if (tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+    toast('Apenas administradores podem editar insumos.', 'warning');
+    return;
+  }
   openModal('Ajuste de Estoque', `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
       <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
@@ -3530,6 +3621,38 @@ window.confirmarAjusteEstoque = async function(id, atual, unidade) {
 };
 
 // ============================================================
+// ── ALERTA: CONTAS PRÓXIMAS DO VENCIMENTO ──────────────────
+// Roda no boot do app (apenas para quem tem acesso à página de
+// Contas) e avisa sobre contas vencidas ou vencendo nos
+// próximos 3 dias. Não bloqueia o fluxo se a consulta falhar.
+// ============================================================
+async function verificarContasProximasVencimento() {
+  if (State.userProfile?.role !== 'admin' && State.userProfile?.role !== 'adminMaster') return;
+
+  const hojeStr = new Date().toISOString().split('T')[0];
+  const limiteStr = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0];
+
+  const { data: contas, error } = await sb.from('contas')
+    .select('id, descricao, valor, vencimento')
+    .eq('status', 'pendente')
+    .lte('vencimento', limiteStr)
+    .order('vencimento', { ascending: true });
+
+  if (error || !contas || contas.length === 0) return;
+
+  const vencidas = contas.filter(c => c.vencimento < hojeStr);
+  const proximas = contas.filter(c => c.vencimento >= hojeStr);
+
+  if (vencidas.length > 0) {
+    toast(`⚠️ ${vencidas.length} conta${vencidas.length > 1 ? 's' : ''} vencida${vencidas.length > 1 ? 's' : ''}! Confira em Contas.`, 'error', 6000);
+  }
+  if (proximas.length > 0) {
+    toast(`📋 ${proximas.length} conta${proximas.length > 1 ? 's' : ''} vencendo nos próximos 3 dias.`, 'warning', 6000);
+  }
+}
+window.verificarContasProximasVencimento = verificarContasProximasVencimento;
+
+// ============================================================
 // ── MÓDULO: CONTAS ────────────────────────────────────────
 // ============================================================
 async function renderContas(el) {
@@ -3537,12 +3660,29 @@ async function renderContas(el) {
     .select('*, fornecedores(nome), funcionarios(nome)')
     .order('vencimento', { ascending: true });
 
+  const hojeStr = new Date().toISOString().split('T')[0];
+  const limiteStr = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0];
+  const contasAlerta = (contas || []).filter(c => !c.pago_em && c.vencimento <= limiteStr);
+  const alertaVencidas = contasAlerta.filter(c => c.vencimento < hojeStr);
+  const alertaProximas = contasAlerta.filter(c => c.vencimento >= hojeStr);
+
   el.innerHTML = `
     <div class="section-header">
       <div><div class="section-title">Contas a Pagar / Receber</div>
       <div class="section-sub">Controle financeiro de obrigações</div></div>
       <button class="btn btn--primary" onclick="abrirModalConta()">+ Nova Conta</button>
     </div>
+    ${contasAlerta.length > 0 ? `
+    <div class="card" style="margin-bottom:var(--sp-4);border-left:4px solid var(--c-danger);background:var(--c-bg)">
+      <div class="card-body" style="padding:var(--sp-4)">
+        <div style="font-weight:600;color:var(--c-danger);display:flex;align-items:center;gap:6px">⚠️ Atenção: contas próximas do vencimento</div>
+        <div style="margin-top:var(--sp-2);display:flex;flex-direction:column;gap:4px">
+          ${alertaVencidas.map(c => `<div style="font-size:var(--t-sm)"><strong style="color:var(--c-danger)">Vencida</strong> — ${c.descricao} · ${formatMoney(c.valor)} · venceu em ${formatDate(c.vencimento)}</div>`).join('')}
+          ${alertaProximas.map(c => `<div style="font-size:var(--t-sm)"><strong style="color:var(--c-warning)">Vence em breve</strong> — ${c.descricao} · ${formatMoney(c.valor)} · vencimento ${formatDate(c.vencimento)}</div>`).join('')}
+        </div>
+      </div>
+    </div>
+    ` : ''}
     <div class="card">
       <div class="table-wrap">
         <table>
@@ -3554,13 +3694,14 @@ async function renderContas(el) {
               const vencida = !c.pago_em && new Date(c.vencimento) < new Date();
               const status = c.pago_em ? 'paga' : vencida ? 'vencida' : 'pendente';
               return `<tr>
-                <td style="font-weight:500">${c.descricao}</td>
+                <td style="font-weight:500">${c.descricao} ${c.fixa ? '<span class="badge badge--accent" title="Conta fixa — repete todo mês">🔁 Fixa</span>' : ''}</td>
                 <td><span class="badge ${c.tipo==='receita'?'badge--success':'badge--danger'}">${c.tipo==='receita'?'Receita':'Despesa'}</span></td>
                 <td style="font-weight:600;color:${c.tipo==='receita'?'var(--c-success)':'var(--c-danger)'}">${formatMoney(c.valor)}</td>
                 <td class="td-mono" style="color:${vencida&&!c.pago_em?'var(--c-danger)':''}">${formatDate(c.vencimento)}</td>
                 <td><span class="badge badge--${status==='paga'?'success':status==='vencida'?'danger':'warning'}">${status}</span></td>
                 <td style="color:var(--c-text-3)">${c.categoria||'—'}</td>
                 <td>
+                  <button class="btn btn--ghost btn--sm" onclick="abrirModalConta('${c.id}')">✏ Editar</button>
                   ${!c.pago_em ? `<button class="btn btn--success btn--sm" onclick="pagarConta('${c.id}',${c.valor})">✓ Pagar</button>` : ''}
                 </td>
               </tr>`;
@@ -3572,34 +3713,54 @@ async function renderContas(el) {
   `;
 }
 
-window.abrirModalConta = function() {
-  openModal('Nova Conta', `
+// abrirModalConta(): cria uma nova conta.
+// abrirModalConta(id): abre a mesma tela já preenchida para edição
+// (evita ter que excluir e recriar por causa de erro de digitação).
+window.abrirModalConta = async function(contaId = null) {
+  let c = null;
+  if (contaId) {
+    const { data, error } = await sb.from('contas').select('*').eq('id', contaId).single();
+    if (error || !data) { toast('Conta não encontrada', 'error'); return; }
+    c = data;
+  }
+
+  openModal(contaId ? '✏ Editar Conta' : 'Nova Conta', `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
       <div class="form-row form-row--2">
-        <div class="field"><label>Descrição *</label><input type="text" class="input" id="conta-desc" placeholder="Ex: Aluguel loja" /></div>
+        <div class="field"><label>Descrição *</label><input type="text" class="input" id="conta-desc" placeholder="Ex: Aluguel loja" value="${c?.descricao ? c.descricao.replace(/"/g,'&quot;') : ''}" /></div>
         <div class="field"><label>Tipo</label>
-          <select class="input" id="conta-tipo"><option value="despesa">Despesa</option><option value="receita">Receita</option></select>
-        </div>
-      </div>
-      <div class="form-row form-row--2">
-        <div class="field"><label>Valor *</label><input type="number" class="input" id="conta-valor" step="0.01" min="0" placeholder="0,00" /></div>
-        <div class="field"><label>Vencimento *</label><input type="date" class="input" id="conta-vencimento" /></div>
-      </div>
-      <div class="form-row form-row--2">
-        <div class="field"><label>Categoria</label><input type="text" class="input" id="conta-categoria" placeholder="Aluguel, água, luz, salário..." /></div>
-        <div class="field"><label>Forma de Pagamento</label>
-          <select class="input" id="conta-pagamento">
-            ${['dinheiro','pix','cartao_debito','cartao_credito','cheque','transferencia'].map(p=>`<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+          <select class="input" id="conta-tipo">
+            <option value="despesa" ${c?.tipo!=='receita'?'selected':''}>Despesa</option>
+            <option value="receita" ${c?.tipo==='receita'?'selected':''}>Receita</option>
           </select>
         </div>
       </div>
-      <div class="field"><label>Observações</label><textarea class="input" id="conta-obs" rows="2"></textarea></div>
-      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarConta()">💾 Salvar Conta</button>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Valor *</label><input type="number" class="input" id="conta-valor" step="0.01" min="0" placeholder="0,00" value="${c?.valor ?? ''}" /></div>
+        <div class="field"><label>Vencimento *</label><input type="date" class="input" id="conta-vencimento" value="${c?.vencimento || ''}" /></div>
+      </div>
+      <div class="form-row form-row--2">
+        <div class="field"><label>Categoria</label><input type="text" class="input" id="conta-categoria" placeholder="Aluguel, água, luz, salário..." value="${c?.categoria ? c.categoria.replace(/"/g,'&quot;') : ''}" /></div>
+        <div class="field"><label>Forma de Pagamento</label>
+          <select class="input" id="conta-pagamento">
+            ${['dinheiro','pix','cartao_debito','cartao_credito','cheque','transferencia'].map(p=>`<option value="${p}" ${c?.forma_pagamento===p?'selected':''}>${labelPagamento(p)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:var(--sp-2);cursor:pointer;padding:var(--sp-3);background:var(--c-bg);border-radius:var(--r-md)">
+        <input type="checkbox" id="conta-fixa" ${c?.fixa?'checked':''} />
+        <div>
+          <div style="font-weight:600">🔁 Conta fixa (repete todo mês)</div>
+          <div style="font-size:var(--t-xs);color:var(--c-text-3)">Ao marcar como paga, uma nova conta com o mesmo valor já é criada automaticamente para o mês seguinte, na mesma data.</div>
+        </div>
+      </label>
+      <div class="field"><label>Observações</label><textarea class="input" id="conta-obs" rows="2">${c?.observacoes || ''}</textarea></div>
+      <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarConta(${contaId ? `'${contaId}'` : 'null'})">💾 ${contaId ? 'Salvar Alterações' : 'Salvar Conta'}</button>
     </div>
   `);
 };
 
-window.salvarConta = async function() {
+window.salvarConta = async function(contaId = null) {
   const payload = {
     descricao: document.getElementById('conta-desc').value.trim(),
     tipo: document.getElementById('conta-tipo').value,
@@ -3608,11 +3769,16 @@ window.salvarConta = async function() {
     categoria: document.getElementById('conta-categoria').value||null,
     forma_pagamento: document.getElementById('conta-pagamento').value,
     observacoes: document.getElementById('conta-obs').value||null,
+    fixa: document.getElementById('conta-fixa')?.checked || false,
   };
   if (!payload.descricao || !payload.valor || !payload.vencimento) { toast('Preencha os campos obrigatórios','warning'); return; }
-  const { error } = await sb.from('contas').insert(payload);
+
+  const { error } = contaId
+    ? await sb.from('contas').update(payload).eq('id', contaId)
+    : await sb.from('contas').insert(payload);
+
   if (error) { toast('Erro: '+error.message,'error'); return; }
-  toast('Conta salva!','success');
+  toast(contaId ? 'Conta atualizada!' : 'Conta salva!', 'success');
   closeModal();
   navigate('contas');
 };
@@ -3633,6 +3799,12 @@ window.pagarConta = function(id, valor) {
 };
 
 window.confirmarPagamentoConta = async function(id) {
+  // Busca a conta original antes de marcar como paga — precisamos dela
+  // (descrição, valor, categoria, vencimento...) para, se for fixa,
+  // gerar automaticamente a ocorrência do mês seguinte.
+  const { data: contaOriginal, error: errBusca } = await sb.from('contas').select('*').eq('id', id).single();
+  if (errBusca || !contaOriginal) { toast('Conta não encontrada', 'error'); return; }
+
   const { error } = await sb.from('contas').update({
     pago_em: document.getElementById('pag-data').value,
     valor_pago: parseFloat(document.getElementById('pag-valor').value)||0,
@@ -3640,7 +3812,28 @@ window.confirmarPagamentoConta = async function(id) {
     status: 'paga',
   }).eq('id', id);
   if (error) { toast('Erro: '+error.message,'error'); return; }
-  toast('Pagamento registrado!','success');
+
+  // ── Conta fixa: gera automaticamente a próxima ocorrência (mesmo dia, mês seguinte) ──
+  if (contaOriginal.fixa) {
+    const vencOriginal = new Date(contaOriginal.vencimento + 'T00:00:00');
+    const proximoVencimento = new Date(vencOriginal);
+    proximoVencimento.setMonth(proximoVencimento.getMonth() + 1);
+
+    await sb.from('contas').insert({
+      descricao: contaOriginal.descricao,
+      tipo: contaOriginal.tipo,
+      valor: contaOriginal.valor,
+      vencimento: proximoVencimento.toISOString().split('T')[0],
+      categoria: contaOriginal.categoria,
+      forma_pagamento: contaOriginal.forma_pagamento,
+      observacoes: contaOriginal.observacoes,
+      fixa: true,
+    });
+    toast('✅ Pagamento registrado! Próxima conta fixa já criada para ' + formatDate(proximoVencimento.toISOString().split('T')[0]) + '.', 'success', 4500);
+  } else {
+    toast('Pagamento registrado!','success');
+  }
+
   closeModal();
   navigate('contas');
 };
@@ -5377,7 +5570,7 @@ window.verCarrinhoPendente = async function(pedidoId) {
   const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
 
   // Renderiza o modal com base no status
-  const modalBody = renderCarrinhoPendenteModalBody(carrinho, 'dinheiro', todosProntos);
+  const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
   openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg');
 };
 
@@ -5422,7 +5615,7 @@ window.verCarrinhoPorId = async function(carrinhoId) {
 
   // Caso contrário, exibe o modal de finalização (com opções de edição)
   _carrinhoPendenteAtual = carrinho;
-  const modalBody = renderCarrinhoPendenteModalBody(carrinho, 'dinheiro', false);
+  const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', false);
   openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg');
 };
 
@@ -5443,6 +5636,19 @@ async function exibirResumoCarrinhoFinalizado(carrinhoId) {
   if (pedidos.length === 0 && vendas.length === 0) {
     toast('Carrinho não encontrado', 'error');
     return;
+  }
+
+  // Busca os itens vendidos (produtos) de todas as vendas deste carrinho,
+  // para exibir o que realmente foi vendido em vez do número/cliente da venda.
+  let itensPorVenda = {};
+  if (vendas.length > 0) {
+    const { data: vendaItens } = await sb.from('venda_itens')
+      .select('*, produtos(nome)')
+      .in('venda_id', vendas.map(v => v.id));
+    (vendaItens || []).forEach(vi => {
+      if (!itensPorVenda[vi.venda_id]) itensPorVenda[vi.venda_id] = [];
+      itensPorVenda[vi.venda_id].push(vi);
+    });
   }
 
   // Monta modal de visualização (read-only)
@@ -5468,12 +5674,25 @@ async function exibirResumoCarrinhoFinalizado(carrinhoId) {
   if (vendas.length > 0) {
     html += `<div><strong>📦 Produtos</strong></div>`;
     vendas.forEach(v => {
-      html += `
-        <div style="display:flex;justify-content:space-between;padding:var(--sp-2) 0;border-bottom:1px solid var(--c-border)">
-          <span>#${v.numero_venda} - ${v.clientes?.nome || 'Consumidor'}</span>
-          <span style="font-weight:600">${formatMoney(v.total)}</span>
-        </div>
-      `;
+      const itens = itensPorVenda[v.id] || [];
+      if (itens.length > 0) {
+        itens.forEach(item => {
+          html += `
+            <div style="display:flex;justify-content:space-between;padding:var(--sp-2) 0;border-bottom:1px solid var(--c-border)">
+              <span>${item.produtos?.nome || 'Produto'} × ${item.quantidade}</span>
+              <span style="font-weight:600">${formatMoney(item.total)}</span>
+            </div>
+          `;
+        });
+      } else {
+        // Venda sem itens detalhados (fallback) — ainda mostra o total
+        html += `
+          <div style="display:flex;justify-content:space-between;padding:var(--sp-2) 0;border-bottom:1px solid var(--c-border)">
+            <span>Venda #${v.numero_venda ?? '—'}</span>
+            <span style="font-weight:600">${formatMoney(v.total)}</span>
+          </div>
+        `;
+      }
     });
   }
 
@@ -5576,11 +5795,12 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
       <div class="field">
         <label>Forma de Pagamento</label>
         <select class="input" id="carrinho-pendente-pagamento" onchange="atualizarPreviewCarrinhoPendente(this.value)">
+          <option value="" ${!pagamento ? 'selected' : ''} disabled>Selecione a forma de pagamento…</option>
           ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `<option value="${p}" ${p===pagamento?'selected':''}>${labelPagamento(p)}</option>`).join('')}
         </select>
       </div>
-      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')" ${!todosProntos ? 'disabled' : ''}>
-        ${todosProntos ? '✅ Finalizar Venda — <span id="cp-total-btn">'+formatMoney(total)+'</span>' : '⏳ Aguardando conferência'}
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')" ${(!todosProntos || !pagamento) ? 'disabled' : ''}>
+        ${!todosProntos ? '⏳ Aguardando conferência' : (!pagamento ? '⚠ Selecione a forma de pagamento' : '✅ Finalizar Venda — <span id="cp-total-btn">'+formatMoney(total)+'</span>')}
       </button>
     </div>
   `;
@@ -5641,7 +5861,11 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
     const itensProduto = itens.filter(i => i.tipo_item === 'produto');
     const clienteNome = carrinho.cliente_nome || null;
     
-  const pagamentoSelect = document.getElementById('carrinho-pendente-pagamento')?.value || 'dinheiro';
+  const pagamentoSelect = document.getElementById('carrinho-pendente-pagamento')?.value || '';
+  if (!pagamentoSelect) {
+    toast('Selecione a forma de pagamento antes de finalizar.', 'warning');
+    return;
+  }
   const pagamentoDb = pagamentoSelect === 'pix_brl' ? 'pix' : pagamentoSelect;
   
   const btn = document.querySelector('#global-modal .btn--success');
@@ -5737,24 +5961,18 @@ async function renderPedidoCard(p) {
     }
   }
 
-  const acoes = {
-    na_fila:     `<button class="btn btn--primary btn--sm" onclick="acaoFila('iniciar','${p.id}')">▶ Iniciar</button>
+  // ── Fila simplificada: um único botão "Confirmar" leva direto ao
+  //    modal de conferência/entrega, que por sua vez abre o carrinho
+  //    para pagamento. Não há mais etapas manuais de iniciar/conferir.
+  const acaoConfirmar = `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
                   <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
-                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
+                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`;
 
-    imprimindo:  `<button class="btn btn--accent btn--sm" onclick="acaoFila('conferir','${p.id}')">📋 Conferir</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('erro','${p.id}')">⚠ Erro</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('pausar','${p.id}')">⏸ Pausar</button>
-                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
-
-    conferencia: `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Entregar</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reimprimir</button>
-                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
-
-    erro:        `<button class="btn btn--warning btn--sm" onclick="acaoFila('reimprimir','${p.id}')">↺ Reprocessar</button>
-                  <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕ Cancelar</button>
-                  <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`,
-
+  const acoes = {
+    na_fila:     acaoConfirmar,
+    imprimindo:  acaoConfirmar,
+    conferencia: acaoConfirmar,
+    erro:        acaoConfirmar,
     concluido:   `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
   };
 
@@ -5987,14 +6205,9 @@ function labelStatusFila(status) {
 
 
 // ── Ações simples de estado ───────────────────────────────
+// (fila simplificada: a única transição manual restante é o cancelamento;
+//  concluir/entregar acontece via abrirModalConferencia → confirmarConferencia)
 window.acaoFila = async function(acao, pedidoId) {
-  const transicoes = {
-    iniciar:    { status: 'imprimindo',  msg: '▶ Impressão iniciada!' },
-    pausar:     { status: 'na_fila',     msg: '⏸ Pedido pausado — voltou para a fila.' },
-    conferir:   { status: 'conferencia', msg: '📋 Pedido em conferência.' },
-    erro:       { status: 'erro',        msg: '⚠ Erro registrado.' },
-  };
-
   if (acao === 'cancelar') {
     if (!confirm('Cancelar este pedido? O cliente deverá ser informado.')) return;
     await sb.from('pedidos_copia').update({ status: 'cancelado' }).eq('id', pedidoId);
@@ -6002,80 +6215,6 @@ window.acaoFila = async function(acao, pedidoId) {
     await refreshFila();
     return;
   }
-
-  if (acao === 'reimprimir') {
-    await sb.from('pedidos_copia').update({ status: 'na_fila' }).eq('id', pedidoId);
-    toast('↺ Pedido reinserido na fila.', 'info');
-    await refreshFila();
-    return;
-  }
-
-  // --- LÓGICA ESPECIAL PARA 'iniciar' ---
-  if (acao === 'iniciar') {
-    // Busca os dados do pedido (incluindo IP da impressora)
-    const { data: pedido, error: errPed } = await sb
-      .from('pedidos_copia')
-      .select('impressoras(ip_rede), quantidade, frente_verso')
-      .eq('id', pedidoId)
-      .single();
-
-    if (errPed || !pedido) {
-      toast('Erro ao buscar dados do pedido.', 'error');
-      return;
-    }
-
-    const ip = pedido.impressoras?.ip_rede;
-    if (!ip) {
-      toast('Impressora não tem IP cadastrado. Inicie manualmente.', 'warning');
-      // Mesmo sem IP, podemos iniciar a impressão (sem contador automático)
-      const { error } = await sb.from('pedidos_copia').update({ status: 'imprimindo' }).eq('id', pedidoId);
-      if (error) { toast('Erro: ' + error.message, 'error'); return; }
-      toast('▶ Impressão iniciada (sem monitoramento automático).', 'success');
-      await refreshFila();
-      return;
-    }
-
-    try {
-      // 1. Consulta o proxy SNMP
-      const proxyURL = 'http://localhost:3333'; // ajuste se necessário
-      const resp = await fetch(`${proxyURL}/api/contador/${ip}`);
-      if (!resp.ok) throw new Error('Falha ao ler contador da impressora');
-      const data = await resp.json();
-      if (data.contador === undefined) throw new Error('Contador não retornado');
-
-      // 2. Calcula as folhas esperadas
-      const paginasPorDoc = pedido.paginas_por_documento || 1;
-      const totalPaginas = pedido.quantidade * paginasPorDoc;
-      const folhasEsperadas = Math.ceil(totalPaginas / (pedido.frente_verso ? 2 : 1));
-
-      // 3. Atualiza o pedido com contador inicial e status
-      await sb.from('pedidos_copia').update({
-        contador_inicial: data.contador,
-        total_folhas_esperadas: folhasEsperadas,
-        status: 'imprimindo'
-      }).eq('id', pedidoId);
-
-      toast('▶ Impressão iniciada com monitoramento SNMP!', 'success');
-      await refreshFila();
-      return;
-    } catch (err) {
-      console.error('Erro no SNMP:', err);
-      toast('Erro ao ler contador, iniciando sem monitoramento: ' + err.message, 'warning');
-      // Fallback: inicia sem contador automático
-      await sb.from('pedidos_copia').update({ status: 'imprimindo' }).eq('id', pedidoId);
-      await refreshFila();
-      return;
-    }
-  }
-
-  // --- Demais ações (pausar, conferir, erro) ---
-  const t = transicoes[acao];
-  if (!t) return;
-
-  const { error } = await sb.from('pedidos_copia').update({ status: t.status }).eq('id', pedidoId);
-  if (error) { toast('Erro: ' + error.message, 'error'); return; }
-  toast(t.msg, 'success');
-  await refreshFila();
 };
 
 // ── Modal de Conferência e Entrega ────────────────────────
@@ -6247,7 +6386,10 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
         cliente_nome_pdv: pedidoOriginal.cliente_nome_pdv,
         observacoes: `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
         forma_pagamento: pedidoOriginal.forma_pagamento,
-        // sem carrinho_id para reimpressão gratuita
+        // Mantém o carrinho_id do pedido original: é gratuita (total 0),
+        // mas precisa passar pela finalização do carrinho para receber a
+        // forma de pagamento correta e não ficar com "—" no histórico/caixa.
+        carrinho_id: pedidoOriginal.carrinho_id || null,
       });
     }
   }

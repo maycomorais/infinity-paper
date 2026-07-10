@@ -1225,7 +1225,7 @@ async function carregarProdutosPdv() {
   const { data } = await sb.from('produtos')
     .select('*')
     .eq('ativo', true)
-    .eq('tipo', 'produto')
+    .in('tipo', ['produto', 'ambos'])
     .order('nome');
   State.produtosPdv = data || [];
 }
@@ -1279,7 +1279,7 @@ window.pdvLerCodigoBarras = async function(codigo) {
 
   // Se não achou (produto pode estar fora do cache), busca no banco
   if (!produto) {
-    const { data } = await sb.from('produtos').select('*').eq('codigo_barras', valor).eq('ativo', true).eq('tipo', 'produto').maybeSingle();
+    const { data } = await sb.from('produtos').select('*').eq('codigo_barras', valor).eq('ativo', true).in('tipo', ['produto', 'ambos']).maybeSingle();
     produto = data || null;
   }
 
@@ -2810,13 +2810,20 @@ window.confirmarQuitarFiado = async function(origem, id, cliente) {
 // ── MÓDULO: ESTOQUE ───────────────────────────────────────
 // ============================================================
 async function renderEstoque(el) {
-  const { data: produtos } = await sb.from('produtos')
+  const { data: produtosRaw } = await sb.from('produtos')
     .select('*, fornecedores(nome)')
     .order('nome');
 
-  // Funcionário pode VER a aba Insumos, mas não pode editar/ajustar/compor
-  // insumos — apenas administradores. Produtos e Folhas continuam liberados.
+  // Produtos "excluídos" viram inativos (ativo=false) e somem da lista,
+  // mas continuam no banco para não quebrar vínculos com vendas/insumos.
+  const produtos = (produtosRaw || []).filter(p => p.ativo !== false);
+
+  // Funcionário pode VER itens de tipo Insumo (e "Ambos"), mas não pode
+  // editar/ajustar/compor esses itens — apenas administradores. Itens
+  // puramente "Produto" continuam liberados para edição por funcionário.
   const isFuncionario = State.userProfile?.role === 'funcionario';
+  const isAdmin = State.userProfile?.role === 'admin' || State.userProfile?.role === 'adminMaster';
+  const ehInsumoOuAmbos = (p) => p.tipo === 'insumo' || p.tipo === 'ambos';
 
   el.innerHTML = `
     <div class="section-header">
@@ -2857,7 +2864,7 @@ async function renderEstoque(el) {
           <tbody>
             ${(produtos||[]).map(p => `
   <tr data-tipo="${p.tipo || 'produto'}" data-usado-impressao="${p.usado_na_impressao || false}">
-    <td style="font-weight:500">${p.nome}${p.usado_na_impressao ? '<span class="badge badge--accent">📄 Folha</span>' : ''}</td>
+    <td style="font-weight:500">${p.nome}${p.tipo === 'ambos' ? '<span class="badge badge--accent" title="Vendido no balcão e também consumido como insumo">🔁 Ambos</span>' : ''}${p.usado_na_impressao ? '<span class="badge badge--accent">📄 Folha</span>' : ''}</td>
     <td><span class="badge badge--primary">${p.categoria}</span></td>
     <td>
       <span style="font-family:var(--font-mono);font-weight:600;color:${p.estoque_atual <= p.estoque_minimo ? 'var(--c-danger)' : 'var(--c-success)'}">
@@ -2870,13 +2877,14 @@ async function renderEstoque(el) {
     <td class="td-mono">${formatMoney(p.preco_custo)}</td>
     <td style="color:var(--c-text-3)">${p.fornecedores?.nome||'—'}</td>
     <td>
-      ${(p.tipo === 'insumo' && isFuncionario) ? `
+      ${(ehInsumoOuAmbos(p) && isFuncionario) ? `
         <span class="badge" style="color:var(--c-text-3)" title="Apenas administradores podem editar insumos">🔒 Somente visualização</span>
       ` : `
       <div style="display:flex;gap:4px">
         <button class="btn btn--ghost btn--sm" onclick="editarProduto('${p.id}')">✏️</button>
         <button class="btn btn--ghost btn--sm" onclick="ajusteEstoque('${p.id}','${p.nome.replace(/'/g,"\\'")}',${p.estoque_atual},'${p.unidade}','${p.tipo||'produto'}')">±</button>
         <button class="btn btn--ghost btn--sm" onclick="gerenciarComposicao('${p.id}','${p.nome.replace(/'/g,"\\'")}','${p.tipo||'produto'}')" title="Gerenciar insumos">🧩</button>
+        ${isAdmin ? `<button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="excluirProduto('${p.id}','${p.nome.replace(/'/g,"\\'")}')" title="Excluir">🗑️</button>` : ''}
       </div>
       `}
     </td>
@@ -2902,8 +2910,9 @@ async function renderEstoque(el) {
       const usadoNaImpressao = tr.dataset.usadoImpressao === 'true';
       tr.style.display = usadoNaImpressao ? '' : 'none';
     } else {
+      // Itens "ambos" contam nas duas abas: Produtos E Insumos
       const tipoProduto = tr.dataset.tipo || 'produto';
-      tr.style.display = tipoProduto === tipo ? '' : 'none';
+      tr.style.display = (tipoProduto === tipo || tipoProduto === 'ambos') ? '' : 'none';
     }
   });
 };
@@ -3113,7 +3122,7 @@ window.abrirModalProduto = async function(produtoId) {
   if (produtoId) {
     const { data } = await sb.from('produtos').select('*').eq('id',produtoId).single();
     p = data || {};
-    if (p.tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+    if ((p.tipo === 'insumo' || p.tipo === 'ambos') && State.userProfile?.role === 'funcionario') {
       toast('Apenas administradores podem editar insumos.', 'warning');
       return;
     }
@@ -3130,11 +3139,15 @@ window.abrirModalProduto = async function(produtoId) {
         <select class="input" id="prod-tipo" onchange="toggleCampoImpressao()">
           <option value="produto" ${(!p.tipo || p.tipo==='produto')?'selected':''}>Produto (venda)</option>
           <option value="insumo" ${p.tipo==='insumo'?'selected':''}>Insumo (consumo)</option>
+          <option value="ambos" ${p.tipo==='ambos'?'selected':''}>Ambos (vendido e também consumido como insumo)</option>
         </select>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">
+          "Ambos" é para itens como papel A4: você vende avulso no balcão e também usa o mesmo estoque para imprimir/produzir. Um único saldo de estoque para as duas coisas.
+        </div>
         <div class="field" id="campo-usado-impressao" style="display:block"}">
           <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-border);border-radius:var(--r-md);background:var(--c-bg)">
             <input type="checkbox" id="prod-usado-impressao" ${p.usado_na_impressao ? 'checked' : ''}>
-            <span>Este insumo pode ser usado como <strong>folha</strong> nas impressões (ex: papel A4, ofício, adesivo)</span>
+            <span>Este item pode ser usado como <strong>folha</strong> nas impressões (ex: papel A4, ofício, adesivo)</span>
           </label>
         </div>
       </div>
@@ -3176,7 +3189,7 @@ window.abrirModalProduto = async function(produtoId) {
 };
 
 window.gerenciarComposicao = async function(produtoId, nomeProduto, tipo = 'produto') {
-  if (tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+  if ((tipo === 'insumo' || tipo === 'ambos') && State.userProfile?.role === 'funcionario') {
     toast('Apenas administradores podem editar insumos.', 'warning');
     return;
   }
@@ -3185,10 +3198,10 @@ window.gerenciarComposicao = async function(produtoId, nomeProduto, tipo = 'prod
     .select('*, insumos:insumo_id(id, nome, unidade, estoque_atual)')
     .eq('produto_id', produtoId);
 
-  // Busca todos os insumos cadastrados
+  // Busca todos os insumos cadastrados (inclui itens "ambos", que também são consumíveis)
   const { data: insumos } = await sb.from('produtos')
     .select('id, nome, unidade, estoque_atual')
-    .eq('tipo', 'insumo')
+    .in('tipo', ['insumo', 'ambos'])
     .order('nome');
 
   openModal(`Composição de "${nomeProduto}"`, `
@@ -3295,7 +3308,7 @@ window.gerenciarInsumosCopia = async function(tipoCopia, descricao) {
 
   const { data: insumos } = await sb.from('produtos')
     .select('id, nome, unidade, estoque_atual')
-    .eq('tipo', 'insumo')
+    .in('tipo', ['insumo', 'ambos'])
     .eq('usado_na_impressao', false)
     .order('nome');
 
@@ -3377,6 +3390,21 @@ window.salvarVinculosCopia = async function(tipoCopia) {
 };
 
 
+// excluirProduto(): exclusão "suave" — marca o produto como inativo
+// (ativo=false) em vez de apagar de verdade. Produtos podem estar
+// vinculados a vendas, insumos de outros produtos ou pedidos de cópia
+// antigos; um DELETE de verdade quebraria essas referências (foreign key)
+// e apagaria histórico. Assim, o produto some da lista de Estoque mas o
+// histórico continua íntegro.
+window.excluirProduto = async function(id, nome) {
+  if (!confirm(`Excluir "${nome}"? Ele deixará de aparecer no estoque, mas o histórico de vendas/produção será preservado.`)) return;
+  const { error } = await sb.from('produtos').update({ ativo: false }).eq('id', id);
+  if (error) { toast(mensagemErroAmigavel(error, 'excluir produto'), 'error'); return; }
+  await registrarLog('excluir', 'produto', id, { nome });
+  toast('Produto excluído!', 'success');
+  navigate('estoque');
+};
+
 window.salvarProduto = async function(id) {
   const payload = {
     nome: document.getElementById('prod-nome').value.trim(),
@@ -3404,10 +3432,10 @@ window.salvarProduto = async function(id) {
 };
 
 async function renderProducao(el) {
-  // Busca todos os produtos finais (tipo = 'produto')
+  // Busca todos os produtos finais (tipo = 'produto' ou 'ambos')
   const { data: produtos } = await sb.from('produtos')
     .select('id, nome, estoque_atual, unidade')
-    .eq('tipo', 'produto')
+    .in('tipo', ['produto', 'ambos'])
     .order('nome');
 
   el.innerHTML = `
@@ -3581,7 +3609,7 @@ window.confirmarProducao = async function() {
 };
 
 window.ajusteEstoque = function(id, nome, atual, unidade, tipo = 'produto') {
-  if (tipo === 'insumo' && State.userProfile?.role === 'funcionario') {
+  if ((tipo === 'insumo' || tipo === 'ambos') && State.userProfile?.role === 'funcionario') {
     toast('Apenas administradores podem editar insumos.', 'warning');
     return;
   }

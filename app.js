@@ -5674,6 +5674,15 @@ window.refreshFila = async function() {
 
   const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
 
+  // Mapa global: carrinho_id → quantidade total de pedidos com esse
+  // carrinho, em QUALQUER impressora. Usado pra saber se um carrinho
+  // juntado (drag-and-drop) está "espalhado" em mais de uma coluna.
+  const carrinhoTotalJobs = {};
+  (pedidos || []).forEach(p => {
+    if (!p.carrinho_id) return;
+    carrinhoTotalJobs[p.carrinho_id] = (carrinhoTotalJobs[p.carrinho_id] || 0) + 1;
+  });
+
   // Construir as colunas usando um loop for...of com await
   const colunasHtml = [];
   for (const { impressora, pedidos: peds } of Object.values(porImpressora)) {
@@ -5696,7 +5705,29 @@ window.refreshFila = async function() {
         <div class="fila-empty-text">${filtroAtivo === 'todos' ? 'Fila livre' : 'Nenhum pedido'}</div>
       </div>`;
     } else {
-      const cards = await Promise.all(pedidosFiltrados.map(p => renderPedidoCard(p)));
+      // Agrupa os pedidos DESTA coluna por carrinho_id — quando o cliente
+      // juntou dois pedidos (drag-and-drop) na mesma impressora, isso vira
+      // um card só em vez de dois. `pedidosFiltrados` já está em ordem
+      // crescente de created_at, então o primeiro de cada grupo é sempre
+      // o pedido mais antigo (define o número/posição do card).
+      const gruposMap = new Map();
+      pedidosFiltrados.forEach(p => {
+        const key = p.carrinho_id || `solo-${p.id}`;
+        if (!gruposMap.has(key)) gruposMap.set(key, []);
+        gruposMap.get(key).push(p);
+      });
+
+      const cards = await Promise.all(
+        Array.from(gruposMap.values()).map(grupo => {
+          const carrinhoId = grupo[0].carrinho_id;
+          // "Espalhado" = o carrinho tem mais pedidos do que os que
+          // apareceram aqui nesta coluna → o resto está em outra impressora.
+          const espalhado = !!carrinhoId && (carrinhoTotalJobs[carrinhoId] || 0) > grupo.length;
+          return grupo.length > 1
+            ? renderPedidoCardGroup(grupo, espalhado)
+            : renderPedidoCard(grupo[0], espalhado);
+        })
+      );
       bodyHtml = cards.join('');
     }
 
@@ -6142,8 +6173,9 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
   }
 };
 
-// ── Renderiza um card de pedido ───────────────────────────
-async function renderPedidoCard(p) {
+// ── Renderiza um card de pedido individual (não juntado, ou cujo
+//    carrinho está espalhado em outra impressora) ─────────
+async function renderPedidoCard(p, espalhado = false) {
   const folhasEsperadas = p.paginas_por_documento
     ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
     : calcularFolhas(p.quantidade, p.frente_verso);
@@ -6196,6 +6228,7 @@ async function renderPedidoCard(p) {
           ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
         </div>
         ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
+        ${espalhado ? `<div style="font-size:10px;color:var(--c-accent)">🔗 Este carrinho também tem pedido(s) em outra impressora</div>` : ''}
       </div>
       <div class="pedido-card-footer">
         ${acoes[p.status] || ''}
@@ -6206,6 +6239,78 @@ async function renderPedidoCard(p) {
       <div style="font-size:10px;color:var(--c-text-3)">
         ⏳ ${p.folhas_usadas || 0} / ${p.total_folhas_esperadas} folhas
       </div>` : ''}
+    </div>
+  `;
+}
+
+// ── Renderiza um card ÚNICO para vários pedidos que foram
+//    juntados no mesmo carrinho (via drag-and-drop). Cada trabalho
+//    mantém sua própria conferência (✅), mas o carrinho, o total e
+//    o botão de pagamento são únicos pro grupo inteiro.
+//    `grupo` já vem ordenado do mais antigo pro mais novo (a query
+//    de refreshFila busca com order by created_at ascending) — por
+//    isso grupo[0] é sempre o pedido mais antigo, e é ele que define
+//    o número/posição do card na fila.
+async function renderPedidoCardGroup(grupo, espalhado = false) {
+  const principal = grupo[0];
+  const carrinhoId = principal.carrinho_id;
+  const clienteLabel = principal.cliente_nome_pdv || `Pedido #${principal.numero_pedido}`;
+
+  // Total do carrinho inteiro (inclui produtos avulsos adicionados via 🛒 +,
+  // não só a soma dos pedidos de cópia deste grupo).
+  let totalCarrinho = grupo.reduce((acc, p) => acc + (p.total || 0), 0);
+  const carrinho = await obterCarrinhoPendentePorPedido(principal.id);
+  if (carrinho) {
+    const subtotalPreview = carrinho.itens.reduce((acc, i) => acc + i.preco_base * i.quantidade, 0);
+    totalCarrinho = Math.max(0, subtotalPreview - (carrinho.desconto || 0));
+  }
+
+  const prontos = grupo.filter(p => p.status === 'concluido' || p.status === 'cancelado').length;
+  const todosProntos = prontos === grupo.length;
+
+  const subitens = grupo.map(p => {
+    const folhasEsperadas = p.paginas_por_documento
+      ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+      : calcularFolhas(p.quantidade, p.frente_verso);
+    const finalizado = p.status === 'concluido' || p.status === 'cancelado';
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:var(--sp-2);padding:6px 0;border-top:1px solid var(--c-border)">
+        <div style="min-width:0">
+          <div style="font-size:var(--t-sm)"><strong>#${p.numero_pedido}</strong> · ${p.quantidade} ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
+          <div style="font-size:10px;color:var(--c-text-3)">
+            ${labelStatusFila(p.status)} · ~${folhasEsperadas} folha${folhasEsperadas !== 1 ? 's' : ''}
+            ${p.impressora_id !== principal.impressora_id ? ` · 🖨️ ${p.impressoras?.nome || 'outra impressora'}` : ''}
+          </div>
+        </div>
+        <div style="display:flex;gap:4px;flex-shrink:0">
+          ${!finalizado ? `
+            <button class="btn btn--success btn--sm" style="padding:2px 8px" onclick="abrirModalConferencia('${p.id}')" title="Confirmar">✅</button>
+            <button class="btn btn--ghost btn--sm" style="padding:2px 8px" onclick="acaoFila('cancelar','${p.id}')" title="Cancelar">✕</button>
+          ` : `<span style="color:var(--c-success);font-size:var(--t-xs)">✓</span>`}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="pedido-card" id="pedido-grupo-${carrinhoId || principal.id}"
+         draggable="true" ondragstart="filaDragStart(event,'${principal.id}')"
+         ondragover="filaDragOver(event)" ondragleave="filaDragLeave(event)" ondrop="filaDrop(event,'${principal.id}')">
+      <div class="pedido-card-header">
+        <span class="pedido-card-num">#${principal.numero_pedido}</span>
+        <span class="pedido-card-cliente">${clienteLabel}</span>
+        <span class="badge badge--accent" title="${grupo.length} pedidos juntados no mesmo carrinho">🛒 ${grupo.length} pedidos</span>
+      </div>
+      <div class="pedido-card-body">
+        ${subitens}
+        ${espalhado ? `<div style="font-size:10px;color:var(--c-accent);margin-top:4px">🔗 Este carrinho também tem pedido(s) em outra impressora</div>` : ''}
+        ${!todosProntos ? `<div style="font-size:10px;color:var(--c-text-3);margin-top:4px">⏳ ${prontos}/${grupo.length} prontos</div>` : ''}
+      </div>
+      <div class="pedido-card-footer">
+        <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPorId('${carrinhoId}')">🛒 Carrinho</button>
+        <button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${principal.id}','${(principal.cliente_nome_pdv || '').replace(/'/g, "\\'")}','${principal.impressora_id || ''}')">🛒 +</button>
+        <span class="pedido-card-valor">${formatMoney(totalCarrinho)}</span>
+      </div>
     </div>
   `;
 }

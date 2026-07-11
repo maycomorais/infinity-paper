@@ -1766,6 +1766,7 @@ async function carregarHistoricoVendas() {
     sb.from('pedidos_copia')
       .select('*, carrinho_id')
       .eq('status', 'concluido')
+      .not('forma_pagamento', 'is', null)
       .order('created_at', { ascending: false })
       .limit(100),
   ]);
@@ -2711,7 +2712,11 @@ window.aplicarFiltroRelatorio = async function() {
   const fimISO    = new Date(fim + 'T23:59:59').toISOString();
 
   const [{ data: copias }, { data: vendas }, { data: sessoes }] = await Promise.all([
-    sb.from('pedidos_copia').select('*').eq('status', 'concluido').gte('created_at', inicioISO).lte('created_at', fimISO),
+    // 'concluido' = produção pronta, não = pago. Uma cópia só é uma VENDA de
+    // fato quando forma_pagamento foi gravada (em finalizarCarrinhoPendente
+    // ou na finalização direta do PDV) — sem isso ela ainda está pendente
+    // de pagamento na fila e não pode contar no histórico/faturamento.
+    sb.from('pedidos_copia').select('*').eq('status', 'concluido').not('forma_pagamento', 'is', null).gte('created_at', inicioISO).lte('created_at', fimISO),
     sb.from('vendas').select('*, clientes(nome)').eq('status', 'concluido').gte('created_at', inicioISO).lte('created_at', fimISO),
     sb.from('caixa_sessoes').select('*, funcionarios(nome)').gte('aberto_em', inicioISO).lte('aberto_em', fimISO).order('aberto_em', { ascending: false }),
   ]);
@@ -6114,18 +6119,30 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
 window.cancelarCarrinhoPendente = async function(carrinhoId) {
   if (!confirm('Cancelar este carrinho inteiro? Todos os pedidos de cópia vinculados serão cancelados. Essa ação não pode ser desfeita.')) return;
 
+  // IMPORTANTE: 'concluido' aqui significa "produção pronta", não "venda
+  // paga" (isso só é setado por forma_pagamento). Um carrinho pendente só
+  // existe justamente porque as cópias já estão 'concluido' aguardando
+  // pagamento — então elas TAMBÉM precisam ser canceladas aqui, senão a
+  // venda nunca é de fato cancelada e o pedido continua contando como
+  // "concluído" nos relatórios mesmo sem nunca ter sido pago.
   const { error: errPedidos } = await sb
     .from('pedidos_copia')
     .update({ status: 'cancelado' })
     .eq('carrinho_id', carrinhoId)
-    .neq('status', 'concluido');
+    .neq('status', 'cancelado');
   if (errPedidos) { toast(mensagemErroAmigavel(errPedidos, 'cancelar carrinho'), 'error'); return; }
 
+  // Remove o carrinho pendente (best-effort). pedidos_copia ainda referencia
+  // carrinho_id (mesmo cancelado) por FK, então esse delete tende a falhar
+  // com 23503 — isso é esperado e não deve bloquear o cancelamento: o que
+  // importa (status='cancelado') já foi gravado acima.
   const { error: errCarrinho } = await sb
     .from('carrinhos_pendentes')
     .delete()
     .eq('id', carrinhoId);
-  if (errCarrinho) { toast(mensagemErroAmigavel(errCarrinho, 'cancelar carrinho'), 'error'); return; }
+  if (errCarrinho) {
+    console.warn('[cancelarCarrinhoPendente] Não foi possível apagar o carrinho pendente (FK?). Pedidos já estão cancelados:', errCarrinho);
+  }
 
   await registrarLog('cancelar', 'carrinho_pendente', carrinhoId);
   toast('Carrinho cancelado.', 'info');

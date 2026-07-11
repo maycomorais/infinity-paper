@@ -5695,9 +5695,12 @@ window.refreshFila = async function() {
   // está aqui não pode sumir da fila: a impressão terminou, mas a venda
   // não. Ele só desaparece quando finalizarCarrinhoPendente() de fato
   // roda e apaga o carrinho.
-  const { data: carrinhosPendentes } = await sb.from('carrinhos_pendentes').select('id');
-  const setCarrinhosPendentes = new Set((carrinhosPendentes || []).map(c => c.id));
-  const aguardaPagamento = (p) => p.status === 'concluido' && !!p.carrinho_id && setCarrinhosPendentes.has(p.carrinho_id);
+  // Não depende mais da linha em carrinhos_pendentes existir: se ela não
+  // puder ser apagada (FK a partir de pedidos_copia/vendas — comum quando
+  // o schema não usa ON DELETE SET NULL), o carrinho ficaria "pendente
+  // pra sempre". O sinal real de "pago" é forma_pagamento gravado no
+  // pedido, que só acontece dentro de finalizarCarrinhoPendente().
+  const aguardaPagamento = (p) => p.status === 'concluido' && !!p.carrinho_id && !p.forma_pagamento;
 
   const filaBody = document.getElementById('fila-body');
   if (!filaBody) return;
@@ -5800,21 +5803,31 @@ window.refreshFila = async function() {
 window.verCarrinhoPendente = async function(pedidoId) {
   const carrinho = await obterCarrinhoPendentePorPedido(pedidoId);
   if (!carrinho) {
+    // Carrinho pendente não existe mais (delete funcionou) — mostra o resumo já finalizado.
+    const { data: pedido } = await sb.from('pedidos_copia').select('carrinho_id').eq('id', pedidoId).single();
+    if (pedido?.carrinho_id) { await exibirResumoCarrinhoFinalizado(pedido.carrinho_id); return; }
     toast('Carrinho não encontrado.', 'error');
     return;
   }
-  _carrinhoPendenteAtual = carrinho;
 
   // Busca os pedidos de cópia vinculados a este carrinho
   const { data: pedidos, error } = await sb
     .from('pedidos_copia')
-    .select('status')
+    .select('status, forma_pagamento')
     .eq('carrinho_id', carrinho.id);
 
   if (error) {
     toast('Erro ao verificar status dos pedidos', 'error');
     return;
   }
+
+  // Se já foi pago (forma_pagamento gravada), a linha em carrinhos_pendentes
+  // só não foi apagada por causa de FK — trata como finalizado, não reabre
+  // a tela de pagamento.
+  const jaPago = (pedidos || []).length > 0 && pedidos.every(p => p.forma_pagamento);
+  if (jaPago) { await exibirResumoCarrinhoFinalizado(carrinho.id); return; }
+
+  _carrinhoPendenteAtual = carrinho;
 
   // Verifica se todos estão concluídos ou cancelados
   const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
@@ -5852,8 +5865,12 @@ window.verCarrinhoPorId = async function(carrinhoId) {
   // Verifica se todos os pedidos de cópia vinculados estão concluídos ou cancelados
   const { data: pedidos } = await sb
     .from('pedidos_copia')
-    .select('status')
+    .select('status, forma_pagamento')
     .eq('carrinho_id', carrinhoId);
+
+  // Já pago, mas a linha do carrinho não foi apagada (FK) — trata como finalizado.
+  const jaPago = (pedidos || []).length > 0 && pedidos.every(p => p.forma_pagamento);
+  if (jaPago) { await exibirResumoCarrinhoFinalizado(carrinhoId); return; }
 
   const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
 
@@ -6085,9 +6102,38 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
       <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')" ${(!todosProntos || !pagamento) ? 'disabled' : ''}>
         ${!todosProntos ? '⏳ Aguardando conferência' : (!pagamento ? '⚠ Selecione a forma de pagamento' : '✅ Finalizar Venda — <span id="cp-total-btn">'+fmt(total)+'</span>')}
       </button>
+      <button class="btn btn--ghost btn--sm" style="width:100%;justify-content:center;color:var(--c-danger)" onclick="cancelarCarrinhoPendente('${carrinho.id}')">
+        ✕ Cancelar Carrinho
+      </button>
     </div>
   `;
 }
+
+// Cancela um carrinho pendente inteiro: cancela todos os pedidos de cópia
+// vinculados (preserva histórico) e apaga o registro de carrinhos_pendentes.
+window.cancelarCarrinhoPendente = async function(carrinhoId) {
+  if (!confirm('Cancelar este carrinho inteiro? Todos os pedidos de cópia vinculados serão cancelados. Essa ação não pode ser desfeita.')) return;
+
+  const { error: errPedidos } = await sb
+    .from('pedidos_copia')
+    .update({ status: 'cancelado' })
+    .eq('carrinho_id', carrinhoId)
+    .neq('status', 'concluido');
+  if (errPedidos) { toast(mensagemErroAmigavel(errPedidos, 'cancelar carrinho'), 'error'); return; }
+
+  const { error: errCarrinho } = await sb
+    .from('carrinhos_pendentes')
+    .delete()
+    .eq('id', carrinhoId);
+  if (errCarrinho) { toast(mensagemErroAmigavel(errCarrinho, 'cancelar carrinho'), 'error'); return; }
+
+  await registrarLog('cancelar', 'carrinho_pendente', carrinhoId);
+  toast('Carrinho cancelado.', 'info');
+  _modalOnBeforeClose = null;
+  closeModal();
+  _carrinhoPendenteAtual = null;
+  if (State.currentPage === 'fila') await refreshFila();
+};
 
 window.atualizarPreviewCarrinhoPendente = function(pagamento) {
   if (!_carrinhoPendenteAtual) return;
@@ -6182,9 +6228,22 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
     .neq('status', 'cancelado');
     if (errPedidos) throw errPedidos;
     console.log(`📦 Encontrados ${pedidosCopia?.length || 0} pedidos de cópia.`);
-    
+
     console.log('🔍 Pedidos encontrados:', pedidosCopia);
-    
+
+    // Idempotência: se um clique anterior já processou tudo (cópias com
+    // forma_pagamento já gravada e/ou venda de produtos já registrada pra
+    // este carrinho), mas o DELETE final falhou/foi reclicado, não
+    // reprocessa (evita duplicar venda/desconto) — só tenta remover o
+    // carrinho pendente de novo.
+    const copiasJaProcessadas = (pedidosCopia || []).length > 0 && pedidosCopia.every(p => p.forma_pagamento);
+    let vendaJaExiste = false;
+    if (itensProduto.length > 0) {
+      const { data: vendaExistente } = await sb.from('vendas').select('id').eq('carrinho_id', carrinhoId).maybeSingle();
+      vendaJaExiste = !!vendaExistente;
+    }
+
+    if (!(copiasJaProcessadas && (itensProduto.length === 0 || vendaJaExiste))) {
     const subtotalCopia = (pedidosCopia || []).reduce(
       (a, p) => a + precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb) * p.quantidade, 0);
       const subtotalProduto = itensProduto.reduce(
@@ -6196,7 +6255,6 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
         let descontoProduto   = 0;
         
         if (pedidosCopia && pedidosCopia.length > 0) {
-        console.warn('⚠️ Nenhum pedido de cópia encontrado para este carrinho.');
       const pesos = pedidosCopia.map(p => precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb) * p.quantidade);
       descontoPorPedido = distribuirValor(descontoTotal, pesos);
       const somaDescontoCopias = descontoPorPedido.reduce((a, b) => a + b, 0);
@@ -6231,9 +6289,21 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
       vendaId = await processarVendaProdutos(itensProduto, subtotalProduto, descontoProduto, pagamentoDb, clienteNome, carrinhoId);
       if (vendaId === null) { if (btn) btn.disabled = false; return; }
     }
+    }
 
-    // Remove o carrinho pendente (já finalizado)
-    await sb.from('carrinhos_pendentes').delete().eq('id', carrinhoId);
+    // Remove o carrinho pendente (best-effort). Se falhar por violação de
+    // FK (pedidos_copia/vendas ainda referenciam carrinho_id — comum se o
+    // schema não usa ON DELETE SET NULL), isso é esperado e NÃO é um erro
+    // real: a venda já foi gravada acima (forma_pagamento nas cópias +
+    // registro em vendas), que é o sinal que refreshFila() usa pra saber
+    // que o carrinho não está mais pendente. Não bloqueia o fluxo por isso.
+    const { error: errDelete } = await sb
+      .from('carrinhos_pendentes')
+      .delete()
+      .eq('id', carrinhoId);
+    if (errDelete) {
+      console.warn('[finalizarCarrinhoPendente] Não foi possível apagar o carrinho pendente (FK?). Venda já está gravada e não fica mais pendente na fila:', errDelete);
+    }
 
     toast('✅ Venda finalizada com sucesso!', 'success');
     _modalOnBeforeClose = null; // pagamento já foi escolhido — pode fechar sem confirmar

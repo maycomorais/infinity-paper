@@ -681,7 +681,14 @@ function alertarCaixaFechado() {
 }
 
 // ── MODAL ─────────────────────────────────────────────────
-function openModal(title, bodyHTML, size = '') {
+// Guarda opcional chamada antes de fechar o modal (X, clique fora, ESC).
+// Se retornar false, o fechamento é cancelado. Usado pra impedir que a
+// tela de pagamento do carrinho seja fechada "sem querer" depois que o
+// pedido já foi entregue, deixando a venda sem forma de pagamento.
+let _modalOnBeforeClose = null;
+
+function openModal(title, bodyHTML, size = '', onBeforeClose = null) {
+  _modalOnBeforeClose = onBeforeClose;
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = bodyHTML;
   const inner = document.getElementById('global-modal-inner');
@@ -689,6 +696,11 @@ function openModal(title, bodyHTML, size = '') {
   document.getElementById('global-modal').classList.add('open');
 }
 function closeModal() {
+  if (_modalOnBeforeClose) {
+    const podeFechar = _modalOnBeforeClose();
+    if (podeFechar === false) return; // guarda bloqueou o fechamento
+  }
+  _modalOnBeforeClose = null;
   document.getElementById('global-modal').classList.remove('open');
 }
 window.openModal = openModal;
@@ -1140,6 +1152,20 @@ function precoComPagamento(base, precoCartao, pagamento) {
   return valorBase;
 }
 
+// Quando o pagamento é Pix (R$ — brasileiros no Paraguai), grava também o
+// valor em reais e a cotação usada no momento da venda, pra exibir depois
+// no histórico sem depender da cotação ATUAL (que muda com o tempo).
+// QR (₲) não usa isso — é um método de pagamento paraguaio, sem conversão.
+function camposBRL(pagamento, totalGs) {
+  if (pagamento !== 'pix_brl') return {};
+  const cotacao = State.empresa?.cotacao_brl ?? State.empresa?.config?.cotacao_brl;
+  if (!cotacao) return {};
+  return {
+    valor_brl: Math.round((totalGs / cotacao) * 100) / 100,
+    cotacao_brl: cotacao,
+  };
+}
+
 function atualizarPreviewPdv() {
   const preview = document.getElementById('preview-pdv');
   if (!preview) return;
@@ -1513,7 +1539,7 @@ window.finalizarVenda = async function() {
   try {
     // ── CASO 1: Apenas produtos ──────────────────────────
     if (itensCopia.length === 0) {
-      const pagamentoDb = PdvState.pagamento === 'pix_brl' ? 'pix' : PdvState.pagamento;
+      const pagamentoDb = PdvState.pagamento;
       const subtotal = itensProduto.reduce((a, b) => a + itemTotal(b), 0);
       const desconto = Math.min(PdvState.desconto || 0, subtotal);
 
@@ -1667,6 +1693,7 @@ async function processarVendaProdutos(itensProduto, subtotal, desconto, pagament
     status: 'concluido',
     cliente_nome_pdv: clienteNomePDV,
     carrinho_id: carrinhoId,
+    ...camposBRL(pagamento, total),
   }).select().single();
 
   if (error) { toast('Erro ao registrar venda: ' + error.message, 'error'); return null; }
@@ -1797,6 +1824,10 @@ async function carregarHistoricoVendas() {
           const pagamentos = [...new Set(g.itens.map(i => i.forma_pagamento).filter(Boolean))];
           const semPagamento = pagamentos.length === 0;
           const pagamentoLabel = pagamentos.length > 1 ? 'Misto' : (pagamentos[0] ? labelPagamento(pagamentos[0]) : '—');
+          // Pix (R$) é a única forma que mostra equivalência em reais —
+          // QR (₲) é um método paraguaio, não precisa de conversão.
+          const somaBRL = g.itens.reduce((a, i) => a + (i.valor_brl || 0), 0);
+          const mostrarBRL = pagamentos.length === 1 && pagamentos[0] === 'pix_brl' && somaBRL > 0;
           // Status: se algum item não estiver concluído, mostra pendente
           const todosConcluidos = g.itens.every(i => i.status === 'concluido');
           const statusLabel = todosConcluidos ? 'Concluído' : 'Pendente';
@@ -1808,7 +1839,7 @@ async function carregarHistoricoVendas() {
               <td class="td-mono">#${g.numero}</td>
               <td>${g.itens.some(i => i.origem === 'copia') ? '🖨️ Cópia' : ''} ${g.itens.some(i => i.origem === 'venda') ? '📦 Produto' : ''}</td>
               <td>${g.cliente}</td>
-              <td><span class="badge ${semPagamento ? 'badge--danger' : 'badge--primary'}">${pagamentoLabel}</span></td>
+              <td><span class="badge ${semPagamento ? 'badge--danger' : 'badge--primary'}">${pagamentoLabel}</span>${mostrarBRL ? `<div style="font-size:10px;color:var(--c-text-3);margin-top:2px">🇧🇷 R$ ${somaBRL.toFixed(2)}</div>` : ''}</td>
               <td style="color:var(--c-success);font-weight:600">${formatMoney(g.total)}</td>
               <td><span class="badge ${badgeStatus}">${statusLabel}</span></td>
               <td class="td-mono">${formatDateTime(g.data)}</td>
@@ -1847,6 +1878,7 @@ window.verPedidoCopiaHistorico = async function(pedidoId) {
         <div>
           <div style="color:var(--c-text-3)">Pagamento</div>
           <div>${p.forma_pagamento ? labelPagamento(p.forma_pagamento) : '—'} ${p.forma_pagamento==='fiado' ? (p.fiado_quitado ? '✅ Quitado' : '⚠️ Pendente') : ''}</div>
+          ${p.forma_pagamento === 'pix_brl' && p.valor_brl ? `<div style="font-size:var(--t-xs);color:var(--c-text-3)">🇧🇷 R$ ${p.valor_brl.toFixed(2)} @ ₲${p.cotacao_brl?.toLocaleString('es-PY')}/R$</div>` : ''}
         </div>
         <div>
           <div style="color:var(--c-text-3)">Total</div>
@@ -1879,20 +1911,20 @@ function _souAdminCaixa() {
 async function _resolverItensHistorico(identificador) {
   if (identificador.startsWith('single-')) {
     const id = identificador.replace('single-', '');
-    const { data: venda } = await sb.from('vendas').select('id').eq('id', id).maybeSingle();
-    if (venda) return [{ tabela: 'venda', id }];
-    const { data: pedido } = await sb.from('pedidos_copia').select('id').eq('id', id).maybeSingle();
-    if (pedido) return [{ tabela: 'copia', id }];
+    const { data: venda } = await sb.from('vendas').select('id, total').eq('id', id).maybeSingle();
+    if (venda) return [{ tabela: 'venda', id, total: venda.total }];
+    const { data: pedido } = await sb.from('pedidos_copia').select('id, total').eq('id', id).maybeSingle();
+    if (pedido) return [{ tabela: 'copia', id, total: pedido.total }];
     return [];
   }
   const carrinhoId = identificador;
   const [{ data: vendasDoCarrinho }, { data: pedidosDoCarrinho }] = await Promise.all([
-    sb.from('vendas').select('id').eq('carrinho_id', carrinhoId),
-    sb.from('pedidos_copia').select('id').eq('carrinho_id', carrinhoId),
+    sb.from('vendas').select('id, total').eq('carrinho_id', carrinhoId),
+    sb.from('pedidos_copia').select('id, total').eq('carrinho_id', carrinhoId),
   ]);
   return [
-    ...(vendasDoCarrinho || []).map(v => ({ tabela: 'venda', id: v.id })),
-    ...(pedidosDoCarrinho || []).map(p => ({ tabela: 'copia', id: p.id })),
+    ...(vendasDoCarrinho || []).map(v => ({ tabela: 'venda', id: v.id, total: v.total })),
+    ...(pedidosDoCarrinho || []).map(p => ({ tabela: 'copia', id: p.id, total: p.total })),
   ];
 }
 
@@ -1919,12 +1951,11 @@ window.corrigirPagamentoHistorico = async function(identificador) {
 window.salvarCorrecaoPagamentoHistorico = async function(identificador) {
   let forma = document.getElementById('corrigir-pagamento-select')?.value || '';
   if (!forma) { toast('Selecione a forma de pagamento.', 'warning'); return; }
-  if (forma === 'pix_brl') forma = 'pix';
 
   const itens = await _resolverItensHistorico(identificador);
   for (const it of itens) {
     const tabela = it.tabela === 'venda' ? 'vendas' : 'pedidos_copia';
-    await sb.from(tabela).update({ forma_pagamento: forma }).eq('id', it.id);
+    await sb.from(tabela).update({ forma_pagamento: forma, ...camposBRL(forma, it.total || 0) }).eq('id', it.id);
   }
   await registrarLog('corrigir_pagamento', 'historico_caixa', identificador, { forma_pagamento: forma });
   toast('Forma de pagamento corrigida!', 'success');
@@ -3109,6 +3140,7 @@ window.verVenda = async function(vendaId) {
         <div>
           <div style="color:var(--c-text-3)">Pagamento</div>
           <div>${labelPagamento(venda.forma_pagamento)}</div>
+          ${venda.forma_pagamento === 'pix_brl' && venda.valor_brl ? `<div style="font-size:var(--t-xs);color:var(--c-text-3)">🇧🇷 R$ ${venda.valor_brl.toFixed(2)} @ ₲${venda.cotacao_brl?.toLocaleString('es-PY')}/R$</div>` : ''}
         </div>
         <div>
           <div style="color:var(--c-text-3)">Total</div>
@@ -5778,7 +5810,7 @@ window.verCarrinhoPendente = async function(pedidoId) {
 
   // Renderiza o modal com base no status
   const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
-  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg');
+  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg', _avisarFecharCarrinhoSemPagamento);
 };
 
 // Exibe o carrinho pendente a partir do ID do carrinho (não do pedido)
@@ -5822,9 +5854,22 @@ window.verCarrinhoPorId = async function(carrinhoId) {
 
   // Caso contrário, exibe o modal de finalização (com opções de edição)
   _carrinhoPendenteAtual = carrinho;
-  const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', false);
-  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg');
+  const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
+  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg', _avisarFecharCarrinhoSemPagamento);
 };
+
+// Aviso (não-bloqueante) ao fechar o modal de pagamento do carrinho sem
+// ter escolhido a forma de pagamento ainda. Fechar aqui é sempre seguro:
+// nada é gravado no banco até finalizarCarrinhoPendente() rodar de fato
+// (a venda dos produtos e a forma de pagamento das cópias só são escritas
+// no clique em "Finalizar Venda"). Então, em vez de travar o operador com
+// um confirm() nativo, só avisamos e deixamos fechar — o card continua
+// ali na fila, com o 🛒 Carrinho pronto pra retomar quando o cliente
+// (que pode estar indeciso, querendo somar mais produtos) decidir de vez.
+function _avisarFecharCarrinhoSemPagamento() {
+  toast('🛒 Carrinho continua pendente na fila — toque em "Carrinho" pra retomar e adicionar mais itens antes de finalizar.', 'info', 4500);
+  return true; // nunca bloqueia o fechamento
+}
 
 // Função auxiliar para exibir resumo de carrinho finalizado (read-only)
 async function exibirResumoCarrinhoFinalizado(carrinhoId) {
@@ -5915,10 +5960,15 @@ async function exibirResumoCarrinhoFinalizado(carrinhoId) {
   // Forma de pagamento (pega a primeira que aparecer, ou 'Misto')
   const pagamentos = [...new Set([...pedidos.map(p => p.forma_pagamento), ...vendas.map(v => v.forma_pagamento)].filter(Boolean))];
   const pagamentoLabel = pagamentos.length > 1 ? 'Misto' : (pagamentos[0] ? labelPagamento(pagamentos[0]) : '—');
+  const somaBRL = [...pedidos, ...vendas].reduce((a, x) => a + (x.valor_brl || 0), 0);
+  const mostrarBRL = pagamentos.length === 1 && pagamentos[0] === 'pix_brl' && somaBRL > 0;
   html += `
     <div style="display:flex;justify-content:space-between;padding-top:var(--sp-2);border-top:1px solid var(--c-border)">
       <span style="color:var(--c-text-3)">Pagamento</span>
-      <span><span class="badge badge--primary">${pagamentoLabel}</span></span>
+      <span style="text-align:right">
+        <span class="badge badge--primary">${pagamentoLabel}</span>
+        ${mostrarBRL ? `<div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">🇧🇷 R$ ${somaBRL.toFixed(2)}</div>` : ''}
+      </span>
     </div>
   `;
 
@@ -5936,6 +5986,12 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
   const desconto = Math.min(carrinho.desconto || 0, subtotal);
   const total = Math.max(0, subtotal - desconto);
 
+  // Quando a forma de pagamento é Pix (R$), os valores são exibidos
+  // convertidos em reais (mesma cotação usada no resto do sistema),
+  // já que em guaranis não faz sentido pro cliente que está pagando em R$.
+  const emBRL = pagamento === 'pix_brl';
+  const fmt = (v) => emBRL ? formatBRL(gsToBRL(v)) : formatMoney(v);
+
   const htmlItens = itens.map(i => {
     const precoUnit = precoComPagamento(i.preco_base, i.preco_cartao, pagamento);
     const ehProduto = i.tipo_item !== 'copia';
@@ -5945,11 +6001,11 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
         <div class="pdv-item-name">${i.tipo_item === 'copia' ? '🖨️ ' + (i.tipo_label || i.tipo) : '📦 ' + i.nome}</div>
         <div class="pdv-item-sub">
           ${(ehProduto && !readonly) ? `<button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdItemCarrinhoPendente('${carrinho.id}','${i.id}',-1)">−</button>` : ''}
-          ${i.quantidade} × ${formatMoney(precoUnit)}
+          ${i.quantidade} × ${fmt(precoUnit)}
           ${(ehProduto && !readonly) ? `<button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdItemCarrinhoPendente('${carrinho.id}','${i.id}',1)">+</button>` : ''}
         </div>
       </div>
-      <div class="pdv-item-price">${formatMoney(precoUnit * i.quantidade)}</div>
+      <div class="pdv-item-price">${fmt(precoUnit * i.quantidade)}</div>
       ${!readonly ? `<button class="pdv-remove-btn" onclick="removerItemCarrinhoPendente('${carrinho.id}','${i.id}')">✕</button>` : ''}
     </div>`;
   }).join('');
@@ -5966,6 +6022,8 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
     `;
   }
 
+  const notaBRL = emBRL ? `<div style="font-size:var(--t-xs);color:var(--c-text-3)">🇧🇷 Cotação: ₲${APP_CONFIG.cotacaoBRL.toLocaleString('es-PY')}/R$</div>` : '';
+
   if (readonly) {
     return `
       <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
@@ -5974,13 +6032,14 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
           ${htmlItens || '<div class="empty-state"><div class="empty-state-sub">Nenhum item</div></div>'}
         </div>
         <div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-text-3)">
-          <span>Subtotal</span><span id="cp-subtotal">${formatMoney(subtotal)}</span>
+          <span>Subtotal</span><span id="cp-subtotal">${fmt(subtotal)}</span>
         </div>
-        ${desconto > 0 ? `<div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-danger)"><span>Desconto</span><span id="cp-desconto">− ${formatMoney(desconto)}</span></div>` : ''}
+        ${desconto > 0 ? `<div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-danger)"><span>Desconto</span><span id="cp-desconto">− ${fmt(desconto)}</span></div>` : ''}
         <div class="pdv-total-row">
           <span class="pdv-total-label">Total</span>
-          <span class="pdv-total-value" id="cp-total">${formatMoney(total)}</span>
+          <span class="pdv-total-value" id="cp-total">${fmt(total)}</span>
         </div>
+        ${notaBRL}
         <div style="margin-top:var(--sp-3);font-size:var(--t-sm);color:var(--c-text-3);text-align:center">
           ✅ Carrinho finalizado em ${new Date().toLocaleString()}
         </div>
@@ -5997,13 +6056,14 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
         ${htmlItens || '<div class="empty-state"><div class="empty-state-sub">Nenhum item</div></div>'}
       </div>
       <div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-text-3)">
-        <span>Subtotal</span><span id="cp-subtotal">${formatMoney(subtotal)}</span>
+        <span>Subtotal</span><span id="cp-subtotal">${fmt(subtotal)}</span>
       </div>
-      ${desconto > 0 ? `<div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-danger)"><span>Desconto</span><span id="cp-desconto">− ${formatMoney(desconto)}</span></div>` : ''}
+      ${desconto > 0 ? `<div class="pdv-total-row" style="font-size:var(--t-sm);color:var(--c-danger)"><span>Desconto</span><span id="cp-desconto">− ${fmt(desconto)}</span></div>` : ''}
       <div class="pdv-total-row">
         <span class="pdv-total-label">Total</span>
-        <span class="pdv-total-value" id="cp-total">${formatMoney(total)}</span>
+        <span class="pdv-total-value" id="cp-total">${fmt(total)}</span>
       </div>
+      ${notaBRL}
       <div class="field">
         <label>Forma de Pagamento</label>
         <select class="input" id="carrinho-pendente-pagamento" onchange="atualizarPreviewCarrinhoPendente(this.value)">
@@ -6012,7 +6072,7 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
         </select>
       </div>
       <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')" ${(!todosProntos || !pagamento) ? 'disabled' : ''}>
-        ${!todosProntos ? '⏳ Aguardando conferência' : (!pagamento ? '⚠ Selecione a forma de pagamento' : '✅ Finalizar Venda — <span id="cp-total-btn">'+formatMoney(total)+'</span>')}
+        ${!todosProntos ? '⏳ Aguardando conferência' : (!pagamento ? '⚠ Selecione a forma de pagamento' : '✅ Finalizar Venda — <span id="cp-total-btn">'+fmt(total)+'</span>')}
       </button>
     </div>
   `;
@@ -6097,7 +6157,7 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
     toast('Selecione a forma de pagamento antes de finalizar.', 'warning');
     return;
   }
-  const pagamentoDb = pagamentoSelect === 'pix_brl' ? 'pix' : pagamentoSelect;
+  const pagamentoDb = pagamentoSelect;
   
   const btn = document.querySelector('#global-modal .btn--success');
   if (btn) { btn.disabled = true; }
@@ -6142,6 +6202,7 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
           desconto:        descontoPorPedido[idx],
           total:           totalItem,
           forma_pagamento: pagamentoDb,
+          ...camposBRL(pagamentoDb, totalItem),
         }).eq('id', p.id);
         if (error) {
           console.error('❌ Erro ao atualizar pedido:', error);
@@ -6164,6 +6225,7 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
     await sb.from('carrinhos_pendentes').delete().eq('id', carrinhoId);
 
     toast('✅ Venda finalizada com sucesso!', 'success');
+    _modalOnBeforeClose = null; // pagamento já foi escolhido — pode fechar sem confirmar
     closeModal();
     _carrinhoPendenteAtual = null;
     await refreshFila();
@@ -6759,7 +6821,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   // 🔍 Busca o pedido atual
   const { data: pedidoAtual, error: errPed } = await sb
     .from('pedidos_copia')
-    .select('tipo, insumo_folha_id')
+    .select('tipo, insumo_folha_id, total')
     .eq('id', pedidoId)
     .single();
 
@@ -6784,7 +6846,6 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
       toast('Selecione a forma de pagamento antes de concluir este pedido.', 'warning');
       return;
     }
-    if (formaPagamentoStandalone === 'pix_brl') formaPagamentoStandalone = 'pix';
   }
 
   if (resultado === 'refazer') {
@@ -6872,7 +6933,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     status: 'concluido',
     concluido_at: new Date().toISOString(),
     observacoes: obs ? `[Conferência] ${obs}` : null,
-    ...(formaPagamentoStandalone ? { forma_pagamento: formaPagamentoStandalone } : {}),
+    ...(formaPagamentoStandalone ? { forma_pagamento: formaPagamentoStandalone, ...camposBRL(formaPagamentoStandalone, pedidoAtual.total || 0) } : {}),
   }).eq('id', pedidoId);
 
   closeModal();

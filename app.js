@@ -5690,6 +5690,15 @@ window.refreshFila = async function() {
 
   if (error) { toast('Erro ao carregar fila: ' + error.message, 'error'); return; }
 
+  // IDs de carrinhos ainda pendentes (venda não finalizada — sem forma de
+  // pagamento escolhida ainda). Um pedido 'concluido' cujo carrinho ainda
+  // está aqui não pode sumir da fila: a impressão terminou, mas a venda
+  // não. Ele só desaparece quando finalizarCarrinhoPendente() de fato
+  // roda e apaga o carrinho.
+  const { data: carrinhosPendentes } = await sb.from('carrinhos_pendentes').select('id');
+  const setCarrinhosPendentes = new Set((carrinhosPendentes || []).map(c => c.id));
+  const aguardaPagamento = (p) => p.status === 'concluido' && !!p.carrinho_id && setCarrinhosPendentes.has(p.carrinho_id);
+
   const filaBody = document.getElementById('fila-body');
   if (!filaBody) return;
 
@@ -5719,7 +5728,7 @@ window.refreshFila = async function() {
   const colunasHtml = [];
   for (const { impressora, pedidos: peds } of Object.values(porImpressora)) {
     const pedidosFiltrados = filtroAtivo === 'todos'
-      ? peds.filter(p => p.status !== 'concluido')
+      ? peds.filter(p => p.status !== 'concluido' || aguardaPagamento(p))
       : peds.filter(p => p.status === filtroAtivo);
 
     const counts = {
@@ -5729,6 +5738,7 @@ window.refreshFila = async function() {
       erro:        peds.filter(p => p.status === 'erro').length,
     };
     const totalAtivos = counts.na_fila + counts.imprimindo + counts.conferencia + counts.erro;
+    const aguardandoPagCount = peds.filter(aguardaPagamento).length;
 
     let bodyHtml = '';
     if (pedidosFiltrados.length === 0) {
@@ -5770,6 +5780,7 @@ window.refreshFila = async function() {
           <div class="fila-coluna-nome">${impressora.nome}</div>
           ${totalAtivos > 0 ? `<span class="badge badge--warning">${totalAtivos} ativo${totalAtivos>1?'s':''}</span>` : ''}
           ${counts.imprimindo > 0 ? `<span class="badge badge--primary">⚡ Imprimindo</span>` : ''}
+          ${aguardandoPagCount > 0 ? `<span class="badge badge--accent">🛒 ${aguardandoPagCount} aguardando pagamento</span>` : ''}
         </div>
         <div class="fila-coluna-body">
           ${bodyHtml}
@@ -6267,7 +6278,14 @@ async function renderPedidoCard(p, espalhado = false) {
     imprimindo:  acaoConfirmar,
     conferencia: acaoConfirmar,
     erro:        acaoConfirmar,
-    concluido:   `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
+    // Impressão entregue, mas a venda só é considerada finalizada quando o
+    // carrinho é de fato fechado com forma de pagamento (finalizarCarrinhoPendente
+    // apaga o carrinho_pendente ao concluir). Enquanto esse carrinho existir,
+    // o card continua na fila com o botão de carrinho em destaque — nada
+    // desaparece "sozinho" antes da venda ser realmente fechada.
+    concluido: carrinho
+      ? `<button class="btn btn--success btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Finalizar Venda</button>`
+      : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
   };
 
   const podeArrastar = p.status !== 'concluido' && p.status !== 'cancelado';
@@ -6294,7 +6312,7 @@ async function renderPedidoCard(p, espalhado = false) {
       </div>
       <div class="pedido-card-footer">
         ${acoes[p.status] || ''}
-        ${(p.status !== 'concluido' && p.status !== 'cancelado') ? `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${p.id}','${(p.cliente_nome_pdv||'').replace(/'/g,"\\'")}','${p.impressora_id||''}')">🛒 +</button>` : ''}
+        ${(p.status !== 'concluido' && p.status !== 'cancelado') || carrinho ? `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${p.id}','${(p.cliente_nome_pdv||'').replace(/'/g,"\\'")}','${p.impressora_id||''}')">🛒 +</button>` : ''}
         <span class="pedido-card-valor">${formatMoney(p.total)}</span>
       </div>
       ${p.status === 'imprimindo' && p.folhas_usadas !== null ? `

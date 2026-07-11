@@ -1257,7 +1257,7 @@ function renderAbaProduto() {
           ${p.preco_cartao ? `<div style="font-size:10px;color:var(--c-text-3)">💳 ${formatMoney(p.preco_cartao)}</div>` : ''}
           <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
         </div>
-      `).join('')} || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+      `).join('') || '<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
     </div>
   `;
 }
@@ -5759,11 +5759,16 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
 
   const htmlItens = itens.map(i => {
     const precoUnit = precoComPagamento(i.preco_base, i.preco_cartao, pagamento);
+    const ehProduto = i.tipo_item !== 'copia';
     return `
     <div class="pdv-item" style="padding:var(--sp-2) 0">
       <div class="pdv-item-info">
         <div class="pdv-item-name">${i.tipo_item === 'copia' ? '🖨️ ' + (i.tipo_label || i.tipo) : '📦 ' + i.nome}</div>
-        <div class="pdv-item-sub">${i.quantidade} × ${formatMoney(precoUnit)}</div>
+        <div class="pdv-item-sub">
+          ${(ehProduto && !readonly) ? `<button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdItemCarrinhoPendente('${carrinho.id}','${i.id}',-1)">−</button>` : ''}
+          ${i.quantidade} × ${formatMoney(precoUnit)}
+          ${(ehProduto && !readonly) ? `<button class="qty-btn" style="padding:2px 8px" onclick="alterarQtdItemCarrinhoPendente('${carrinho.id}','${i.id}',1)">+</button>` : ''}
+        </div>
       </div>
       <div class="pdv-item-price">${formatMoney(precoUnit * i.quantidade)}</div>
       ${!readonly ? `<button class="pdv-remove-btn" onclick="removerItemCarrinhoPendente('${carrinho.id}','${i.id}')">✕</button>` : ''}
@@ -5840,6 +5845,25 @@ window.atualizarPreviewCarrinhoPendente = function(pagamento) {
   if (modalBody) modalBody.innerHTML = renderCarrinhoPendenteModalBody(_carrinhoPendenteAtual, pagamento);
 };
 
+window.alterarQtdItemCarrinhoPendente = async function(carrinhoId, itemId, delta) {
+  const { data: carrinho } = await sb
+    .from('carrinhos_pendentes')
+    .select('itens')
+    .eq('id', carrinhoId)
+    .single();
+
+  if (!carrinho) { toast('Carrinho não encontrado', 'error'); return; }
+
+  const itens = (carrinho.itens || []).map(i =>
+    i.id === itemId ? { ...i, quantidade: Math.max(1, (i.quantidade || 1) + delta) } : i
+  );
+  await sb.from('carrinhos_pendentes')
+    .update({ itens })
+    .eq('id', carrinhoId);
+
+  verCarrinhoPorId(carrinhoId); // recarrega o modal
+};
+
 window.removerItemCarrinhoPendente = async function(carrinhoId, itemId) {
   const { data: carrinho } = await sb
     .from('carrinhos_pendentes')
@@ -5855,7 +5879,7 @@ window.removerItemCarrinhoPendente = async function(carrinhoId, itemId) {
     .eq('id', carrinhoId);
 
   toast('Item removido', 'info');
-  verCarrinhoPendente(carrinhoId); // recarrega o modal
+  verCarrinhoPorId(carrinhoId); // recarrega o modal (carrinhoId, não pedidoId!)
 };
 
 window.finalizarCarrinhoPendente = async function(carrinhoId) {
@@ -6064,7 +6088,7 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
             ${p.preco_cartao ? `<div style="font-size:10px;color:var(--c-text-3)">💳 ${formatMoney(p.preco_cartao)}</div>` : ''}
             <div style="font-size:10px;color:var(--c-text-3)">Estoque: ${p.estoque_atual} ${p.unidade}</div>
           </div>
-        `).join('')} || '<div class="empty-state" style="padding:var(--sp-4)"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
+        `).join('') || '<div class="empty-state" style="padding:var(--sp-4)"><div class="empty-state-sub">Nenhum produto cadastrado</div></div>'}
       </div>
       <div id="fila-mini-carrinho-itens"></div>
 
@@ -6095,8 +6119,9 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
 };
 
 window.filtrarFilaMiniProdutos = function(q) {
-  document.querySelectorAll('#fila-mini-produtos .pdv-item').forEach(el => {
-    el.style.display = (el.dataset.nome||'').includes(q.toLowerCase()) ? '' : 'none';
+  document.querySelectorAll('#fila-mini-produtos .tipo-copia-btn').forEach(el => {
+    const nome = el.dataset.nome?.toLowerCase() || '';
+    el.style.display = nome.includes(q.toLowerCase()) ? '' : 'none';
   });
 };
 

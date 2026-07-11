@@ -983,7 +983,7 @@ async function renderCopias(el) {
         <div class="field">
           <label>Forma de Pagamento</label>
           <div class="payment-methods" id="payment-methods">
-            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(p => `
               <button class="payment-btn ${PdvState.pagamento===p?'selected':''}"
                       onclick="selecionarPagamento('${p}')" data-pag="${p}">
                 ${labelPagamento(p)}
@@ -1786,6 +1786,8 @@ async function carregarHistoricoVendas() {
     return;
   }
 
+  const isAdmin = State.userProfile?.role === 'admin' || State.userProfile?.role === 'adminMaster';
+
   container.innerHTML = `
     <table>
       <thead><tr><th>#</th><th>Origem</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
@@ -1793,6 +1795,7 @@ async function carregarHistoricoVendas() {
         ${grupos.map(g => {
           // Exibe a primeira forma de pagamento (ou 'Misto')
           const pagamentos = [...new Set(g.itens.map(i => i.forma_pagamento).filter(Boolean))];
+          const semPagamento = pagamentos.length === 0;
           const pagamentoLabel = pagamentos.length > 1 ? 'Misto' : (pagamentos[0] ? labelPagamento(pagamentos[0]) : '—');
           // Status: se algum item não estiver concluído, mostra pendente
           const todosConcluidos = g.itens.every(i => i.status === 'concluido');
@@ -1805,11 +1808,17 @@ async function carregarHistoricoVendas() {
               <td class="td-mono">#${g.numero}</td>
               <td>${g.itens.some(i => i.origem === 'copia') ? '🖨️ Cópia' : ''} ${g.itens.some(i => i.origem === 'venda') ? '📦 Produto' : ''}</td>
               <td>${g.cliente}</td>
-              <td><span class="badge badge--primary">${pagamentoLabel}</span></td>
+              <td><span class="badge ${semPagamento ? 'badge--danger' : 'badge--primary'}">${pagamentoLabel}</span></td>
               <td style="color:var(--c-success);font-weight:600">${formatMoney(g.total)}</td>
               <td><span class="badge ${badgeStatus}">${statusLabel}</span></td>
               <td class="td-mono">${formatDateTime(g.data)}</td>
-              <td><button class="btn btn--ghost btn--sm" onclick="verDetalhesCarrinho('${verId}')">Ver</button></td>
+              <td>
+                <div style="display:flex;gap:4px">
+                  <button class="btn btn--ghost btn--sm" onclick="verDetalhesCarrinho('${verId}')">Ver</button>
+                  ${(isAdmin && semPagamento) ? `<button class="btn btn--ghost btn--sm" style="color:var(--c-warning)" onclick="corrigirPagamentoHistorico('${verId}')" title="Definir forma de pagamento">💳</button>` : ''}
+                  ${isAdmin ? `<button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="excluirGrupoHistorico('${verId}')" title="Excluir (erro/duplicado)">🗑️</button>` : ''}
+                </div>
+              </td>
             </tr>
           `;
         }).join('')}
@@ -1852,6 +1861,144 @@ window.verPedidoCopiaHistorico = async function(pedidoId) {
     </div>
   `);
 };
+
+// ============================================================
+// ── AÇÕES ADMINISTRATIVAS DO HISTÓRICO (CAIXA) ──────────────
+// Apenas admin/adminMaster: corrigir pagamento faltante ou
+// excluir um lançamento por engano/duplicidade. A exclusão
+// devolve ao estoque o que foi consumido, quando aplicável.
+// ============================================================
+function _souAdminCaixa() {
+  const ok = State.userProfile?.role === 'admin' || State.userProfile?.role === 'adminMaster';
+  if (!ok) toast('Apenas administradores podem fazer isso.', 'warning');
+  return ok;
+}
+
+// Resolve um identificador do histórico (carrinho_id ou 'single-<id>')
+// para a lista de { tabela, id } que ele representa.
+async function _resolverItensHistorico(identificador) {
+  if (identificador.startsWith('single-')) {
+    const id = identificador.replace('single-', '');
+    const { data: venda } = await sb.from('vendas').select('id').eq('id', id).maybeSingle();
+    if (venda) return [{ tabela: 'venda', id }];
+    const { data: pedido } = await sb.from('pedidos_copia').select('id').eq('id', id).maybeSingle();
+    if (pedido) return [{ tabela: 'copia', id }];
+    return [];
+  }
+  const carrinhoId = identificador;
+  const [{ data: vendasDoCarrinho }, { data: pedidosDoCarrinho }] = await Promise.all([
+    sb.from('vendas').select('id').eq('carrinho_id', carrinhoId),
+    sb.from('pedidos_copia').select('id').eq('carrinho_id', carrinhoId),
+  ]);
+  return [
+    ...(vendasDoCarrinho || []).map(v => ({ tabela: 'venda', id: v.id })),
+    ...(pedidosDoCarrinho || []).map(p => ({ tabela: 'copia', id: p.id })),
+  ];
+}
+
+window.corrigirPagamentoHistorico = async function(identificador) {
+  if (!_souAdminCaixa()) return;
+  const itens = await _resolverItensHistorico(identificador);
+  if (itens.length === 0) { toast('Registro não encontrado.', 'error'); return; }
+
+  openModal('💳 Corrigir Forma de Pagamento', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+      <div class="section-sub">Este lançamento foi concluído sem forma de pagamento (provavelmente um pedido que ficou órfão do carrinho). Selecione a forma de pagamento correta para regularizar o caixa.</div>
+      <div class="field">
+        <label>Forma de Pagamento</label>
+        <select class="input" id="corrigir-pagamento-select">
+          <option value="" selected disabled>Selecione…</option>
+          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(fp => `<option value="${fp}">${labelPagamento(fp)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="salvarCorrecaoPagamentoHistorico('${identificador}')">✅ Salvar</button>
+    </div>
+  `);
+};
+
+window.salvarCorrecaoPagamentoHistorico = async function(identificador) {
+  let forma = document.getElementById('corrigir-pagamento-select')?.value || '';
+  if (!forma) { toast('Selecione a forma de pagamento.', 'warning'); return; }
+  if (forma === 'pix_brl') forma = 'pix';
+
+  const itens = await _resolverItensHistorico(identificador);
+  for (const it of itens) {
+    const tabela = it.tabela === 'venda' ? 'vendas' : 'pedidos_copia';
+    await sb.from(tabela).update({ forma_pagamento: forma }).eq('id', it.id);
+  }
+  await registrarLog('corrigir_pagamento', 'historico_caixa', identificador, { forma_pagamento: forma });
+  toast('Forma de pagamento corrigida!', 'success');
+  closeModal();
+  await carregarHistoricoVendas();
+};
+
+window.excluirGrupoHistorico = async function(identificador) {
+  if (!_souAdminCaixa()) return;
+  if (!confirm('Excluir este lançamento do caixa? Essa ação não pode ser desfeita. O estoque consumido (produtos e folhas) será devolvido automaticamente.')) return;
+
+  try {
+    const itens = await _resolverItensHistorico(identificador);
+    if (itens.length === 0) { toast('Registro não encontrado.', 'error'); return; }
+
+    for (const it of itens) {
+      if (it.tabela === 'venda') {
+        await _excluirVendaEReverterEstoque(it.id);
+      } else {
+        await _excluirPedidoCopiaEReverterEstoque(it.id);
+      }
+    }
+
+    toast('Lançamento excluído e estoque devolvido.', 'success');
+    await carregarHistoricoVendas();
+  } catch (err) {
+    toast('Erro ao excluir: ' + err.message, 'error');
+  }
+};
+
+async function _excluirVendaEReverterEstoque(vendaId) {
+  const { data: itensVenda } = await sb.from('venda_itens').select('*').eq('venda_id', vendaId);
+  for (const it of (itensVenda || [])) {
+    const { data: prod } = await sb.from('produtos').select('estoque_atual').eq('id', it.produto_id).single();
+    if (prod) {
+      await sb.from('produtos').update({ estoque_atual: (prod.estoque_atual || 0) + it.quantidade }).eq('id', it.produto_id);
+    }
+  }
+  await sb.from('venda_itens').delete().eq('venda_id', vendaId);
+  await sb.from('vendas').delete().eq('id', vendaId);
+  await registrarLog('excluir', 'venda', vendaId, { motivo: 'excluído via histórico do caixa' });
+}
+
+async function _excluirPedidoCopiaEReverterEstoque(pedidoId) {
+  const { data: p } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
+  if (!p) return;
+
+  if (p.status === 'concluido') {
+    const folhasConsumidas = p.folhas_usadas || p.total_folhas || 0;
+
+    // Devolve a folha (papel) específica usada nesta impressão
+    if (p.insumo_folha_id && folhasConsumidas > 0) {
+      const { data: folha } = await sb.from('produtos').select('estoque_atual').eq('id', p.insumo_folha_id).single();
+      if (folha) {
+        await sb.from('produtos').update({ estoque_atual: (folha.estoque_atual || 0) + folhasConsumidas }).eq('id', p.insumo_folha_id);
+      }
+    }
+
+    // Devolve outros insumos vinculados a este tipo de cópia (toner, tinta etc.)
+    if (p.tipo && folhasConsumidas > 0) {
+      const { data: vinculos } = await sb.from('copia_insumos').select('*').eq('tipo_copia', p.tipo);
+      for (const v of (vinculos || [])) {
+        const consumo = v.quantidade * folhasConsumidas;
+        const { data: ins } = await sb.from('produtos').select('estoque_atual').eq('id', v.insumo_id).single();
+        if (ins) {
+          await sb.from('produtos').update({ estoque_atual: (ins.estoque_atual || 0) + consumo }).eq('id', v.insumo_id);
+        }
+      }
+    }
+  }
+
+  await sb.from('pedidos_copia').delete().eq('id', pedidoId);
+  await registrarLog('excluir', 'pedido_copia', pedidoId, { motivo: 'excluído via histórico do caixa' });
+}
 
 // ── ITENS VISÍVEIS POR PERFIL ────────────────────────────
 function getVisibleNavItems() {
@@ -2496,7 +2643,7 @@ async function renderRelatorios(el) {
           <label>Pagamento</label>
           <select class="input" id="rel-pagamento">
             <option value="todos" ${f.pagamento==='todos'?'selected':''}>Todos</option>
-            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `<option value="${p}" ${f.pagamento===p?'selected':''}>${labelPagamento(p)}</option>`).join('')}
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(p => `<option value="${p}" ${f.pagamento===p?'selected':''}>${labelPagamento(p)}</option>`).join('')}
           </select>
         </div>
         <button class="btn btn--primary" onclick="aplicarFiltroRelatorio()">🔍 Filtrar</button>
@@ -2755,7 +2902,7 @@ window.abrirQuitarFiado = function(item, cliente) {
       <div class="field">
         <label>Forma de pagamento recebida agora</label>
         <select class="input" id="quitar-pagamento">
-          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito'].map(p => `<option value="${p}">${labelPagamento(p)}</option>`).join('')}
+          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia'].map(p => `<option value="${p}">${labelPagamento(p)}</option>`).join('')}
         </select>
       </div>
       <button class="btn btn--success btn--lg" style="width:100%;justify-content:center"
@@ -5450,6 +5597,7 @@ async function renderFilaProducao(el) {
         <div class="live-dot" title="Atualização automática a cada ${FILA_REFRESH_MS/1000}s"></div>
         <span style="font-size:var(--t-sm);font-weight:600">Fila de Produção</span>
         <span style="font-size:var(--t-xs);color:var(--c-text-3)" id="fila-ultima-atualizacao"></span>
+        <span style="font-size:var(--t-xs);color:var(--c-text-3)">💡 Arraste um pedido sobre outro para juntá-los no mesmo carrinho</span>
         <button class="btn btn--ghost btn--sm" onclick="limparConcluidos()">🧹 Limpar Concluídos</button>
 
         <div style="margin-left:auto;display:flex;gap:var(--sp-2);flex-wrap:wrap">
@@ -5829,7 +5977,7 @@ function renderCarrinhoPendenteModalBody(carrinho, pagamento, todosProntos = tru
         <label>Forma de Pagamento</label>
         <select class="input" id="carrinho-pendente-pagamento" onchange="atualizarPreviewCarrinhoPendente(this.value)">
           <option value="" ${!pagamento ? 'selected' : ''} disabled>Selecione a forma de pagamento…</option>
-          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','fiado'].map(p => `<option value="${p}" ${p===pagamento?'selected':''}>${labelPagamento(p)}</option>`).join('')}
+          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(p => `<option value="${p}" ${p===pagamento?'selected':''}>${labelPagamento(p)}</option>`).join('')}
         </select>
       </div>
       <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="finalizarCarrinhoPendente('${carrinho.id}')" ${(!todosProntos || !pagamento) ? 'disabled' : ''}>
@@ -6028,8 +6176,12 @@ async function renderPedidoCard(p) {
     concluido:   `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
   };
 
+  const podeArrastar = p.status !== 'concluido' && p.status !== 'cancelado';
+
   return `
-    <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}">
+    <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}"
+         ${podeArrastar ? `draggable="true" ondragstart="filaDragStart(event,'${p.id}')"` : ''}
+         ondragover="filaDragOver(event)" ondragleave="filaDragLeave(event)" ondrop="filaDrop(event,'${p.id}')">
       <div class="pedido-card-header">
         <span class="pedido-card-num">#${p.numero_pedido}</span>
         <span class="pedido-card-cliente">${clienteLabel}</span>
@@ -6058,6 +6210,93 @@ async function renderPedidoCard(p) {
   `;
 }
 
+// ============================================================
+// ── DRAG-AND-DROP: JUNTAR PEDIDOS NO MESMO CARRINHO ─────────
+// Arrastar um card de pedido sobre outro move o pedido de
+// origem (e todo o carrinho dele, se tiver) para o carrinho do
+// pedido de destino. Útil quando o cliente pediu duas coisas
+// separadas e quer pagar tudo junto na retirada.
+// ============================================================
+window.filaDragStart = function(ev, pedidoId) {
+  ev.dataTransfer.setData('text/plain', pedidoId);
+  ev.dataTransfer.effectAllowed = 'move';
+};
+
+window.filaDragOver = function(ev) {
+  ev.preventDefault();
+  ev.currentTarget.style.outline = '2px dashed var(--c-accent)';
+  ev.currentTarget.style.outlineOffset = '-2px';
+};
+
+window.filaDragLeave = function(ev) {
+  ev.currentTarget.style.outline = '';
+};
+
+window.filaDrop = async function(ev, destinoId) {
+  ev.preventDefault();
+  ev.currentTarget.style.outline = '';
+  const origemId = ev.dataTransfer.getData('text/plain');
+  if (!origemId || origemId === destinoId) return;
+  await mesclarPedidosNaFila(origemId, destinoId);
+};
+
+window.mesclarPedidosNaFila = async function(origemId, destinoId) {
+  try {
+    const [{ data: origem }, { data: destino }] = await Promise.all([
+      sb.from('pedidos_copia').select('id, carrinho_id, cliente_nome_pdv, status').eq('id', origemId).single(),
+      sb.from('pedidos_copia').select('id, carrinho_id, cliente_nome_pdv, status').eq('id', destinoId).single(),
+    ]);
+    if (!origem || !destino) { toast('Pedido não encontrado.', 'error'); return; }
+    if (['concluido', 'cancelado'].includes(origem.status) || ['concluido', 'cancelado'].includes(destino.status)) {
+      toast('Não é possível juntar pedidos já concluídos ou cancelados.', 'warning');
+      return;
+    }
+    if (origem.carrinho_id && origem.carrinho_id === destino.carrinho_id) {
+      toast('Esses pedidos já estão no mesmo carrinho.', 'info');
+      return;
+    }
+
+    // Garante que o destino tenha um carrinho pra receber o pedido de origem
+    let destinoCarrinhoId = destino.carrinho_id;
+    if (!destinoCarrinhoId) {
+      const { data: novoCarrinho, error: errNovo } = await sb.from('carrinhos_pendentes')
+        .insert({ itens: [], cliente_nome: destino.cliente_nome_pdv || null, desconto: 0 })
+        .select().single();
+      if (errNovo || !novoCarrinho) throw errNovo || new Error('Falha ao criar carrinho');
+      destinoCarrinhoId = novoCarrinho.id;
+      await sb.from('pedidos_copia').update({ carrinho_id: destinoCarrinhoId }).eq('id', destinoId);
+    }
+
+    if (origem.carrinho_id) {
+      // Origem já tinha um carrinho próprio — junta os produtos/desconto dele
+      // e move TODOS os pedidos de cópia que estavam nesse carrinho junto.
+      const [{ data: origemCarrinho }, { data: destinoCarrinho }] = await Promise.all([
+        sb.from('carrinhos_pendentes').select('*').eq('id', origem.carrinho_id).maybeSingle(),
+        sb.from('carrinhos_pendentes').select('*').eq('id', destinoCarrinhoId).single(),
+      ]);
+      if (origemCarrinho) {
+        const itensMerge = [...(destinoCarrinho.itens || []), ...(origemCarrinho.itens || [])];
+        const descontoMerge = (destinoCarrinho.desconto || 0) + (origemCarrinho.desconto || 0);
+        await sb.from('carrinhos_pendentes').update({ itens: itensMerge, desconto: descontoMerge }).eq('id', destinoCarrinhoId);
+        await sb.from('pedidos_copia').update({ carrinho_id: destinoCarrinhoId }).eq('carrinho_id', origem.carrinho_id);
+        await sb.from('carrinhos_pendentes').delete().eq('id', origem.carrinho_id);
+      } else {
+        // carrinho_id do pedido apontava pra um carrinho que não existe mais
+        await sb.from('pedidos_copia').update({ carrinho_id: destinoCarrinhoId }).eq('id', origemId);
+      }
+    } else {
+      // Pedido avulso, sem carrinho — só move ele para o carrinho de destino
+      await sb.from('pedidos_copia').update({ carrinho_id: destinoCarrinhoId }).eq('id', origemId);
+    }
+
+    await registrarLog('mesclar_carrinho', 'pedido_copia', origemId, { destino: destinoId });
+    toast('🛒 Pedidos juntados no mesmo carrinho!', 'success');
+    await refreshFila();
+  } catch (err) {
+    toast('Erro ao juntar pedidos: ' + err.message, 'error');
+  }
+};
+
 // ── Mini-carrinho dentro do card da fila ──────────────────
 // Permite, sem sair da tela de produção, vender um produto extra
 // ou adicionar mais uma impressão para o mesmo cliente do pedido.
@@ -6066,8 +6305,10 @@ let _filaMiniCarrinho = [];
 window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraId) {
   _filaMiniCarrinho = [];
   if (!State.produtosPdv || State.produtosPdv.length === 0) await carregarProdutosPdv();
+  if (!State.folhasDisponiveis || State.folhasDisponiveis.length === 0) await loadFolhasDisponiveis();
   const produtos = State.produtosPdv || [];
   const precos = State.precosCopia || [];
+  const folhas = State.folhasDisponiveis || [];
 
   openModal(`🛒 Adicionar para ${clienteNome || 'este pedido'}`, `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
@@ -6105,6 +6346,13 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
           <label>Quantidade</label>
           <input type="number" class="input" id="fila-mini-qtd" min="1" value="1" />
         </div>
+      </div>
+      <div class="field">
+        <label>Folha (papel)</label>
+        <select class="input" id="fila-mini-folha">
+          <option value="">— Selecione o papel —</option>
+          ${folhas.map(f => `<option value="${f.id}" data-nome="${f.nome}">${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})</option>`).join('')}
+        </select>
       </div>
 
       <div class="field" style="margin-bottom:0">
@@ -6151,9 +6399,16 @@ function renderFilaMiniCarrinhoItens() {
 window.confirmarMiniCarrinhoFila = async function(pedidoIdOrigem, clienteNome, impressoraId) {
   const tipoNovo   = document.getElementById('fila-mini-tipo')?.value || '';
   const qtdNovo    = parseInt(document.getElementById('fila-mini-qtd')?.value) || 1;
+  const folhaSelect = document.getElementById('fila-mini-folha');
+  const folhaId    = folhaSelect?.value || null;
+  const folhaNome  = folhaId ? (folhaSelect.selectedOptions[0]?.dataset.nome || null) : null;
 
   if (_filaMiniCarrinho.length === 0 && !tipoNovo) {
     toast('Adicione ao menos um produto ou uma impressão', 'warning');
+    return;
+  }
+  if (tipoNovo && !folhaId) {
+    toast('Selecione a folha (papel) usada nesta impressão.', 'warning');
     return;
   }
 
@@ -6224,6 +6479,8 @@ window.confirmarMiniCarrinhoFila = async function(pedidoIdOrigem, clienteNome, i
         paginas_por_documento: 1,
         total_folhas:    totalFolhas,
         carrinho_id:     pedido.carrinho_id,
+        insumo_folha_id: folhaId,
+        insumo_folha_nome: folhaNome,
       });
       if (error) throw error;
     }
@@ -6322,6 +6579,21 @@ window.abrirModalConferencia = async function(pedidoId) {
         </div>
       </div>
 
+      ${!p.carrinho_id ? `
+      <div style="background:var(--c-danger-s);border:1.5px solid var(--c-danger);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);font-weight:600;color:var(--c-danger);margin-bottom:var(--sp-2)">
+          ⚠ Este pedido não está vinculado a um carrinho — o pagamento não será pedido depois. Selecione agora:
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label>Forma de Pagamento</label>
+          <select class="input" id="conf-forma-pagamento">
+            <option value="" selected disabled>Selecione a forma de pagamento…</option>
+            ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(fp => `<option value="${fp}">${labelPagamento(fp)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      ` : ''}
+
       <!-- Resultado da conferência -->
       <div>
         <label style="font-size:var(--t-xs);font-weight:600;color:var(--c-text-2);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:var(--sp-2)">
@@ -6396,6 +6668,19 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   const folhasReal = parseInt(document.getElementById('conf-folhas-real')?.value || folhasEsperadas);
   const qtdReimp = parseInt(document.getElementById('conf-qtd-reimp')?.value || 0);
   const obs = document.getElementById('conf-obs')?.value || null;
+
+  // Pedido sem carrinho: nunca vai passar por finalizarCarrinhoPendente,
+  // então o pagamento precisa ser definido agora, senão ele "conclui" sem
+  // forma de pagamento e some do controle do caixa.
+  let formaPagamentoStandalone = null;
+  if (!carrinhoId && resultado !== 'refazer') {
+    formaPagamentoStandalone = document.getElementById('conf-forma-pagamento')?.value || '';
+    if (!formaPagamentoStandalone) {
+      toast('Selecione a forma de pagamento antes de concluir este pedido.', 'warning');
+      return;
+    }
+    if (formaPagamentoStandalone === 'pix_brl') formaPagamentoStandalone = 'pix';
+  }
 
   if (resultado === 'refazer') {
     await sb.from('pedidos_copia').update({
@@ -6482,6 +6767,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     status: 'concluido',
     concluido_at: new Date().toISOString(),
     observacoes: obs ? `[Conferência] ${obs}` : null,
+    ...(formaPagamentoStandalone ? { forma_pagamento: formaPagamentoStandalone } : {}),
   }).eq('id', pedidoId);
 
   closeModal();

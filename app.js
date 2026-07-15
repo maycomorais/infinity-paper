@@ -1816,11 +1816,37 @@ async function carregarHistoricoVendas() {
 
   const isAdmin = State.userProfile?.role === 'admin' || State.userProfile?.role === 'adminMaster';
 
+  // Rótulo amigável para o cabeçalho de cada dia (Hoje / Ontem / data)
+  const hojeKey = new Date().toDateString();
+  const ontemKey = new Date(Date.now() - 86400000).toDateString();
+  const labelDia = (dataStr) => {
+    const d = new Date(dataStr);
+    const key = d.toDateString();
+    if (key === hojeKey) return 'Hoje';
+    if (key === ontemKey) return 'Ontem';
+    return new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' }).format(d);
+  };
+
+  let diaAtual = null;
+
   container.innerHTML = `
     <table>
       <thead><tr><th>#</th><th>Origem</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
       <tbody>
         ${grupos.map(g => {
+          const chaveDia = new Date(g.data).toDateString();
+          let cabecalhoDia = '';
+          if (chaveDia !== diaAtual) {
+            diaAtual = chaveDia;
+            const totalDia = grupos.filter(x => new Date(x.data).toDateString() === chaveDia).reduce((a, x) => a + x.total, 0);
+            cabecalhoDia = `
+              <tr class="historico-dia-header">
+                <td colspan="8" style="background:var(--c-bg);font-weight:700;padding:var(--sp-2) var(--sp-3);text-transform:capitalize">
+                  📅 ${labelDia(g.data)} <span style="font-weight:400;color:var(--c-text-3);font-size:var(--t-xs)">— total do dia: ${formatMoney(totalDia)}</span>
+                </td>
+              </tr>`;
+          }
+          return cabecalhoDia + (() => {
           // Exibe a primeira forma de pagamento (ou 'Misto')
           const pagamentos = [...new Set(g.itens.map(i => i.forma_pagamento).filter(Boolean))];
           const semPagamento = pagamentos.length === 0;
@@ -1853,6 +1879,7 @@ async function carregarHistoricoVendas() {
               </td>
             </tr>
           `;
+          })();
         }).join('')}
       </tbody>
     </table>
@@ -3895,9 +3922,18 @@ async function renderContas(el) {
       </div>
     </div>
     ` : ''}
+
+    <!-- ABAS DE FILTRO -->
+    <div class="tabs" style="margin-bottom:var(--sp-4);">
+      <button class="tab-btn active" data-status="todos" onclick="filtrarContasPorStatus('todos', this)">Todas</button>
+      <button class="tab-btn" data-status="pendente" onclick="filtrarContasPorStatus('pendente', this)">A Vencer</button>
+      <button class="tab-btn" data-status="vencida" onclick="filtrarContasPorStatus('vencida', this)">Vencidas</button>
+      <button class="tab-btn" data-status="paga" onclick="filtrarContasPorStatus('paga', this)">Quitadas</button>
+    </div>
+
     <div class="card">
       <div class="table-wrap">
-        <table>
+        <table id="tabela-contas">
           <thead>
             <tr><th>Descrição</th><th>Tipo</th><th>Valor</th><th>Vencimento</th><th>Status</th><th>Categoria</th><th></th></tr>
           </thead>
@@ -3905,7 +3941,7 @@ async function renderContas(el) {
             ${(contas||[]).map(c => {
               const vencida = !c.pago_em && new Date(c.vencimento) < new Date();
               const status = c.pago_em ? 'paga' : vencida ? 'vencida' : 'pendente';
-              return `<tr>
+              return `<tr data-status="${status}">
                 <td style="font-weight:500">${c.descricao} ${c.fixa ? '<span class="badge badge--accent" title="Conta fixa — repete todo mês">🔁 Fixa</span>' : ''}</td>
                 <td><span class="badge ${c.tipo==='receita'?'badge--success':'badge--danger'}">${c.tipo==='receita'?'Receita':'Despesa'}</span></td>
                 <td style="font-weight:600;color:${c.tipo==='receita'?'var(--c-success)':'var(--c-danger)'}">${formatMoney(c.valor)}</td>
@@ -3923,6 +3959,16 @@ async function renderContas(el) {
       </div>
     </div>
   `;
+
+  // Filtro por aba: A Vencer / Vencidas / Quitadas / Todas
+  window.filtrarContasPorStatus = function(status, btn) {
+    document.querySelectorAll('#page-content .tabs .tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('#tabela-contas tbody tr').forEach(tr => {
+      if (!tr.dataset.status) return; // linha de "vazio"
+      tr.style.display = (status === 'todos' || tr.dataset.status === status) ? '' : 'none';
+    });
+  };
 }
 
 // abrirModalConta(): cria uma nova conta.
@@ -4677,6 +4723,7 @@ async function renderPrecos(el) {
                 <td style="display:flex;gap:4px">
                   <button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️</button>
                   <button class="btn btn--ghost btn--sm" onclick="gerenciarInsumosCopia('${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Vincular insumos consumidos por folha">🧩</button>
+                  <button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="excluirPreco('${p.id}','${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Excluir tipo de cópia">🗑️</button>
                 </td>
               </tr>
             `).join('')}
@@ -4748,7 +4795,15 @@ window.salvarNovoPreco = async function() {
   });
 
   if (error) {
-    toast('Erro ao criar: ' + error.message, 'error');
+    // A coluna "tipo" no banco é um ENUM do Postgres — só aceita os valores
+    // que já existem cadastrados nele. Rode a migração SQL (script enviado
+    // à parte) convertendo essa coluna para texto livre para liberar
+    // qualquer identificador novo direto pela tela.
+    if (error.code === '22P02' || /invalid input value for enum/i.test(error.message)) {
+      toast('Esse identificador não existe no banco (coluna é ENUM). É preciso rodar a migração SQL — veja as instruções.', 'error', 6000);
+    } else {
+      toast('Erro ao criar: ' + error.message, 'error');
+    }
     return;
   }
 
@@ -4756,6 +4811,25 @@ window.salvarNovoPreco = async function() {
   closeModal();
   await loadPrecosCopia(); // recarrega o state
   navigate('precos');       // re-renderiza a página
+};
+
+// Exclui um tipo de cópia. Remove antes os vínculos de insumo (copia_insumos)
+// para não deixar registro órfão. Pedidos já lançados no histórico mantêm o
+// identificador antigo gravado neles (não são apagados nem afetados).
+window.excluirPreco = async function(id, tipo, descricao) {
+  if (!confirm(`Excluir o tipo de cópia "${descricao}"?\n\nPedidos já registrados no histórico não serão apagados.`)) return;
+
+  await sb.from('copia_insumos').delete().eq('tipo_copia', tipo);
+  const { error } = await sb.from('precos_copia').delete().eq('id', id);
+
+  if (error) {
+    toast('Erro ao excluir: ' + error.message, 'error');
+    return;
+  }
+
+  toast('Tipo de cópia excluído!', 'success');
+  await loadPrecosCopia();
+  navigate('precos');
 };
 
 window.editarPreco = async function(id) {

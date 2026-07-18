@@ -42,6 +42,8 @@ function salvarEstadoPdv() {
       tipoCopia: PdvState.tipoCopia,
       quantidade: PdvState.quantidade,
       frenteVerso: PdvState.frenteVerso,
+      folhaSelecionada: PdvState.folhaSelecionada,
+      cobrarFolha: PdvState.cobrarFolha,
       paginasPorDocumento: PdvState.paginasPorDocumento,
       step: PdvState.step,
       aba: PdvState.aba,
@@ -622,7 +624,7 @@ async function navigate(pageId) {
 async function loadFolhasDisponiveis() {
   const { data } = await sb
     .from('produtos')
-    .select('id, nome, unidade, estoque_atual')
+    .select('id, nome, unidade, estoque_atual, preco_venda')
     .eq('usado_na_impressao', true)  // apenas o flag
     .order('nome');
   State.folhasDisponiveis = data || [];
@@ -893,6 +895,7 @@ const PdvState = {
   quantidade: 1,
   frenteVerso: false,
   folhaSelecionada: null,
+  cobrarFolha: false, // se true, soma o preço de venda da folha (papel especial) ao total da impressão
   paginasPorDocumento: 1,
   // passo do "mini-stepper" de impressão: 1 = tipo, 2 = quantidade
   // (o antigo passo 1 — escolher impressora — foi removido; a
@@ -1173,11 +1176,20 @@ function atualizarPreviewPdv() {
 
   const { base, cartao } = getPrecoCopiaAtual();
   const precoUnit = precoComPagamento(base, cartao, PdvState.pagamento);
-  const total = precoUnit * PdvState.quantidade;
+  const subtotalCopias = precoUnit * PdvState.quantidade;
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
   const paginasPorDoc = PdvState.paginasPorDocumento || 1;
   const totalPaginas = PdvState.quantidade * paginasPorDoc;
   const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
+
+  // Sobretaxa de papel especial (ex: papel fotográfico) — só entra se o
+  // operador marcou "Cobrar preço da folha" E o papel selecionado tem
+  // preço de venda cadastrado. É somada por FOLHA, não por cópia — uma
+  // impressão de 10 páginas frente/verso usa 5 folhas, não 10.
+  const folhaAtual = (State.folhasDisponiveis || []).find(f => f.id === PdvState.folhaSelecionada);
+  const cobrarFolha = PdvState.cobrarFolha && folhaAtual?.preco_venda > 0;
+  const extraFolha = cobrarFolha ? folhaAtual.preco_venda * folhas : 0;
+  const total = subtotalCopias + extraFolha;
 
   const totalPagEl = document.getElementById('total-paginas-preview');
   const folhasEl = document.getElementById('folhas-preview');
@@ -1191,6 +1203,7 @@ function atualizarPreviewPdv() {
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">${PdvState.quantidade} × ${formatMoney(precoUnit)}${cartao ? ' <span style="opacity:.7">(preço cartão aplicado se pagar no cartão)</span>' : ''}</div>
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">📄 ${totalPaginas} páginas · ${folhas} folhas</div>
         ${PdvState.frenteVerso ? '<div style="font-size:10px;color:var(--c-accent)">✓ Frente e Verso</div>' : ''}
+        ${cobrarFolha ? `<div style="font-size:var(--t-xs);color:var(--c-warning);margin-top:2px">💰 + ${folhaAtual.nome}: ${folhas} × ${formatMoney(folhaAtual.preco_venda)} = ${formatMoney(extraFolha)}</div>` : ''}
       </div>
       <div style="font-size:var(--t-2xl);font-weight:800;color:var(--c-success)">${formatMoney(total)}</div>
     </div>
@@ -1217,6 +1230,13 @@ window.adicionarAoCarrinho = function() {
     return;
   }
 
+  // Sobretaxa de papel especial — mesmo cálculo do preview (ver atualizarPreviewPdv).
+  // Congela o preço da folha NO MOMENTO da adição ao carrinho (folha_preco_venda),
+  // pra não mudar o valor já cobrado se o preço de cadastro da folha mudar depois.
+  const folhaObj = State.folhasDisponiveis.find(f => f.id === folhaId);
+  const cobrarFolha = PdvState.cobrarFolha && folhaObj?.preco_venda > 0;
+  const extraFolhaTotal = cobrarFolha ? Math.round(folhaObj.preco_venda * folhas) : 0;
+
   PdvState.carrinho.push({
     id: uuid(),
     tipo_item: 'copia',
@@ -1232,6 +1252,9 @@ window.adicionarAoCarrinho = function() {
     total_folhas: folhas,
     folha_id: folhaId,
     folha_nome: folhaNome,
+    cobrar_folha: cobrarFolha,
+    folha_preco_venda: cobrarFolha ? folhaObj.preco_venda : 0,
+    extra_folha_total: extraFolhaTotal,
   });
 
   atualizarCarrinhoUI();
@@ -1242,6 +1265,7 @@ window.adicionarAoCarrinho = function() {
   PdvState.tipoCopia = null;
   PdvState.quantidade = 1;
   PdvState.folhaSelecionada = null;
+  PdvState.cobrarFolha = false;
   renderAbaCopia_refresh();
   salvarEstadoPdv()
 };
@@ -1346,7 +1370,10 @@ function itemPrecoUnitario(item) {
   return precoComPagamento(item.preco_base, item.preco_cartao, PdvState.pagamento);
 }
 function itemTotal(item) {
-  return itemPrecoUnitario(item) * item.quantidade;
+  // extra_folha_total é um valor fixo (folhas × preço da folha), somado por
+  // fora do "unitário × quantidade" — não é per-cópia, é per-FOLHA, e a
+  // conta de folhas já considera frente/verso e páginas por documento.
+  return itemPrecoUnitario(item) * item.quantidade + (item.extra_folha_total || 0);
 }
 
 // ── CARRINHO ÚNICO ─────────────────────────────────────────
@@ -1405,6 +1432,7 @@ function atualizarCarrinhoUI() {
             <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
             <div class="pdv-item-sub">📄 Folha: ${item.folha_nome || '—'}</div>
             <div class="pdv-item-sub">${formatMoney(precoUnit)}/un</div>
+            ${item.extra_folha_total > 0 ? `<div class="pdv-item-sub" style="color:var(--c-warning)">💰 + papel especial: ${formatMoney(item.extra_folha_total)}</div>` : ''}
           </div>
           <div class="pdv-item-price">${formatMoney(tot)}</div>
           <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
@@ -1588,7 +1616,12 @@ window.finalizarVenda = async function() {
         preco_base:      item.preco_base,
         preco_cartao:    item.preco_cartao,
         desconto:        0,  // provisório – será recalculado na retirada
-        total:           Math.round(item.preco_base * item.quantidade),
+        // total inclui a sobretaxa de papel especial, se marcada (ver
+        // itemTotal()/adicionarAoCarrinho). extra_folha é gravado à parte
+        // pra sobreviver ao recálculo de total que acontece na retirada
+        // (finalizarCarrinhoPendente reconstrói o total do zero ali).
+        total:           Math.round(item.preco_base * item.quantidade) + (item.extra_folha_total || 0),
+        extra_folha:     item.extra_folha_total || 0,
         status:          'na_fila',
         forma_pagamento: null,
         cliente_nome_pdv: clienteNomePDV,
@@ -1816,37 +1849,38 @@ async function carregarHistoricoVendas() {
 
   const isAdmin = State.userProfile?.role === 'admin' || State.userProfile?.role === 'adminMaster';
 
-  // Rótulo amigável para o cabeçalho de cada dia (Hoje / Ontem / data)
-  const hojeKey = new Date().toDateString();
-  const ontemKey = new Date(Date.now() - 86400000).toDateString();
-  const labelDia = (dataStr) => {
+  // Chave de dia-calendário (local) usada para agrupar e detectar troca de dia.
+  // Baseada nos componentes de data locais — mesmo critério usado por formatDate/formatDateTime,
+  // então o cabeçalho bate exatamente com o que aparece na coluna "Data" de cada linha.
+  const diaKey = (dataStr) => {
     const d = new Date(dataStr);
-    const key = d.toDateString();
-    if (key === hojeKey) return 'Hoje';
-    if (key === ontemKey) return 'Ontem';
-    return new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' }).format(d);
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
   };
 
-  let diaAtual = null;
+  // Conta quantas vendas caem em cada dia, e soma o total geral + total por
+  // forma de pagamento — usado no cabeçalho de cada dia ("Total do dia" e a
+  // quebra por meio de pagamento, ex: Efectivo ₲50.000 · Crédito ₲71.000).
+  // Soma por ITEM (não por grupo), pois um carrinho pode ter itens com
+  // formas de pagamento diferentes (ex: parte em dinheiro, parte fiado).
+  const resumoPorDia = grupos.reduce((acc, g) => {
+    const k = diaKey(g.data);
+    if (!acc[k]) acc[k] = { qtd: 0, total: 0, porPagamento: {} };
+    acc[k].qtd += 1;
+    acc[k].total += g.total;
+    g.itens.forEach(i => {
+      const forma = i.forma_pagamento || 'sem_forma';
+      acc[k].porPagamento[forma] = (acc[k].porPagamento[forma] || 0) + (i.total || 0);
+    });
+    return acc;
+  }, {});
+
+  let ultimoDia = null;
 
   container.innerHTML = `
     <table>
       <thead><tr><th>#</th><th>Origem</th><th>Cliente</th><th>Pagamento</th><th>Total</th><th>Status</th><th>Data</th><th></th></tr></thead>
       <tbody>
         ${grupos.map(g => {
-          const chaveDia = new Date(g.data).toDateString();
-          let cabecalhoDia = '';
-          if (chaveDia !== diaAtual) {
-            diaAtual = chaveDia;
-            const totalDia = grupos.filter(x => new Date(x.data).toDateString() === chaveDia).reduce((a, x) => a + x.total, 0);
-            cabecalhoDia = `
-              <tr class="historico-dia-header">
-                <td colspan="8" style="background:var(--c-bg);font-weight:700;padding:var(--sp-2) var(--sp-3);text-transform:capitalize">
-                  📅 ${labelDia(g.data)} <span style="font-weight:400;color:var(--c-text-3);font-size:var(--t-xs)">— total do dia: ${formatMoney(totalDia)}</span>
-                </td>
-              </tr>`;
-          }
-          return cabecalhoDia + (() => {
           // Exibe a primeira forma de pagamento (ou 'Misto')
           const pagamentos = [...new Set(g.itens.map(i => i.forma_pagamento).filter(Boolean))];
           const semPagamento = pagamentos.length === 0;
@@ -1861,7 +1895,33 @@ async function carregarHistoricoVendas() {
           const badgeStatus = todosConcluidos ? 'badge--success' : 'badge--warning';
           // Identificador para o botão "Ver"
           const verId = g.carrinho_id ? g.carrinho_id : `single-${g.itens[0]?.id}`;
-          return `
+
+          // Cabeçalho de dia: só é inserido quando o dia muda em relação à linha anterior.
+          const k = diaKey(g.data);
+          let headerRow = '';
+          if (k !== ultimoDia) {
+            ultimoDia = k;
+            const resumo = resumoPorDia[k];
+            // Maior valor primeiro — o meio mais usado no dia aparece à esquerda.
+            const chipsPagamento = Object.entries(resumo.porPagamento)
+              .sort((a, b) => b[1] - a[1])
+              .map(([forma, valor]) => `
+                <span class="table-day-header__chip">${forma === 'sem_forma' ? '❓ Sem forma' : labelPagamento(forma)} <strong>${formatMoney(valor)}</strong></span>
+              `).join('');
+            headerRow = `
+            <tr class="table-day-header">
+              <td colspan="8">
+                <div class="table-day-header__row">
+                  <span class="table-day-header__label">📅 Vendas dia ${formatDate(g.data)}</span>
+                  <span class="table-day-header__count">${resumo.qtd} ${resumo.qtd === 1 ? 'venda' : 'vendas'}</span>
+                  <span class="table-day-header__total">Total do dia: ${formatMoney(resumo.total)}</span>
+                </div>
+                <div class="table-day-header__breakdown">${chipsPagamento}</div>
+              </td>
+            </tr>`;
+          }
+
+          return `${headerRow}
             <tr>
               <td class="td-mono">#${g.numero}</td>
               <td>${g.itens.some(i => i.origem === 'copia') ? '🖨️ Cópia' : ''} ${g.itens.some(i => i.origem === 'venda') ? '📦 Produto' : ''}</td>
@@ -1879,7 +1939,6 @@ async function carregarHistoricoVendas() {
               </td>
             </tr>
           `;
-          })();
         }).join('')}
       </tbody>
     </table>
@@ -1916,6 +1975,7 @@ window.verPedidoCopiaHistorico = async function(pedidoId) {
       <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-3)">
         <div>${labelTipoCopia(p.tipo)} — ${p.quantidade} cópias${p.frente_verso ? ' (frente e verso)' : ''}</div>
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">Impressora: ${p.impressoras?.nome || '—'} · ${p.total_folhas || 0} folhas</div>
+        ${p.extra_folha > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-warning)">💰 Papel especial (${p.insumo_folha_nome || 'folha'}): +${formatMoney(p.extra_folha)}</div>` : ''}
         ${p.desconto > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-danger)">Desconto: ${formatMoney(p.desconto)}</div>` : ''}
       </div>
     </div>
@@ -2770,6 +2830,24 @@ window.aplicarFiltroRelatorio = async function() {
   const totalGeral = linhas.reduce((a, b) => a + b.total, 0);
   const totalCopia = linhas.filter(l => l.origem === 'copia').reduce((a, b) => a + b.total, 0);
   const totalVenda = linhas.filter(l => l.origem === 'venda').reduce((a, b) => a + b.total, 0);
+
+  // Quebra por forma de pagamento — soma e contagem de transações de cada meio.
+  // Segue a mesma ordem usada no filtro "Pagamento" acima, pra manter consistência visual.
+  const ORDEM_PAGAMENTOS = ['dinheiro', 'pix', 'pix_brl', 'cartao_debito', 'cartao_credito', 'transferencia', 'fiado'];
+  const porPagamento = linhas.reduce((acc, l) => {
+    const chave = l.pagamento || 'sem_forma';
+    if (!acc[chave]) acc[chave] = { total: 0, qtd: 0 };
+    acc[chave].total += l.total;
+    acc[chave].qtd += 1;
+    return acc;
+  }, {});
+  // Só entra na lista de exibição se houver alguma transação nesse meio nas
+  // 'sem_forma' (edge case: venda concluída sem forma de pagamento registrada).
+  const chavesPagamentoExibir = [
+    ...ORDEM_PAGAMENTOS,
+    ...Object.keys(porPagamento).filter(k => k === 'sem_forma'),
+  ];
+
   const resumoEl = document.getElementById('relatorio-resumo');
   if (resumoEl) {
     resumoEl.innerHTML = `
@@ -2787,6 +2865,20 @@ window.aplicarFiltroRelatorio = async function() {
           <div class="stat-card-label">📦 Produtos</div>
           <div class="stat-card-value" style="color:var(--c-success)">${formatMoney(totalVenda)}</div>
         </div>
+      </div>
+
+      <div style="font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--c-text-3);margin-bottom:var(--sp-2)">💳 Por forma de pagamento</div>
+      <div class="stat-grid stat-grid--compact" style="margin-bottom:var(--sp-4)">
+        ${chavesPagamentoExibir.map(chave => {
+          const dados = porPagamento[chave] || { total: 0, qtd: 0 };
+          const label = chave === 'sem_forma' ? '❓ Sem forma' : labelPagamento(chave);
+          return `
+          <div class="stat-card stat-card--compact">
+            <div class="stat-card-label">${label}</div>
+            <div class="stat-card-value">${formatMoney(dados.total)}</div>
+            <div class="stat-card-sub">${dados.qtd} ${dados.qtd === 1 ? 'transação' : 'transações'}</div>
+          </div>`;
+        }).join('')}
       </div>
     `;
   }
@@ -3905,6 +3997,17 @@ async function renderContas(el) {
   const alertaVencidas = contasAlerta.filter(c => c.vencimento < hojeStr);
   const alertaProximas = contasAlerta.filter(c => c.vencimento >= hojeStr);
 
+  // Contagem por aba (A vencer / Vencidas / Quitadas / Todas) — usada nos
+  // números ao lado de cada botão de filtro. Mesma regra de status usada
+  // nas linhas da tabela abaixo, calculada uma única vez aqui pra não repetir.
+  const contasStatusCount = (contas || []).reduce((acc, c) => {
+    const vencida = !c.pago_em && c.vencimento < hojeStr;
+    const chave = c.pago_em ? 'quitada' : vencida ? 'vencida' : 'a_vencer';
+    acc[chave] += 1;
+    acc.todas += 1;
+    return acc;
+  }, { todas: 0, a_vencer: 0, vencida: 0, quitada: 0 });
+
   el.innerHTML = `
     <div class="section-header">
       <div><div class="section-title">Contas a Pagar / Receber</div>
@@ -3925,10 +4028,10 @@ async function renderContas(el) {
 
     <!-- ABAS DE FILTRO -->
     <div class="tabs" style="margin-bottom:var(--sp-4);">
-      <button class="tab-btn active" data-status="todos" onclick="filtrarContasPorStatus('todos', this)">Todas</button>
-      <button class="tab-btn" data-status="pendente" onclick="filtrarContasPorStatus('pendente', this)">A Vencer</button>
-      <button class="tab-btn" data-status="vencida" onclick="filtrarContasPorStatus('vencida', this)">Vencidas</button>
-      <button class="tab-btn" data-status="paga" onclick="filtrarContasPorStatus('paga', this)">Quitadas</button>
+      <button class="tab-btn active" data-status="todas" onclick="filtrarContasPorStatus('todas', this)">Todas <span class="tab-btn-count">${contasStatusCount.todas}</span></button>
+      <button class="tab-btn" data-status="a_vencer" onclick="filtrarContasPorStatus('a_vencer', this)">A vencer <span class="tab-btn-count">${contasStatusCount.a_vencer}</span></button>
+      <button class="tab-btn" data-status="vencida" onclick="filtrarContasPorStatus('vencida', this)">Vencidas <span class="tab-btn-count">${contasStatusCount.vencida}</span></button>
+      <button class="tab-btn" data-status="quitada" onclick="filtrarContasPorStatus('quitada', this)">Quitadas <span class="tab-btn-count">${contasStatusCount.quitada}</span></button>
     </div>
 
     <div class="card">
@@ -3939,9 +4042,10 @@ async function renderContas(el) {
           </thead>
           <tbody>
             ${(contas||[]).map(c => {
-              const vencida = !c.pago_em && new Date(c.vencimento) < new Date();
+              const vencida = !c.pago_em && c.vencimento < hojeStr;
               const status = c.pago_em ? 'paga' : vencida ? 'vencida' : 'pendente';
-              return `<tr data-status="${status}">
+              const statusFiltro = c.pago_em ? 'quitada' : vencida ? 'vencida' : 'a_vencer';
+              return `<tr data-status="${statusFiltro}">
                 <td style="font-weight:500">${c.descricao} ${c.fixa ? '<span class="badge badge--accent" title="Conta fixa — repete todo mês">🔁 Fixa</span>' : ''}</td>
                 <td><span class="badge ${c.tipo==='receita'?'badge--success':'badge--danger'}">${c.tipo==='receita'?'Receita':'Despesa'}</span></td>
                 <td style="font-weight:600;color:${c.tipo==='receita'?'var(--c-success)':'var(--c-danger)'}">${formatMoney(c.valor)}</td>
@@ -3956,18 +4060,29 @@ async function renderContas(el) {
             }).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-icon">📋</div><div class="empty-state-sub">Nenhuma conta cadastrada</div></div></td></tr>'}
           </tbody>
         </table>
+        <div id="contas-filtro-vazio" class="empty-state" style="padding:var(--sp-8);display:none">
+          <div class="empty-state-icon">📋</div>
+          <div class="empty-state-sub">Nenhuma conta nesta aba</div>
+        </div>
       </div>
     </div>
   `;
 
-  // Filtro por aba: A Vencer / Vencidas / Quitadas / Todas
+  // Filtro por aba (A vencer / Vencidas / Quitadas / Todas) — 100% client-side,
+  // sem nova query: os dados já foram carregados acima, só alterna a visibilidade das linhas.
   window.filtrarContasPorStatus = function(status, btn) {
-    document.querySelectorAll('#page-content .tabs .tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#page-content .tab-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    document.querySelectorAll('#tabela-contas tbody tr').forEach(tr => {
-      if (!tr.dataset.status) return; // linha de "vazio"
-      tr.style.display = (status === 'todos' || tr.dataset.status === status) ? '' : 'none';
+
+    let visiveis = 0;
+    document.querySelectorAll('#tabela-contas tbody tr[data-status]').forEach(tr => {
+      const mostra = status === 'todas' || tr.dataset.status === status;
+      tr.style.display = mostra ? '' : 'none';
+      if (mostra) visiveis++;
     });
+
+    const vazio = document.getElementById('contas-filtro-vazio');
+    if (vazio) vazio.style.display = visiveis === 0 ? '' : 'none';
   };
 }
 
@@ -4487,6 +4602,7 @@ function renderStepTipoCopia() {
 }
 
 function renderStepQuantidade() {
+  const folhaAtual = (State.folhasDisponiveis || []).find(f => f.id === PdvState.folhaSelecionada);
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Quantidade e Opções</span></div>
@@ -4507,11 +4623,18 @@ function renderStepQuantidade() {
           <select class="input" id="select-folha" onchange="selecionarFolha(this.value)">
             <option value="">— Selecione uma folha —</option>
             ${(State.folhasDisponiveis || []).map(f => `
-              <option value="${f.id}" data-nome="${f.nome}" ${PdvState.folhaSelecionada === f.id ? 'selected' : ''}>
-                ${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})
+              <option value="${f.id}" data-nome="${f.nome}" data-preco="${f.preco_venda || 0}" ${PdvState.folhaSelecionada === f.id ? 'selected' : ''}>
+                ${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})${f.preco_venda > 0 ? ` — ${formatMoney(f.preco_venda)}/folha` : ''}
               </option>
             `).join('')}
           </select>
+        </div>
+        <div class="field" id="campo-cobrar-folha" style="display:${folhaAtual && folhaAtual.preco_venda > 0 ? 'block' : 'none'};margin-top:var(--sp-2)">
+          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-warning);border-radius:var(--r-md);background:var(--c-bg)">
+            <input type="checkbox" id="chk-cobrar-folha" ${PdvState.cobrarFolha ? 'checked' : ''}
+                   onchange="PdvState.cobrarFolha=this.checked;atualizarPreviewPdv()">
+            <span>💰 Cobrar preço da folha nesta impressão <strong id="cobrar-folha-preco">${folhaAtual && folhaAtual.preco_venda > 0 ? `(+${formatMoney(folhaAtual.preco_venda)}/folha)` : ''}</strong></span>
+          </label>
         </div>
           </div>
           <div class="field">
@@ -4617,7 +4740,20 @@ async function renderImpressoras(el) {
 
 window.selecionarFolha = function(folhaId) {
   PdvState.folhaSelecionada = folhaId;
+  // Reseta o "cobrar folha" ao trocar de papel — evita carregar sem querer
+  // uma sobretaxa pensada pro papel anterior para o novo papel selecionado.
+  PdvState.cobrarFolha = false;
+
+  const folha = (State.folhasDisponiveis || []).find(f => f.id === folhaId);
+  const campo = document.getElementById('campo-cobrar-folha');
+  const chk = document.getElementById('chk-cobrar-folha');
+  const precoLabel = document.getElementById('cobrar-folha-preco');
+  if (campo) campo.style.display = (folha && folha.preco_venda > 0) ? 'block' : 'none';
+  if (chk) chk.checked = false;
+  if (precoLabel) precoLabel.textContent = (folha && folha.preco_venda > 0) ? `(+${formatMoney(folha.preco_venda)}/folha)` : '';
+
   salvarEstadoPdv();
+  atualizarPreviewPdv();
 };
 
 window.abrirModalImpressora = function(imp={}) {
@@ -4723,7 +4859,6 @@ async function renderPrecos(el) {
                 <td style="display:flex;gap:4px">
                   <button class="btn btn--ghost btn--sm" onclick="editarPreco('${p.id}')">✏️</button>
                   <button class="btn btn--ghost btn--sm" onclick="gerenciarInsumosCopia('${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Vincular insumos consumidos por folha">🧩</button>
-                  <button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="excluirPreco('${p.id}','${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Excluir tipo de cópia">🗑️</button>
                 </td>
               </tr>
             `).join('')}
@@ -4795,15 +4930,7 @@ window.salvarNovoPreco = async function() {
   });
 
   if (error) {
-    // A coluna "tipo" no banco é um ENUM do Postgres — só aceita os valores
-    // que já existem cadastrados nele. Rode a migração SQL (script enviado
-    // à parte) convertendo essa coluna para texto livre para liberar
-    // qualquer identificador novo direto pela tela.
-    if (error.code === '22P02' || /invalid input value for enum/i.test(error.message)) {
-      toast('Esse identificador não existe no banco (coluna é ENUM). É preciso rodar a migração SQL — veja as instruções.', 'error', 6000);
-    } else {
-      toast('Erro ao criar: ' + error.message, 'error');
-    }
+    toast('Erro ao criar: ' + error.message, 'error');
     return;
   }
 
@@ -4811,25 +4938,6 @@ window.salvarNovoPreco = async function() {
   closeModal();
   await loadPrecosCopia(); // recarrega o state
   navigate('precos');       // re-renderiza a página
-};
-
-// Exclui um tipo de cópia. Remove antes os vínculos de insumo (copia_insumos)
-// para não deixar registro órfão. Pedidos já lançados no histórico mantêm o
-// identificador antigo gravado neles (não são apagados nem afetados).
-window.excluirPreco = async function(id, tipo, descricao) {
-  if (!confirm(`Excluir o tipo de cópia "${descricao}"?\n\nPedidos já registrados no histórico não serão apagados.`)) return;
-
-  await sb.from('copia_insumos').delete().eq('tipo_copia', tipo);
-  const { error } = await sb.from('precos_copia').delete().eq('id', id);
-
-  if (error) {
-    toast('Erro ao excluir: ' + error.message, 'error');
-    return;
-  }
-
-  toast('Tipo de cópia excluído!', 'success');
-  await loadPrecosCopia();
-  navigate('precos');
 };
 
 window.editarPreco = async function(id) {
@@ -6355,8 +6463,11 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
       for (let idx = 0; idx < pedidosCopia.length; idx++) {
         const p = pedidosCopia[idx];
         const precoUnit = precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb);
-        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx];
-        console.log(`🔄 Atualizando pedido ${p.id}: precoUnit=${precoUnit}, desconto=${descontoPorPedido[idx]}, total=${totalItem}, pagamento=${pagamentoDb}`);
+        // extra_folha (sobretaxa de papel especial) é somado DEPOIS do desconto —
+        // é repasse de custo de material, não deve ser corroído por desconto
+        // negociado sobre o valor da cópia em si.
+        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx] + (p.extra_folha || 0);
+        console.log(`🔄 Atualizando pedido ${p.id}: precoUnit=${precoUnit}, desconto=${descontoPorPedido[idx]}, extraFolha=${p.extra_folha||0}, total=${totalItem}, pagamento=${pagamentoDb}`);
         const { error } = await sb.from('pedidos_copia').update({
           preco_unitario:  Math.round(precoUnit),
           desconto:        descontoPorPedido[idx],

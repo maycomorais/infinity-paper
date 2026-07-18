@@ -347,6 +347,12 @@ input, select, textarea {
 .stat-card--accent  .stat-card-value { color: var(--c-accent); }
 .stat-card--danger  .stat-card-value { color: var(--c-danger); }
 
+/* Variante compacta — usada para grids com muitos cards (ex: por forma de pagamento) */
+.stat-grid--compact { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--sp-3); }
+.stat-card--compact { padding: var(--sp-3) var(--sp-4); gap: 4px; }
+.stat-card--compact .stat-card-value { font-size: var(--t-lg); color: var(--c-text); }
+
+
 /* ── CARDS ───────────────────────────────────────────────── */
 .card {
   background: var(--c-card);
@@ -488,6 +494,60 @@ tbody td {
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
 .td-mono { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--c-text-3); }
+
+/* ── Cabeçalho de agrupamento por dia (histórico de vendas) ── */
+.table-day-header td {
+  background: var(--c-surface);
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--c-border-2);
+  border-top: 1px solid var(--c-border-2);
+}
+.table-day-header:first-child td { border-top: none; }
+.table-day-header:hover td { background: var(--c-surface); color: inherit; } /* ignora o hover padrão de tbody tr */
+.table-day-header__label {
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: .03em;
+  color: var(--c-text);
+}
+.table-day-header__count {
+  font-size: var(--t-xs);
+  font-weight: 500;
+  color: var(--c-text-3);
+  margin-left: var(--sp-2);
+}
+.table-day-header__row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.table-day-header__total {
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--c-success);
+  margin-left: auto;
+}
+.table-day-header__breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: 6px;
+}
+.table-day-header__chip {
+  font-size: 11px;
+  color: var(--c-text-3);
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-full);
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+.table-day-header__chip strong {
+  color: var(--c-text);
+  font-weight: 700;
+  margin-left: 3px;
+}
 
 /* ── BADGES / PILLS ──────────────────────────────────────── */
 .badge {
@@ -872,6 +932,20 @@ tbody tr:hover td { background: rgba(255,255,255,.02); color: var(--c-text); }
   background: var(--c-card);
   color: var(--c-text);
   box-shadow: var(--shadow-sm);
+}
+.tab-btn-count {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--c-bg);
+  color: var(--c-text-3);
+}
+.tab-btn.active .tab-btn-count {
+  background: var(--c-primary);
+  color: #fff;
 }
 
 /* ── PROGRESS BARS ───────────────────────────────────────── */

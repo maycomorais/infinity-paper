@@ -43,7 +43,6 @@ function salvarEstadoPdv() {
       quantidade: PdvState.quantidade,
       frenteVerso: PdvState.frenteVerso,
       folhaSelecionada: PdvState.folhaSelecionada,
-      cobrarFolha: PdvState.cobrarFolha,
       paginasPorDocumento: PdvState.paginasPorDocumento,
       step: PdvState.step,
       aba: PdvState.aba,
@@ -895,7 +894,6 @@ const PdvState = {
   quantidade: 1,
   frenteVerso: false,
   folhaSelecionada: null,
-  cobrarFolha: false, // se true, soma o preço de venda da folha (papel especial) ao total da impressão
   paginasPorDocumento: 1,
   // passo do "mini-stepper" de impressão: 1 = tipo, 2 = quantidade
   // (o antigo passo 1 — escolher impressora — foi removido; a
@@ -1120,6 +1118,11 @@ window.selecionarImpressora = function(id) {
 
 window.selecionarTipoCopia = function(tipo) {
   PdvState.tipoCopia = tipo;
+  const preco = State.precosCopia.find(p => p.tipo === tipo);
+  // Tipos de "Impressão Especial" já têm um papel fixo vinculado — trava a
+  // seleção de folha automaticamente, sem depender do operador escolher
+  // o papel certo manualmente (evita erro de digitação/seleção).
+  if (preco?.papel_fixo_id) PdvState.folhaSelecionada = preco.papel_fixo_id;
   document.querySelectorAll('.tipo-copia-btn').forEach(b => {
     b.classList.toggle('selected', b.dataset.tipo === tipo);
   });
@@ -1136,13 +1139,27 @@ window.ajustarQtd = function(delta) {
   salvarEstadoPdv()
 };
 
+// Resolve o preço efetivo de um tipo de cópia (fonte única usada pelo PDV
+// principal E pelo mini-carrinho da fila, pra nunca ficar desalinhado).
+// papel_fixo_id só trava qual papel é usado nessa impressão (pra estoque e
+// pra não depender do operador escolher certo) — o preço é sempre o que
+// foi definido manualmente nos campos de preço, igual qualquer outro tipo.
+function resolverPrecoTipoCopia(preco, quantidade = 1) {
+  if (!preco) return { base: 0, cartao: null, folhaFixa: null };
+  const folhaFixa = preco.papel_fixo_id
+    ? (State.folhasDisponiveis || []).find(f => f.id === preco.papel_fixo_id) || null
+    : null;
+  let base = preco.preco_unitario;
+  if (preco.preco_desconto && quantidade >= preco.qtd_desconto) base = preco.preco_desconto;
+  return { base, cartao: preco.preco_cartao || null, folhaFixa };
+}
+
 function getPrecoCopiaAtual() {
   if (!PdvState.tipoCopia) return { base: 0, cartao: null };
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
   if (!preco) return { base: 0, cartao: null };
-  let base = preco.preco_unitario;
-  if (preco.preco_desconto && PdvState.quantidade >= preco.qtd_desconto) base = preco.preco_desconto;
-  return { base, cartao: preco.preco_cartao || null };
+  const { base, cartao } = resolverPrecoTipoCopia(preco, PdvState.quantidade);
+  return { base, cartao };
 }
 
 // Retorna o preço unitário efetivo considerando a forma de pagamento.
@@ -1176,20 +1193,11 @@ function atualizarPreviewPdv() {
 
   const { base, cartao } = getPrecoCopiaAtual();
   const precoUnit = precoComPagamento(base, cartao, PdvState.pagamento);
-  const subtotalCopias = precoUnit * PdvState.quantidade;
+  const total = precoUnit * PdvState.quantidade;
   const preco = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
   const paginasPorDoc = PdvState.paginasPorDocumento || 1;
   const totalPaginas = PdvState.quantidade * paginasPorDoc;
   const folhas = Math.ceil(totalPaginas / (PdvState.frenteVerso ? 2 : 1));
-
-  // Sobretaxa de papel especial (ex: papel fotográfico) — só entra se o
-  // operador marcou "Cobrar preço da folha" E o papel selecionado tem
-  // preço de venda cadastrado. É somada por FOLHA, não por cópia — uma
-  // impressão de 10 páginas frente/verso usa 5 folhas, não 10.
-  const folhaAtual = (State.folhasDisponiveis || []).find(f => f.id === PdvState.folhaSelecionada);
-  const cobrarFolha = PdvState.cobrarFolha && folhaAtual?.preco_venda > 0;
-  const extraFolha = cobrarFolha ? folhaAtual.preco_venda * folhas : 0;
-  const total = subtotalCopias + extraFolha;
 
   const totalPagEl = document.getElementById('total-paginas-preview');
   const folhasEl = document.getElementById('folhas-preview');
@@ -1203,7 +1211,7 @@ function atualizarPreviewPdv() {
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">${PdvState.quantidade} × ${formatMoney(precoUnit)}${cartao ? ' <span style="opacity:.7">(preço cartão aplicado se pagar no cartão)</span>' : ''}</div>
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">📄 ${totalPaginas} páginas · ${folhas} folhas</div>
         ${PdvState.frenteVerso ? '<div style="font-size:10px;color:var(--c-accent)">✓ Frente e Verso</div>' : ''}
-        ${cobrarFolha ? `<div style="font-size:var(--t-xs);color:var(--c-warning);margin-top:2px">💰 + ${folhaAtual.nome}: ${folhas} × ${formatMoney(folhaAtual.preco_venda)} = ${formatMoney(extraFolha)}</div>` : ''}
+        ${preco?.papel_fixo_id ? '<div style="font-size:10px;color:var(--c-accent)">📄 Papel travado automaticamente para este tipo</div>' : ''}
       </div>
       <div style="font-size:var(--t-2xl);font-weight:800;color:var(--c-success)">${formatMoney(total)}</div>
     </div>
@@ -1230,13 +1238,6 @@ window.adicionarAoCarrinho = function() {
     return;
   }
 
-  // Sobretaxa de papel especial — mesmo cálculo do preview (ver atualizarPreviewPdv).
-  // Congela o preço da folha NO MOMENTO da adição ao carrinho (folha_preco_venda),
-  // pra não mudar o valor já cobrado se o preço de cadastro da folha mudar depois.
-  const folhaObj = State.folhasDisponiveis.find(f => f.id === folhaId);
-  const cobrarFolha = PdvState.cobrarFolha && folhaObj?.preco_venda > 0;
-  const extraFolhaTotal = cobrarFolha ? Math.round(folhaObj.preco_venda * folhas) : 0;
-
   PdvState.carrinho.push({
     id: uuid(),
     tipo_item: 'copia',
@@ -1252,9 +1253,6 @@ window.adicionarAoCarrinho = function() {
     total_folhas: folhas,
     folha_id: folhaId,
     folha_nome: folhaNome,
-    cobrar_folha: cobrarFolha,
-    folha_preco_venda: cobrarFolha ? folhaObj.preco_venda : 0,
-    extra_folha_total: extraFolhaTotal,
   });
 
   atualizarCarrinhoUI();
@@ -1265,7 +1263,6 @@ window.adicionarAoCarrinho = function() {
   PdvState.tipoCopia = null;
   PdvState.quantidade = 1;
   PdvState.folhaSelecionada = null;
-  PdvState.cobrarFolha = false;
   renderAbaCopia_refresh();
   salvarEstadoPdv()
 };
@@ -1370,10 +1367,7 @@ function itemPrecoUnitario(item) {
   return precoComPagamento(item.preco_base, item.preco_cartao, PdvState.pagamento);
 }
 function itemTotal(item) {
-  // extra_folha_total é um valor fixo (folhas × preço da folha), somado por
-  // fora do "unitário × quantidade" — não é per-cópia, é per-FOLHA, e a
-  // conta de folhas já considera frente/verso e páginas por documento.
-  return itemPrecoUnitario(item) * item.quantidade + (item.extra_folha_total || 0);
+  return itemPrecoUnitario(item) * item.quantidade;
 }
 
 // ── CARRINHO ÚNICO ─────────────────────────────────────────
@@ -1432,7 +1426,6 @@ function atualizarCarrinhoUI() {
             <div class="pdv-item-sub">${item.impressora_nome} · ${item.quantidade} cópias${item.frente_verso?' · F/V':''}</div>
             <div class="pdv-item-sub">📄 Folha: ${item.folha_nome || '—'}</div>
             <div class="pdv-item-sub">${formatMoney(precoUnit)}/un</div>
-            ${item.extra_folha_total > 0 ? `<div class="pdv-item-sub" style="color:var(--c-warning)">💰 + papel especial: ${formatMoney(item.extra_folha_total)}</div>` : ''}
           </div>
           <div class="pdv-item-price">${formatMoney(tot)}</div>
           <button class="pdv-remove-btn" onclick="removerDoCarrinho('${item.id}')">✕</button>
@@ -1616,12 +1609,7 @@ window.finalizarVenda = async function() {
         preco_base:      item.preco_base,
         preco_cartao:    item.preco_cartao,
         desconto:        0,  // provisório – será recalculado na retirada
-        // total inclui a sobretaxa de papel especial, se marcada (ver
-        // itemTotal()/adicionarAoCarrinho). extra_folha é gravado à parte
-        // pra sobreviver ao recálculo de total que acontece na retirada
-        // (finalizarCarrinhoPendente reconstrói o total do zero ali).
-        total:           Math.round(item.preco_base * item.quantidade) + (item.extra_folha_total || 0),
-        extra_folha:     item.extra_folha_total || 0,
+        total:           Math.round(item.preco_base * item.quantidade),
         status:          'na_fila',
         forma_pagamento: null,
         cliente_nome_pdv: clienteNomePDV,
@@ -1975,7 +1963,6 @@ window.verPedidoCopiaHistorico = async function(pedidoId) {
       <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-3)">
         <div>${labelTipoCopia(p.tipo)} — ${p.quantidade} cópias${p.frente_verso ? ' (frente e verso)' : ''}</div>
         <div style="font-size:var(--t-xs);color:var(--c-text-3)">Impressora: ${p.impressoras?.nome || '—'} · ${p.total_folhas || 0} folhas</div>
-        ${p.extra_folha > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-warning)">💰 Papel especial (${p.insumo_folha_nome || 'folha'}): +${formatMoney(p.extra_folha)}</div>` : ''}
         ${p.desconto > 0 ? `<div style="font-size:var(--t-xs);color:var(--c-danger)">Desconto: ${formatMoney(p.desconto)}</div>` : ''}
       </div>
     </div>
@@ -4585,16 +4572,18 @@ function renderStepTipoCopia() {
       <div class="card-header"><span class="card-title">Escolha o tipo de cópia</span></div>
       <div class="card-body">
         <div class="tipo-copia-grid" id="tipo-copia-grid">
-          ${State.precosCopia.map(p => `
+          ${State.precosCopia.map(p => {
+            const { base } = resolverPrecoTipoCopia(p);
+            return `
             <div class="tipo-copia-btn ${PdvState.tipoCopia === p.tipo ? 'selected' : ''}"
                  data-tipo="${p.tipo}"
                  onclick="selecionarTipoCopia('${p.tipo}')">
-              <div class="tipo-copia-btn-icon">${iconeTipoCopia(p.tipo)}</div>
+              <div class="tipo-copia-btn-icon">${p.papel_fixo_id ? '📄' : iconeTipoCopia(p.tipo)}</div>
               <div class="tipo-copia-btn-name">${p.descricao}</div>
-              <div class="tipo-copia-btn-price">${formatMoney(p.preco_unitario)} /cópia</div>
+              <div class="tipo-copia-btn-price">${formatMoney(base)} /cópia</div>
               ${p.preco_desconto ? `<div style="font-size:10px;color:var(--c-text-3)">≥${p.qtd_desconto} pçs: ${formatMoney(p.preco_desconto)}</div>` : ''}
             </div>
-          `).join('')}
+          `;}).join('')}
         </div>
       </div>
     </div>
@@ -4602,7 +4591,8 @@ function renderStepTipoCopia() {
 }
 
 function renderStepQuantidade() {
-  const folhaAtual = (State.folhasDisponiveis || []).find(f => f.id === PdvState.folhaSelecionada);
+  const precoAtual = State.precosCopia.find(p => p.tipo === PdvState.tipoCopia);
+  const papelFixo = !!precoAtual?.papel_fixo_id;
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Quantidade e Opções</span></div>
@@ -4620,21 +4610,15 @@ function renderStepQuantidade() {
             </div>
             <div class="field">
           <label>📄 Tipo de Folha *</label>
-          <select class="input" id="select-folha" onchange="selecionarFolha(this.value)">
+          <select class="input" id="select-folha" onchange="selecionarFolha(this.value)" ${papelFixo ? 'disabled' : ''}>
             <option value="">— Selecione uma folha —</option>
             ${(State.folhasDisponiveis || []).map(f => `
-              <option value="${f.id}" data-nome="${f.nome}" data-preco="${f.preco_venda || 0}" ${PdvState.folhaSelecionada === f.id ? 'selected' : ''}>
-                ${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})${f.preco_venda > 0 ? ` — ${formatMoney(f.preco_venda)}/folha` : ''}
+              <option value="${f.id}" data-nome="${f.nome}" ${PdvState.folhaSelecionada === f.id ? 'selected' : ''}>
+                ${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})
               </option>
             `).join('')}
           </select>
-        </div>
-        <div class="field" id="campo-cobrar-folha" style="display:${folhaAtual && folhaAtual.preco_venda > 0 ? 'block' : 'none'};margin-top:var(--sp-2)">
-          <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer;padding:9px 12px;border:1.5px solid var(--c-warning);border-radius:var(--r-md);background:var(--c-bg)">
-            <input type="checkbox" id="chk-cobrar-folha" ${PdvState.cobrarFolha ? 'checked' : ''}
-                   onchange="PdvState.cobrarFolha=this.checked;atualizarPreviewPdv()">
-            <span>💰 Cobrar preço da folha nesta impressão <strong id="cobrar-folha-preco">${folhaAtual && folhaAtual.preco_venda > 0 ? `(+${formatMoney(folhaAtual.preco_venda)}/folha)` : ''}</strong></span>
-          </label>
+          ${papelFixo ? `<div style="font-size:var(--t-xs);color:var(--c-accent);margin-top:4px">🔒 "${precoAtual.descricao}" sempre usa este papel automaticamente.</div>` : ''}
         </div>
           </div>
           <div class="field">
@@ -4740,20 +4724,7 @@ async function renderImpressoras(el) {
 
 window.selecionarFolha = function(folhaId) {
   PdvState.folhaSelecionada = folhaId;
-  // Reseta o "cobrar folha" ao trocar de papel — evita carregar sem querer
-  // uma sobretaxa pensada pro papel anterior para o novo papel selecionado.
-  PdvState.cobrarFolha = false;
-
-  const folha = (State.folhasDisponiveis || []).find(f => f.id === folhaId);
-  const campo = document.getElementById('campo-cobrar-folha');
-  const chk = document.getElementById('chk-cobrar-folha');
-  const precoLabel = document.getElementById('cobrar-folha-preco');
-  if (campo) campo.style.display = (folha && folha.preco_venda > 0) ? 'block' : 'none';
-  if (chk) chk.checked = false;
-  if (precoLabel) precoLabel.textContent = (folha && folha.preco_venda > 0) ? `(+${formatMoney(folha.preco_venda)}/folha)` : '';
-
   salvarEstadoPdv();
-  atualizarPreviewPdv();
 };
 
 window.abrirModalImpressora = function(imp={}) {
@@ -4836,6 +4807,7 @@ window.verInstrucoesSNMP = function() {
 // ============================================================
 async function renderPrecos(el) {
   const {data: precos} = await sb.from('precos_copia').select('*').order('tipo');
+  if (!State.folhasDisponiveis || State.folhasDisponiveis.length === 0) await loadFolhasDisponiveis();
   el.innerHTML = `
     <div class="section-header">
       <div><div class="section-title">Tabela de Preços de Cópias</div>
@@ -4847,11 +4819,13 @@ async function renderPrecos(el) {
         <table>
           <thead><tr><th>Tipo</th><th>Descrição</th><th>Preço Unit.</th><th>Preço Desconto</th><th>A partir de</th><th>💳 Cartão</th><th>Ativo</th><th>Ações</th></tr></thead>
           <tbody>
-            ${(precos||[]).map(p=>`
+            ${(precos||[]).map(p=>{
+              const { base, folhaFixa } = resolverPrecoTipoCopia(p);
+              return `
               <tr>
                 <td class="td-mono">${p.tipo}</td>
-                <td>${p.descricao}</td>
-                <td style="color:var(--c-accent);font-weight:600">${formatMoney(p.preco_unitario)}</td>
+                <td>${p.descricao} ${p.papel_fixo_id ? `<span class="badge badge--accent" title="Papel travado automaticamente nesta impressão">📄 ${folhaFixa?.nome || 'papel vinculado'}</span>` : ''}</td>
+                <td style="color:var(--c-accent);font-weight:600">${formatMoney(base)}</td>
                 <td>${p.preco_desconto ? formatMoney(p.preco_desconto) : '—'}</td>
                 <td>${p.qtd_desconto||'—'} cópias</td>
                 <td>${p.preco_cartao ? formatMoney(p.preco_cartao) : '—'}</td>
@@ -4861,7 +4835,7 @@ async function renderPrecos(el) {
                   <button class="btn btn--ghost btn--sm" onclick="gerenciarInsumosCopia('${p.tipo}','${p.descricao.replace(/'/g,"\\'")}')" title="Vincular insumos consumidos por folha">🧩</button>
                 </td>
               </tr>
-            `).join('')}
+            `;}).join('')}
           </tbody>
         </table>
       </div>
@@ -4881,6 +4855,17 @@ window.abrirModalNovoPreco = function() {
         <label>Descrição *</label>
         <input type="text" class="input" id="novo-desc" placeholder="Cópia Colorida A4 Frente e Verso" />
       </div>
+
+      <div class="field">
+        <label>📄 Papel fixo (opcional)</label>
+        <select class="input" id="novo-papel-fixo" onchange="atualizarReferenciaPapelFixo('novo')">
+          <option value="">— Nenhum (operador escolhe o papel no PDV) —</option>
+          ${(State.folhasDisponiveis||[]).map(f => `<option value="${f.id}">${f.nome}${f.preco_venda>0?` — venda: ${formatMoney(f.preco_venda)}`:''}</option>`).join('')}
+        </select>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">Se escolher um papel, esse tipo de impressão sempre usa esse papel automaticamente — o preço cobrado continua sendo o que você definir abaixo, não o preço do papel.</div>
+        <div id="novo-referencia-papel-fixo" style="display:none;font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px"></div>
+      </div>
+
       <div class="form-row form-row--3">
         <div class="field"><label>Preço Unitário (₲) *</label><input type="number" class="input" id="novo-unit" step="100" min="0" /></div>
         <div class="field"><label>Preço com Desconto</label><input type="number" class="input" id="novo-desc-val" step="100" min="0" /></div>
@@ -4890,6 +4875,7 @@ window.abrirModalNovoPreco = function() {
         <label>💳 Preço no Cartão (opcional)</label>
         <input type="number" class="input" id="novo-preco-cartao" step="100" min="0" placeholder="Deixe vazio para usar o preço normal" />
       </div>
+
       <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
         <input type="checkbox" id="novo-ativo" checked> <span>Ativo no PDV</span>
       </label>
@@ -4898,9 +4884,29 @@ window.abrirModalNovoPreco = function() {
   `, 'modal--lg');
 };
 
+// Mostra o preço de venda do papel escolhido como REFERÊNCIA apenas —
+// não define o preço cobrado (isso é sempre o campo "Preço Unitário" abaixo).
+// Compartilhado pelos dois modais via prefixo do id ('novo' ou 'preco').
+window.atualizarReferenciaPapelFixo = function(prefix) {
+  const sel = document.getElementById(`${prefix}-papel-fixo`);
+  const ref = document.getElementById(`${prefix}-referencia-papel-fixo`);
+  const papelFixoId = sel?.value || '';
+  if (!ref) return;
+  if (papelFixoId) {
+    const folha = (State.folhasDisponiveis || []).find(f => f.id === papelFixoId);
+    ref.style.display = 'block';
+    ref.textContent = folha?.preco_venda > 0
+      ? `📎 Referência: "${folha.nome}" custa ${formatMoney(folha.preco_venda)} — só pra te ajudar a decidir o preço acima.`
+      : `📎 "${folha?.nome}" ainda não tem preço de venda cadastrado no Estoque.`;
+  } else {
+    ref.style.display = 'none';
+  }
+};
+
 window.salvarNovoPreco = async function() {
   const tipo = document.getElementById('novo-tipo').value.trim();
   const descricao = document.getElementById('novo-desc').value.trim();
+  const papelFixoId = document.getElementById('novo-papel-fixo').value || null;
   const preco_unitario = parseFloat(document.getElementById('novo-unit').value) || 0;
   const preco_desconto = parseFloat(document.getElementById('novo-desc-val').value) || null;
   const qtd_desconto = parseInt(document.getElementById('novo-qtd').value) || 100;
@@ -4926,6 +4932,7 @@ window.salvarNovoPreco = async function() {
     preco_desconto,
     qtd_desconto,
     preco_cartao,
+    papel_fixo_id: papelFixoId,
     ativo
   });
 
@@ -4943,9 +4950,21 @@ window.salvarNovoPreco = async function() {
 window.editarPreco = async function(id) {
   const {data} = await sb.from('precos_copia').select('*').eq('id',id).single();
   if(!data) return;
+  if (!State.folhasDisponiveis || State.folhasDisponiveis.length === 0) await loadFolhasDisponiveis();
   openModal('Editar Preço — '+data.descricao,`
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
       <div class="field"><label>Descrição</label><input type="text" class="input" id="preco-desc" value="${data.descricao}" /></div>
+
+      <div class="field">
+        <label>📄 Papel fixo (opcional)</label>
+        <select class="input" id="preco-papel-fixo" onchange="atualizarReferenciaPapelFixo('preco')">
+          <option value="">— Nenhum (operador escolhe o papel no PDV) —</option>
+          ${(State.folhasDisponiveis||[]).map(f => `<option value="${f.id}" ${data.papel_fixo_id===f.id?'selected':''}>${f.nome}${f.preco_venda>0?` — venda: ${formatMoney(f.preco_venda)}`:''}</option>`).join('')}
+        </select>
+        <div style="font-size:var(--t-xs);color:var(--c-text-3)">Se escolher um papel, esse tipo de impressão sempre usa esse papel automaticamente — o preço cobrado continua sendo o que você definir abaixo, não o preço do papel.</div>
+        <div id="preco-referencia-papel-fixo" style="display:none;font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px"></div>
+      </div>
+
       <div class="form-row form-row--3">
         <div class="field"><label>Preço Unitário *</label><input type="number" class="input" id="preco-unit" value="${data.preco_unitario}" step="0.01" min="0" /></div>
         <div class="field"><label>Preço c/ Desconto</label><input type="number" class="input" id="preco-desc-val" value="${data.preco_desconto||''}" step="0.01" min="0" /></div>
@@ -4955,16 +4974,20 @@ window.editarPreco = async function(id) {
         <label>💳 Preço no Cartão (opcional)</label>
         <input type="number" class="input" id="preco-cartao" value="${data.preco_cartao||''}" step="0.01" min="0" placeholder="Deixe vazio para usar o preço normal" />
       </div>
+
       <label style="display:flex;align-items:center;gap:var(--sp-3);cursor:pointer">
         <input type="checkbox" id="preco-ativo" ${data.ativo?'checked':''}> <span>Ativo no PDV</span>
       </label>
       <button class="btn btn--primary btn--lg" style="width:100%;justify-content:center" onclick="salvarPreco('${id}')">💾 Salvar Preço</button>
     </div>
   `);
+  // Preenche a referência logo na abertura, se já tinha papel fixo selecionado
+  atualizarReferenciaPapelFixo('preco');
 };
 window.salvarPreco = async function(id) {
   const p = {
     descricao: document.getElementById('preco-desc').value.trim(),
+    papel_fixo_id: document.getElementById('preco-papel-fixo').value || null,
     preco_unitario: parseFloat(document.getElementById('preco-unit').value)||0,
     preco_desconto: parseFloat(document.getElementById('preco-desc-val').value)||null,
     qtd_desconto: parseInt(document.getElementById('preco-qtd').value)||100,
@@ -6463,11 +6486,8 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
       for (let idx = 0; idx < pedidosCopia.length; idx++) {
         const p = pedidosCopia[idx];
         const precoUnit = precoComPagamento(p.preco_base, p.preco_cartao, pagamentoDb);
-        // extra_folha (sobretaxa de papel especial) é somado DEPOIS do desconto —
-        // é repasse de custo de material, não deve ser corroído por desconto
-        // negociado sobre o valor da cópia em si.
-        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx] + (p.extra_folha || 0);
-        console.log(`🔄 Atualizando pedido ${p.id}: precoUnit=${precoUnit}, desconto=${descontoPorPedido[idx]}, extraFolha=${p.extra_folha||0}, total=${totalItem}, pagamento=${pagamentoDb}`);
+        const totalItem = Math.round(precoUnit * p.quantidade) - descontoPorPedido[idx];
+        console.log(`🔄 Atualizando pedido ${p.id}: precoUnit=${precoUnit}, desconto=${descontoPorPedido[idx]}, total=${totalItem}, pagamento=${pagamentoDb}`);
         const { error } = await sb.from('pedidos_copia').update({
           preco_unitario:  Math.round(precoUnit),
           desconto:        descontoPorPedido[idx],
@@ -6794,9 +6814,9 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
       <div class="form-row form-row--2">
         <div class="field">
           <label>Tipo de cópia</label>
-          <select class="input" id="fila-mini-tipo">
+          <select class="input" id="fila-mini-tipo" onchange="filaMiniSelecionarTipo(this.value)">
             <option value="">— Nenhuma —</option>
-            ${precos.map(p => `<option value="${p.tipo}">${p.descricao} (${formatMoney(p.preco_unitario)})</option>`).join('')}
+            ${precos.map(p => `<option value="${p.tipo}" data-papel-fixo="${p.papel_fixo_id||''}">${p.descricao} (${formatMoney(resolverPrecoTipoCopia(p).base)})</option>`).join('')}
           </select>
         </div>
         <div class="field">
@@ -6810,6 +6830,7 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
           <option value="">— Selecione o papel —</option>
           ${folhas.map(f => `<option value="${f.id}" data-nome="${f.nome}">${f.nome} (estoque: ${f.estoque_atual} ${f.unidade})</option>`).join('')}
         </select>
+        <div id="fila-mini-folha-fixa-aviso" style="display:none;font-size:var(--t-xs);color:var(--c-accent);margin-top:4px">🔒 Este tipo sempre usa este papel automaticamente.</div>
       </div>
 
       <div class="field" style="margin-bottom:0">
@@ -6821,6 +6842,24 @@ window.abrirMiniCarrinhoFila = async function(pedidoId, clienteNome, impressoraI
       </button>
     </div>
   `, 'modal--lg');
+};
+
+// Quando o tipo escolhido no mini-carrinho da fila tem papel fixo vinculado
+// (Impressão Especial), trava o seletor de folha nesse papel automaticamente
+// — mesmo comportamento do PDV principal (selecionarTipoCopia).
+window.filaMiniSelecionarTipo = function(tipo) {
+  const preco = (State.precosCopia || []).find(p => p.tipo === tipo);
+  const folhaSelect = document.getElementById('fila-mini-folha');
+  const aviso = document.getElementById('fila-mini-folha-fixa-aviso');
+  if (!folhaSelect) return;
+  if (preco?.papel_fixo_id) {
+    folhaSelect.value = preco.papel_fixo_id;
+    folhaSelect.disabled = true;
+    if (aviso) aviso.style.display = 'block';
+  } else {
+    folhaSelect.disabled = false;
+    if (aviso) aviso.style.display = 'none';
+  }
 };
 
 window.filtrarFilaMiniProdutos = function(q) {
@@ -6917,8 +6956,7 @@ window.confirmarMiniCarrinhoFila = async function(pedidoIdOrigem, clienteNome, i
     //    entra na fila de produção física.
     if (tipoNovo) {
       const preco = State.precosCopia.find(p => p.tipo === tipoNovo);
-      const precoBase = preco ? preco.preco_unitario : 0;
-      const precoCartao = preco?.preco_cartao || null;
+      const { base: precoBase, cartao: precoCartao } = resolverPrecoTipoCopia(preco, qtdNovo);
       const totalFolhas = calcularFolhas(qtdNovo, false);
       const { error } = await sb.from('pedidos_copia').insert({
         impressora_id:   impressoraId || null,

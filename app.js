@@ -10,6 +10,13 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 window.sb = sb;
 window.supa = sb; // também para compatibilidade
 
+// Cache para evitar consultas repetidas
+const FILA_CACHE = {
+  pedidos: [],
+  carrinhosMap: {},
+  impressorasMap: {},
+};
+
 // ── LOG DE AUDITORIA ───────────────────────────────────────
 // Registra ações administrativas (criar/editar/bloquear/excluir etc.)
 // Não bloqueia o fluxo principal se falhar — apenas avisa no console.
@@ -143,11 +150,11 @@ const NAV = [
 (async () => {
   const { data: { session } } = await sb.auth.getSession();
   if (session?.user) {
-    State.user = session.user;
-    await initApp();
-  } else {
-    showLogin();
-  }
+  State.user = session.user;
+  await initApp();
+} else {
+  showLogin();
+}
 
   sb.auth.onAuthStateChange(async (_event, session) => {
     console.log('Auth event:', _event, session?.user?.email);
@@ -187,6 +194,10 @@ document.getElementById('btn-logout').addEventListener('click', async () => {
 });
 
 // ── INIT APP ──────────────────────────────────────────────
+
+let _appInitializing = false;
+let _appInitialized = false;
+
 async function initApp() {
   console.log('🔵 initApp iniciado');
   document.getElementById('login-screen').style.display = 'none';
@@ -194,10 +205,16 @@ async function initApp() {
 
   // Carrega dados base
   await Promise.all([loadEmpresa(), loadImpressoras(), loadPrecosCopia()]);
-   console.log('✅ Dados base carregados');
+
+  if (_appInitializing || _appInitialized) {
+    console.log('⏭️ initApp já em execução ou concluído, ignorando nova chamada.');
+    return;
+  }
+  _appInitializing = true;
 
   // Cotação BRL: fonte única é a coluna empresa.cotacao_brl.
   // Fallback pro campo antigo (config.cotacao_brl) só pra não perder valor já salvo por instalações antigas.
+  try { 
   const cotacaoDoBanco = State.empresa?.cotacao_brl ?? State.empresa?.config?.cotacao_brl;
   if (cotacaoDoBanco) {
     setCotacao(cotacaoDoBanco);
@@ -277,6 +294,10 @@ if (collapseBtn) {
   document.getElementById('global-modal').addEventListener('click', e => {
     if (e.target.id === 'global-modal') closeModal();
   });
+} finally {
+  _appInitializing = false;
+  _appInitialized = true;
+}
 }
 
 function userHasRole(requiredRoles) {
@@ -1524,6 +1545,8 @@ window.calcularTroco = function() {
 // ── FINALIZAÇÃO (CORRIGIDA) ──────────────────────────────
 // ── FINALIZAÇÃO (CORRIGIDA) ──────────────────────────────
 window.finalizarVenda = async function() {
+  console.log('🚀 [finalizarVenda] INICIADO');
+
   // 1. Verificações iniciais
   const statusCaixa = await getStatusCaixa();
   if (!statusCaixa.aberto) {
@@ -1531,47 +1554,41 @@ window.finalizarVenda = async function() {
     return;
   }
   if (statusCaixa.travado) {
-    toast('⚠️ Caixa travado! Libere com senha de administrador para realizar vendas.', 'error');
+    toast('⚠️ Caixa travado! Libere com senha de administrador.', 'error');
     return;
   }
   if (PdvState.carrinho.length === 0) {
     toast('Carrinho vazio', 'warning');
     return;
   }
-  const temCopiaCheck = PdvState.carrinho.some(i => i.tipo_item === 'copia');
-  if (!temCopiaCheck && !PdvState.pagamento) {
-    toast('Selecione a forma de pagamento antes de finalizar.', 'warning');
+  const temCopia = PdvState.carrinho.some(i => i.tipo_item === 'copia');
+  if (!temCopia && !PdvState.pagamento) {
+    toast('Selecione a forma de pagamento.', 'warning');
     return;
   }
 
   const btn = document.getElementById('btn-finalizar-venda');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Processando...';
+    btn.textContent = '⏳ Processando...';
   }
 
-  // 2. Obtém o nome do cliente (se houver)
   const clienteNomePDV = document.getElementById('input-cliente-nome-pdv')?.value?.trim() || null;
-
-  // 3. Separa itens do carrinho
-  const itensCopia   = PdvState.carrinho.filter(i => i.tipo_item === 'copia');
+  const itensCopia = PdvState.carrinho.filter(i => i.tipo_item === 'copia');
   const itensProduto = PdvState.carrinho.filter(i => i.tipo_item === 'produto');
 
   try {
-    // ── CASO 1: Apenas produtos ──────────────────────────
+    // ── Apenas produtos ──────────────────────────────────────
     if (itensCopia.length === 0) {
-      const pagamentoDb = PdvState.pagamento;
+      const pagamento = PdvState.pagamento;
       const subtotal = itensProduto.reduce((a, b) => a + itemTotal(b), 0);
       const desconto = Math.min(PdvState.desconto || 0, subtotal);
-
-      const vendaId = await processarVendaProdutos(itensProduto, subtotal, desconto, pagamentoDb, clienteNomePDV);
+      const vendaId = await processarVendaProdutos(itensProduto, subtotal, desconto, pagamento, clienteNomePDV);
       if (vendaId === null) {
-        // erro já foi mostrado em processarVendaProdutos
         if (btn) btn.disabled = false;
         return;
       }
-
-      toast('✅ Venda registrada!', 'success', 3500);
+      toast('✅ Venda registrada!', 'success');
       limparCarrinho();
       limparEstadoPdv();
       renderAbaCopia_refresh();
@@ -1579,12 +1596,26 @@ window.finalizarVenda = async function() {
       return;
     }
 
-    // ── CASO 2: Há cópias (com ou sem produtos) ──────────
-    // 4. Cria o carrinho pendente (uma única vez)
+    // ── Validação de itens de cópia ────────────────────────
+    for (const item of itensCopia) {
+      if (item.preco_base == null || isNaN(item.preco_base) || item.preco_base <= 0) {
+        throw new Error(`Item sem preço válido: ${item.tipo} (preco_base=${item.preco_base})`);
+      }
+      if (!item.impressora_id) {
+        throw new Error(`Item sem impressora: ${item.tipo}`);
+      }
+      if (!item.folha_id) {
+        throw new Error(`Item sem folha selecionada: ${item.tipo}`);
+      }
+      console.log(`✅ Item OK: ${item.tipo}, qtd=${item.quantidade}, preco=${item.preco_base}, folha=${item.folha_id}`);
+    }
+
+    // ── Cria carrinho pendente ──────────────────────────────
+    console.log('📦 Criando carrinho pendente...');
     const { data: carrinho, error: errCarrinho } = await sb
       .from('carrinhos_pendentes')
       .insert({
-        itens: PdvState.carrinho,          // todos os itens (cópias + produtos)
+        itens: PdvState.carrinho,
         cliente_nome: clienteNomePDV,
         desconto: PdvState.desconto || 0,
         observacoes: '',
@@ -1593,54 +1624,69 @@ window.finalizarVenda = async function() {
       .single();
 
     if (errCarrinho || !carrinho) {
-      console.error('❌ Erro ao criar carrinho pendente:', errCarrinho);
-      throw new Error('Erro ao criar carrinho pendente: ' + (errCarrinho?.message || 'desconhecido'));
+      console.error('❌ Erro ao criar carrinho:', errCarrinho);
+      throw new Error('Falha ao criar carrinho pendente: ' + (errCarrinho?.message || 'desconhecido'));
     }
-    console.log('✅ Carrinho pendente criado com ID:', carrinho.id);
+    console.log('✅ Carrinho criado com ID:', carrinho.id);
 
-    // 5. Insere cada pedido de cópia com referência ao carrinho
+    // ── Insere cada pedido de cópia ─────────────────────────
+    let insertedCount = 0;
     for (const item of itensCopia) {
-      const { error } = await sb.from('pedidos_copia').insert({
-        impressora_id:   item.impressora_id,
-        tipo:            item.tipo,
-        quantidade:      item.quantidade,
-        frente_verso:    item.frente_verso,
-        preco_unitario:  Math.round(item.preco_base),
-        preco_base:      item.preco_base,
-        preco_cartao:    item.preco_cartao,
-        desconto:        0,  // provisório – será recalculado na retirada
-        total:           Math.round(item.preco_base * item.quantidade),
-        status:          'na_fila',
-        forma_pagamento: null,
-        cliente_nome_pdv: clienteNomePDV,
+      const totalItem = Math.round(item.preco_base * item.quantidade);
+      const insertData = {
+        impressora_id:        item.impressora_id,
+        tipo:                 item.tipo,
+        quantidade:           item.quantidade,
+        frente_verso:         item.frente_verso || false,
+        preco_unitario:       Math.round(item.preco_base),
+        preco_base:           item.preco_base,
+        preco_cartao:         item.preco_cartao || null,
+        desconto:             0,
+        total:                totalItem,
+        status:               'na_fila',
+        forma_pagamento:      null,
+        cliente_nome_pdv:     clienteNomePDV,
         paginas_por_documento: item.paginas_por_documento || 1,
-        total_folhas:    item.total_folhas,
-        carrinho_id:     carrinho.id,
-        insumo_folha_id: item.folha_id || null,
-        insumo_folha_nome: item.folha_nome || null,
-      });
+        total_folhas:         item.total_folhas || Math.ceil(item.quantidade / (item.frente_verso ? 2 : 1)),
+        carrinho_id:          carrinho.id,
+        insumo_folha_id:      item.folha_id || null,
+        insumo_folha_nome:    item.folha_nome || null,
+      };
+      console.log(`📝 Inserindo pedido #${insertedCount+1}:`, JSON.stringify(insertData, null, 2));
+
+      const { error } = await sb.from('pedidos_copia').insert(insertData);
       if (error) {
-        console.error('❌ Erro ao inserir pedido de cópia:', error);
-        throw error;
+        console.error('❌ ERRO no INSERT:', error);
+        // Tenta obter mais detalhes do erro
+        throw new Error(`Falha ao inserir pedido (${item.tipo}): ${error.message} (code: ${error.code})`);
       }
+      insertedCount++;
+      console.log(`✅ Pedido #${insertedCount} inserido com sucesso.`);
     }
 
-    // 6. Mensagem de sucesso
     const msgProduto = itensProduto.length > 0
-      ? ` + ${itensProduto.length} produto(s) aguardando retirada`
+      ? ` + ${itensProduto.length} produto(s)`
       : '';
-    toast(`✅ ${itensCopia.length} impressão(ões) enviada(s) para a fila${msgProduto}!`, 'success', 4500);
+    toast(`✅ ${insertedCount} impressão(ões) enviada(s) para a fila${msgProduto}!`, 'success', 5000);
 
-    // 7. Limpa estado do PDV
     limparCarrinho();
     limparEstadoPdv();
     renderAbaCopia_refresh();
 
+    // ── Atualiza fila imediatamente ──────────────────────────
+    if (State.currentPage === 'fila') {
+      console.log('🔄 Atualizando fila...');
+      await refreshFila();
+    } else {
+      console.log('ℹ️ Navegue para "Fila de Produção" para ver os pedidos.');
+    }
+
   } catch (err) {
-    console.error('❌ Erro em finalizarVenda:', err);
+    console.error('❌ [finalizarVenda] ERRO GERAL:', err);
+    // Exibe alert para garantir visibilidade
+    alert(`❌ Erro ao finalizar: ${err.message}`);
     toast('Erro ao finalizar: ' + err.message, 'error');
   } finally {
-    // 8. Reabilita o botão sempre
     if (btn) {
       btn.disabled = false;
       btn.textContent = '📋 Enviar para Fila';
@@ -5887,170 +5933,217 @@ window.limparConcluidos = async function() {
 };
 
 // ── Carrega e renderiza pedidos por impressora ─────────────
-window.refreshFila = async function() {
+// Variável para debounce
+let _refreshFilaTimeout = null;
+let _refreshFilaRunning = false;
+
+window.refreshFila = async function(force = false) {
+  // Debounce: se chamada novamente dentro de 300ms, reinicia o timer
+  if (!force) {
+    if (_refreshFilaTimeout) clearTimeout(_refreshFilaTimeout);
+    return new Promise((resolve) => {
+      _refreshFilaTimeout = setTimeout(async () => {
+        _refreshFilaTimeout = null;
+        await _refreshFilaInternal();
+        resolve();
+      }, 300);
+    });
+  }
+  // Se for force, executa imediatamente (mas ainda com trava de concorrência)
+  await _refreshFilaInternal();
+};
+
+async function _refreshFilaInternal() {
+  if (_refreshFilaRunning) return;
+  _refreshFilaRunning = true;
+
   const btn = document.getElementById('btn-refresh-fila');
   if (btn) btn.disabled = true;
 
-  // 1. Buscar pedidos
-  const { data: pedidos, error } = await sb
-    .from('pedidos_copia')
-    .select('*, impressoras(nome, status, colorida, tipo)')
-    .in('status', ['na_fila', 'imprimindo', 'conferencia', 'concluido', 'erro'])
-    .order('created_at', { ascending: true })
-    .limit(200);
+  console.log('🔄 [refreshFila] Iniciando (optimizado)...');
 
-  if (error) {
-    toast('Erro ao carregar fila: ' + error.message, 'error');
+  try {
+    const LIMITE = 50;
+    const { data: pedidos, error } = await sb
+      .from('pedidos_copia')
+      .select('*, impressoras(nome, status, colorida, tipo)')
+      .in('status', ['na_fila', 'imprimindo', 'conferencia', 'concluido', 'erro'])
+      .order('created_at', { ascending: true })
+      .limit(LIMITE);
+
+    if (error) {
+      console.error('❌ Erro na consulta:', error);
+      toast('Erro ao carregar fila: ' + error.message, 'error');
+      if (btn) btn.disabled = false;
+      _refreshFilaRunning = false;
+      return;
+    }
+
+    const filaBody = document.getElementById('fila-body');
+    if (!filaBody) {
+      console.warn('⚠️ #fila-body não encontrado');
+      if (btn) btn.disabled = false;
+      _refreshFilaRunning = false;
+      return;
+    }
+
+    if (!pedidos || pedidos.length === 0) {
+      filaBody.innerHTML = `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">📭</div><div class="fila-empty-text">Nenhum pedido na fila</div></div>`;
+      if (btn) btn.disabled = false;
+      _refreshFilaRunning = false;
+      return;
+    }
+
+    // Buscar carrinhos em lote
+    const carrinhoIds = [...new Set(pedidos.map(p => p.carrinho_id).filter(Boolean))];
+    let carrinhosMap = {};
+    if (carrinhoIds.length > 0) {
+      const { data: carrinhos, error: errCarr } = await sb
+        .from('carrinhos_pendentes')
+        .select('*')
+        .in('id', carrinhoIds);
+      if (!errCarr && carrinhos) {
+        carrinhosMap = carrinhos.reduce((acc, c) => { acc[c.id] = c; return acc; }, {});
+      }
+    }
+
+    await loadImpressoras();
+    const porImpressora = {};
+    State.impressoras.forEach(imp => {
+      porImpressora[imp.id] = { impressora: imp, pedidos: [] };
+    });
+
+    pedidos.forEach(p => {
+      const key = p.impressora_id || '__sem_impressora__';
+      if (!porImpressora[key]) {
+        porImpressora[key] = {
+          impressora: p.impressoras || { nome: 'Impressora removida', status: 'offline' },
+          pedidos: []
+        };
+      }
+      porImpressora[key].pedidos.push(p);
+    });
+
+    const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
+    let colunasHtml = '';
+
+    for (const key of Object.keys(porImpressora)) {
+      const { impressora, pedidos: peds } = porImpressora[key];
+
+      // ---- FILTRO CORRIGIDO ----
+      let pedidosFiltrados;
+      if (filtroAtivo === 'todos') {
+        // Exibe todos EXCETO os concluídos (a menos que estejam aguardando pagamento)
+        pedidosFiltrados = peds.filter(p =>
+          p.status !== 'concluido' || (p.carrinho_id && !p.forma_pagamento)
+        );
+      } else {
+        pedidosFiltrados = peds.filter(p => p.status === filtroAtivo);
+      }
+      // --------------------------
+
+      if (pedidosFiltrados.length === 0) {
+        colunasHtml += `
+          <div class="fila-coluna">
+            <div class="fila-coluna-header">
+              <div class="printer-status-dot ${impressora.status || 'offline'}"></div>
+              <div class="fila-coluna-nome">${impressora.nome}</div>
+            </div>
+            <div class="fila-coluna-body">
+              <div class="fila-empty"><div class="fila-empty-icon">✅</div><div class="fila-empty-text">Vazia</div></div>
+            </div>
+          </div>`;
+        continue;
+      }
+
+      const cardsHtml = pedidosFiltrados.map(p => {
+        const carrinho = carrinhosMap[p.carrinho_id] || null;
+        let totalCarrinho = 0;
+        if (carrinho) {
+          totalCarrinho = (carrinho.itens || []).reduce((acc, i) => acc + (i.preco_base || 0) * (i.quantidade || 0), 0);
+          totalCarrinho = Math.max(0, totalCarrinho - (carrinho.desconto || 0));
+        }
+        const clienteLabel = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+        const folhasEsperadas = p.paginas_por_documento
+          ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+          : Math.ceil(p.quantidade / (p.frente_verso ? 2 : 1));
+
+        return `
+          <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}">
+            <div class="pedido-card-header">
+              <span class="pedido-card-num">#${p.numero_pedido}</span>
+              <span class="pedido-card-cliente">${clienteLabel}</span>
+              <span class="status-fila status-fila--${p.status}">${labelStatusFila(p.status)}</span>
+            </div>
+            <div class="pedido-card-body">
+              <div><strong>${p.quantidade}</strong> cópias · ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
+              <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
+              <div style="color:var(--c-text-3);font-size:10px;margin-top:2px">
+                Recebido: ${formatDateTime(p.created_at)}
+                ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
+              </div>
+              ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
+            </div>
+            <div class="pedido-card-footer">
+              <button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
+              <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
+              <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>
+              <span class="pedido-card-valor">${formatMoney(p.total)}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      colunasHtml += `
+        <div class="fila-coluna">
+          <div class="fila-coluna-header">
+            <div class="printer-status-dot ${impressora.status || 'offline'}"></div>
+            <div class="fila-coluna-nome">${impressora.nome}</div>
+            <span class="badge badge--warning">${pedidosFiltrados.length}</span>
+          </div>
+          <div class="fila-coluna-body">
+            ${cardsHtml}
+          </div>
+        </div>`;
+    }
+
+    filaBody.innerHTML = colunasHtml || `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">🖥️</div><div class="fila-empty-text">Nenhuma impressora cadastrada</div></div>`;
+
+    const tsEl = document.getElementById('fila-ultima-atualizacao');
+    if (tsEl) tsEl.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })}`;
+
+  } catch (err) {
+    console.error('❌ [refreshFila] Erro geral:', err);
+    toast('Erro ao atualizar fila: ' + err.message, 'error');
+  } finally {
     if (btn) btn.disabled = false;
-    return;
+    _refreshFilaRunning = false;
   }
 
-  // 2. Coletar todos os carrinho_ids que não são nulos
-  const carrinhoIds = [...new Set(pedidos.map(p => p.carrinho_id).filter(Boolean))];
-
-  // 3. Buscar todos os carrinhos pendentes de uma vez
-  let carrinhoMap = new Map();
-  if (carrinhoIds.length > 0) {
-    const { data: carrinhos, error: errCarr } = await sb
-      .from('carrinhos_pendentes')
-      .select('*')
-      .in('id', carrinhoIds);
-    if (!errCarr && carrinhos) {
-      carrinhos.forEach(c => carrinhoMap.set(c.id, c));
-    }
-  }
-
-  // 4. Função auxiliar para obter carrinho do mapa (sem consulta extra)
-  function obterCarrinhoPorId(carrinhoId) {
-    return carrinhoMap.get(carrinhoId) || null;
-  }
-
-  // 5. Montar estrutura por impressora
-  const porImpressora = {};
-  State.impressoras.forEach(imp => { porImpressora[imp.id] = { impressora: imp, pedidos: [] }; });
-
-  (pedidos || []).forEach(p => {
-    const key = p.impressora_id || '__sem_impressora__';
-    if (!porImpressora[key]) {
-      porImpressora[key] = { impressora: p.impressoras || { nome: 'Impressora removida', status: 'offline' }, pedidos: [] };
-    }
-    porImpressora[key].pedidos.push(p);
-  });
-
-  const filtroAtivo = document.querySelector('#fila-filtros .chip.active')?.dataset?.filtro || 'todos';
-
-  // 6. Mapa de contagem de jobs por carrinho (para detectar pedidos "espalhados")
-  const carrinhoTotalJobs = {};
-  (pedidos || []).forEach(p => {
-    if (!p.carrinho_id) return;
-    carrinhoTotalJobs[p.carrinho_id] = (carrinhoTotalJobs[p.carrinho_id] || 0) + 1;
-  });
-
-  // 7. Renderizar colunas
-  const colunasHtml = [];
-  for (const { impressora, pedidos: peds } of Object.values(porImpressora)) {
-    const pedidosFiltrados = filtroAtivo === 'todos'
-      ? peds.filter(p => p.status !== 'concluido' || (p.carrinho_id && !p.forma_pagamento))
-      : peds.filter(p => p.status === filtroAtivo);
-
-    const counts = {
-      na_fila:     peds.filter(p => p.status === 'na_fila').length,
-      imprimindo:  peds.filter(p => p.status === 'imprimindo').length,
-      conferencia: peds.filter(p => p.status === 'conferencia').length,
-      erro:        peds.filter(p => p.status === 'erro').length,
-    };
-    const totalAtivos = counts.na_fila + counts.imprimindo + counts.conferencia + counts.erro;
-    const aguardandoPagCount = peds.filter(p => p.status === 'concluido' && p.carrinho_id && !p.forma_pagamento).length;
-
-    let bodyHtml = '';
-    if (pedidosFiltrados.length === 0) {
-      bodyHtml = `<div class="fila-empty">
-        <div class="fila-empty-icon">✅</div>
-        <div class="fila-empty-text">${filtroAtivo === 'todos' ? 'Fila livre' : 'Nenhum pedido'}</div>
-      </div>`;
-    } else {
-      // Agrupa por carrinho_id
-      const gruposMap = new Map();
-      pedidosFiltrados.forEach(p => {
-        const key = p.carrinho_id || `solo-${p.id}`;
-        if (!gruposMap.has(key)) gruposMap.set(key, []);
-        gruposMap.get(key).push(p);
-      });
-
-      const cards = await Promise.all(
-        Array.from(gruposMap.values()).map(grupo => {
-          const carrinhoId = grupo[0].carrinho_id;
-          const espalhado = !!carrinhoId && (carrinhoTotalJobs[carrinhoId] || 0) > grupo.length;
-          // Passa o carrinho já do mapa, se existir
-          const carrinho = carrinhoId ? obterCarrinhoPorId(carrinhoId) : null;
-          return grupo.length > 1
-            ? renderPedidoCardGroup(grupo, espalhado, carrinho)
-            : renderPedidoCard(grupo[0], espalhado, carrinho);
-        })
-      );
-      bodyHtml = cards.join('');
-    }
-
-    colunasHtml.push(`
-      <div class="fila-coluna">
-        <div class="fila-coluna-header">
-          <div class="printer-status-dot ${impressora.status || 'offline'}"></div>
-          <div class="fila-coluna-nome">${impressora.nome}</div>
-          ${totalAtivos > 0 ? `<span class="badge badge--warning">${totalAtivos} ativo${totalAtivos>1?'s':''}</span>` : ''}
-          ${counts.imprimindo > 0 ? `<span class="badge badge--primary">⚡ Imprimindo</span>` : ''}
-          ${aguardandoPagCount > 0 ? `<span class="badge badge--accent">🛒 ${aguardandoPagCount} aguardando pagamento</span>` : ''}
-        </div>
-        <div class="fila-coluna-body">
-          ${bodyHtml}
-        </div>
-      </div>
-    `);
-  }
-
-  const filaBody = document.getElementById('fila-body');
-  if (filaBody) {
-    filaBody.innerHTML = colunasHtml.join('') || `<div class="fila-empty" style="flex:1"><div class="fila-empty-icon">🖥️</div><div class="fila-empty-text">Nenhuma impressora cadastrada</div></div>`;
-  }
-
-  const tsEl = document.getElementById('fila-ultima-atualizacao');
-  if (tsEl) tsEl.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })}`;
-
-  if (btn) btn.disabled = false;
-};
+  FILA_CACHE.pedidos = pedidos;
+  FILA_CACHE.carrinhosMap = carrinhosMap;
+  FILA_CACHE.impressorasMap = State.impressoras.reduce((acc, i) => { acc[i.id] = i; return acc; }, {});
+}
 
 window.verCarrinhoPendente = async function(pedidoId) {
-  const carrinho = await obterCarrinhoPendentePorPedido(pedidoId);
+  // Busca pedido no cache
+  let p = FILA_CACHE.pedidos.find(p => p.id === pedidoId);
+  if (!p) {
+    const { data } = await sb.from('pedidos_copia').select('carrinho_id').eq('id', pedidoId).single();
+    p = data;
+  }
+  if (!p || !p.carrinho_id) { toast('Carrinho não encontrado', 'error'); return; }
+
+  let carrinho = FILA_CACHE.carrinhosMap[p.carrinho_id];
   if (!carrinho) {
-    // Carrinho pendente não existe mais (delete funcionou) — mostra o resumo já finalizado.
-    const { data: pedido } = await sb.from('pedidos_copia').select('carrinho_id').eq('id', pedidoId).single();
-    if (pedido?.carrinho_id) { await exibirResumoCarrinhoFinalizado(pedido.carrinho_id); return; }
-    toast('Carrinho não encontrado.', 'error');
-    return;
+    const { data } = await sb.from('carrinhos_pendentes').select('*').eq('id', p.carrinho_id).single();
+    carrinho = data;
   }
-
-  // Busca os pedidos de cópia vinculados a este carrinho
-  const { data: pedidos, error } = await sb
-    .from('pedidos_copia')
-    .select('status, forma_pagamento')
-    .eq('carrinho_id', carrinho.id);
-
-  if (error) {
-    toast('Erro ao verificar status dos pedidos', 'error');
-    return;
-  }
-
-  // Se já foi pago (forma_pagamento gravada), a linha em carrinhos_pendentes
-  // só não foi apagada por causa de FK — trata como finalizado, não reabre
-  // a tela de pagamento.
-  const jaPago = (pedidos || []).length > 0 && pedidos.every(p => p.forma_pagamento);
-  if (jaPago) { await exibirResumoCarrinhoFinalizado(carrinho.id); return; }
+  if (!carrinho) { toast('Carrinho não encontrado', 'error'); return; }
 
   _carrinhoPendenteAtual = carrinho;
-
-  // Verifica se todos estão concluídos ou cancelados
+  const { data: pedidos } = await sb.from('pedidos_copia').select('status, forma_pagamento').eq('carrinho_id', carrinho.id);
   const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
-
-  // Renderiza o modal com base no status
   const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
   openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg', _avisarFecharCarrinhoSemPagamento);
 };
@@ -6062,37 +6155,50 @@ window.verCarrinhoPorId = async function(carrinhoId) {
     return;
   }
 
-  // Busca o carrinho pendente
-  const { data: carrinho, error } = await sb
-    .from('carrinhos_pendentes')
-    .select('*')
-    .eq('id', carrinhoId)
-    .maybeSingle();
+  // Tenta usar o cache primeiro
+  let carrinho = FILA_CACHE.carrinhosMap[carrinhoId];
+  if (!carrinho) {
+    // Fallback: busca no banco
+    const { data, error } = await sb
+      .from('carrinhos_pendentes')
+      .select('*')
+      .eq('id', carrinhoId)
+      .maybeSingle();
 
-  if (error) {
-    toast('Erro ao buscar carrinho: ' + error.message, 'error');
-    return;
+    if (error) {
+      toast('Erro ao buscar carrinho: ' + error.message, 'error');
+      return;
+    }
+    carrinho = data;
   }
 
-  // Se o carrinho não existe, busca os registros finalizados
+  // Se ainda não encontrou, exibe resumo finalizado (se houver)
   if (!carrinho) {
     await exibirResumoCarrinhoFinalizado(carrinhoId);
     return;
   }
 
   // Verifica se todos os pedidos de cópia vinculados estão concluídos ou cancelados
-  const { data: pedidos } = await sb
+  const { data: pedidos, error: errPedidos } = await sb
     .from('pedidos_copia')
     .select('status, forma_pagamento')
     .eq('carrinho_id', carrinhoId);
 
-  // Já pago, mas a linha do carrinho não foi apagada (FK) — trata como finalizado.
+  if (errPedidos) {
+    toast('Erro ao verificar status dos pedidos: ' + errPedidos.message, 'error');
+    return;
+  }
+
+  // Já pago, mas a linha do carrinho não foi apagada (FK) → trata como finalizado
   const jaPago = (pedidos || []).length > 0 && pedidos.every(p => p.forma_pagamento);
-  if (jaPago) { await exibirResumoCarrinhoFinalizado(carrinhoId); return; }
+  if (jaPago) {
+    await exibirResumoCarrinhoFinalizado(carrinhoId);
+    return;
+  }
 
   const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
 
-  // Se todos estão prontos, o carrinho já foi finalizado – exibe apenas visualização
+  // Se todos estão prontos e há pedidos, já foi finalizado – exibe apenas visualização
   if (todosProntos && pedidos && pedidos.length > 0) {
     await exibirResumoCarrinhoFinalizado(carrinhoId);
     return;
@@ -6101,7 +6207,12 @@ window.verCarrinhoPorId = async function(carrinhoId) {
   // Caso contrário, exibe o modal de finalização (com opções de edição)
   _carrinhoPendenteAtual = carrinho;
   const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
-  openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg', _avisarFecharCarrinhoSemPagamento);
+  openModal(
+    `🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`,
+    modalBody,
+    'modal--lg',
+    _avisarFecharCarrinhoSemPagamento
+  );
 };
 
 // Aviso (não-bloqueante) ao fechar o modal de pagamento do carrinho sem
@@ -6548,42 +6659,45 @@ window.finalizarCarrinhoPendente = async function(carrinhoId) {
 
 // ── Renderiza um card de pedido individual (não juntado, ou cujo
 //    carrinho está espalhado em outra impressora) ─────────
-async function renderPedidoCard(p, espalhado = false, carrinho = null) {
+async function renderPedidoCard(p, espalhado = false) {
   const folhasEsperadas = p.paginas_por_documento
     ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
     : calcularFolhas(p.quantidade, p.frente_verso);
   const clienteLabel = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
 
   let totalCarrinho = 0;
-  if (carrinho) {
-    const subtotalPreview = carrinho.itens.reduce((acc, i) => acc + i.preco_base * i.quantidade, 0);
-    totalCarrinho = Math.max(0, subtotalPreview - (carrinho.desconto || 0));
+  let carrinho = null;
+  if (p.carrinho_id) {
+    carrinho = await obterCarrinhoPendentePorPedido(p.id);
+    if (carrinho) {
+      // Prévia com preço normal (sem cartão) — a forma de pagamento só é
+      // escolhida na retirada, em finalizarCarrinhoPendente().
+      const subtotalPreview = carrinho.itens.reduce((acc, i) => acc + i.preco_base * i.quantidade, 0);
+      totalCarrinho = Math.max(0, subtotalPreview - (carrinho.desconto || 0));
+    }
   }
 
-  // Botão de conferência (para status não finalizados)
+  // ── Fila simplificada: um único botão "Confirmar" leva direto ao
+  //    modal de conferência/entrega, que por sua vez abre o carrinho
+  //    para pagamento. Não há mais etapas manuais de iniciar/conferir.
   const acaoConfirmar = `<button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
                   <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
                   <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>`;
 
-  // Ações por status
-  let acoes;
-  if (p.status === 'concluido') {
-    // Pedido entregue, mas ainda sem pagamento?
-    if (!p.forma_pagamento) {
-      // Se tem carrinho, finaliza via carrinho; senão, finaliza diretamente (pedido órfão)
-      if (carrinho) {
-        acoes = `<button class="btn btn--success btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Finalizar Venda</button>`;
-      } else {
-        acoes = `<button class="btn btn--success btn--sm" onclick="finalizarPedidoOrfao('${p.id}')">✅ Finalizar Venda</button>`;
-      }
-    } else {
-      acoes = `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`;
-    }
-  } else if (p.status === 'cancelado') {
-    acoes = `<span style="font-size:var(--t-xs);color:var(--c-danger)">Cancelado</span>`;
-  } else {
-    acoes = acaoConfirmar;
-  }
+  const acoes = {
+    na_fila:     acaoConfirmar,
+    imprimindo:  acaoConfirmar,
+    conferencia: acaoConfirmar,
+    erro:        acaoConfirmar,
+    // Impressão entregue, mas a venda só é considerada finalizada quando o
+    // carrinho é de fato fechado com forma de pagamento (finalizarCarrinhoPendente
+    // apaga o carrinho_pendente ao concluir). Enquanto esse carrinho existir,
+    // o card continua na fila com o botão de carrinho em destaque — nada
+    // desaparece "sozinho" antes da venda ser realmente fechada.
+    concluido: carrinho
+      ? `<button class="btn btn--success btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Finalizar Venda</button>`
+      : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue às ${formatDateTime(p.concluido_at)}</span>`,
+  };
 
   const podeArrastar = p.status !== 'concluido' && p.status !== 'cancelado';
 
@@ -6608,8 +6722,8 @@ async function renderPedidoCard(p, espalhado = false, carrinho = null) {
         ${espalhado ? `<div style="font-size:10px;color:var(--c-accent)">🔗 Este carrinho também tem pedido(s) em outra impressora</div>` : ''}
       </div>
       <div class="pedido-card-footer">
-        ${acoes}
-        ${(p.status !== 'concluido' && p.status !== 'cancelado') || (p.status === 'concluido' && !p.forma_pagamento) ? `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${p.id}','${(p.cliente_nome_pdv||'').replace(/'/g,"\\'")}','${p.impressora_id||''}')">🛒 +</button>` : ''}
+        ${acoes[p.status] || ''}
+        ${(p.status !== 'concluido' && p.status !== 'cancelado') || carrinho ? `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${p.id}','${(p.cliente_nome_pdv||'').replace(/'/g,"\\'")}','${p.impressora_id||''}')">🛒 +</button>` : ''}
         <span class="pedido-card-valor">${formatMoney(p.total)}</span>
       </div>
       ${p.status === 'imprimindo' && p.folhas_usadas !== null ? `
@@ -6628,12 +6742,15 @@ async function renderPedidoCard(p, espalhado = false, carrinho = null) {
 //    de refreshFila busca com order by created_at ascending) — por
 //    isso grupo[0] é sempre o pedido mais antigo, e é ele que define
 //    o número/posição do card na fila.
-async function renderPedidoCardGroup(grupo, espalhado = false, carrinho = null) {
+async function renderPedidoCardGroup(grupo, espalhado = false) {
   const principal = grupo[0];
   const carrinhoId = principal.carrinho_id;
   const clienteLabel = principal.cliente_nome_pdv || `Pedido #${principal.numero_pedido}`;
 
+  // Total do carrinho inteiro (inclui produtos avulsos adicionados via 🛒 +,
+  // não só a soma dos pedidos de cópia deste grupo).
   let totalCarrinho = grupo.reduce((acc, p) => acc + (p.total || 0), 0);
+  const carrinho = await obterCarrinhoPendentePorPedido(principal.id);
   if (carrinho) {
     const subtotalPreview = carrinho.itens.reduce((acc, i) => acc + i.preco_base * i.quantidade, 0);
     totalCarrinho = Math.max(0, subtotalPreview - (carrinho.desconto || 0));
@@ -6641,8 +6758,6 @@ async function renderPedidoCardGroup(grupo, espalhado = false, carrinho = null) 
 
   const prontos = grupo.filter(p => p.status === 'concluido' || p.status === 'cancelado').length;
   const todosProntos = prontos === grupo.length;
-  const todosPagos = grupo.every(p => p.forma_pagamento);
-  const precisaFinalizar = todosProntos && !todosPagos;
 
   const subitens = grupo.map(p => {
     const folhasEsperadas = p.paginas_por_documento
@@ -6668,17 +6783,6 @@ async function renderPedidoCardGroup(grupo, espalhado = false, carrinho = null) 
     `;
   }).join('');
 
-  // Botão para finalizar o carrinho inteiro (se todos prontos e pelo menos um não pago)
-  let btnFinalizar = '';
-  if (precisaFinalizar) {
-    if (carrinho) {
-      btnFinalizar = `<button class="btn btn--success btn--sm" onclick="verCarrinhoPorId('${carrinhoId}')">🛒 Finalizar Venda</button>`;
-    } else {
-      // Caso órfão: usa o primeiro pedido do grupo para finalizar individualmente
-      btnFinalizar = `<button class="btn btn--success btn--sm" onclick="finalizarPedidoOrfao('${principal.id}')">✅ Finalizar Venda</button>`;
-    }
-  }
-
   return `
     <div class="pedido-card" id="pedido-grupo-${carrinhoId || principal.id}"
          draggable="true" ondragstart="filaDragStart(event,'${principal.id}')"
@@ -6694,7 +6798,6 @@ async function renderPedidoCardGroup(grupo, espalhado = false, carrinho = null) 
         ${!todosProntos ? `<div style="font-size:10px;color:var(--c-text-3);margin-top:4px">⏳ ${prontos}/${grupo.length} prontos</div>` : ''}
       </div>
       <div class="pedido-card-footer">
-        ${btnFinalizar}
         <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPorId('${carrinhoId}')">🛒 Carrinho</button>
         <button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${principal.id}','${(principal.cliente_nome_pdv || '').replace(/'/g, "\\'")}','${principal.impressora_id || ''}')">🛒 +</button>
         <span class="pedido-card-valor">${formatMoney(totalCarrinho)}</span>
@@ -6702,82 +6805,6 @@ async function renderPedidoCardGroup(grupo, espalhado = false, carrinho = null) 
     </div>
   `;
 }
-
-window.finalizarPedidoOrfao = async function(pedidoId) {
-  const { data: pedido, error } = await sb
-    .from('pedidos_copia')
-    .select('*')
-    .eq('id', pedidoId)
-    .single();
-
-  if (error || !pedido) {
-    toast('Pedido não encontrado.', 'error');
-    return;
-  }
-
-  if (pedido.forma_pagamento) {
-    toast('Este pedido já foi pago.', 'info');
-    return;
-  }
-
-  // Abre um modal simples para escolher a forma de pagamento
-  openModal('Finalizar Venda (Pedido sem Carrinho)', `
-    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
-      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
-        <div><strong>Pedido #${pedido.numero_pedido}</strong></div>
-        <div>${pedido.quantidade} cópias · ${labelTipoCopia(pedido.tipo)}</div>
-        <div style="font-size:var(--t-xl);font-weight:700;color:var(--c-accent);margin-top:var(--sp-2)">${formatMoney(pedido.total)}</div>
-      </div>
-      <div class="field">
-        <label>Forma de Pagamento</label>
-        <select class="input" id="orfao-pagamento">
-          <option value="" disabled selected>Selecione…</option>
-          ${['dinheiro','pix','pix_brl','cartao_debito','cartao_credito','transferencia','fiado'].map(fp => `<option value="${fp}">${labelPagamento(fp)}</option>`).join('')}
-        </select>
-      </div>
-      <button class="btn btn--success btn--lg" style="width:100%;justify-content:center" onclick="confirmarFinalizacaoOrfao('${pedidoId}')">
-        ✅ Confirmar Pagamento
-      </button>
-    </div>
-  `, 'modal--lg');
-};
-
-window.confirmarFinalizacaoOrfao = async function(pedidoId) {
-  const forma = document.getElementById('orfao-pagamento')?.value;
-  if (!forma) {
-    toast('Selecione a forma de pagamento.', 'warning');
-    return;
-  }
-
-  const { data: pedido } = await sb
-    .from('pedidos_copia')
-    .select('total')
-    .eq('id', pedidoId)
-    .single();
-
-  if (!pedido) {
-    toast('Pedido não encontrado.', 'error');
-    return;
-  }
-
-  const { error } = await sb
-    .from('pedidos_copia')
-    .update({
-      forma_pagamento: forma,
-      ...camposBRL(forma, pedido.total || 0),
-      concluido_at: new Date().toISOString() // atualiza a data de conclusão
-    })
-    .eq('id', pedidoId);
-
-  if (error) {
-    toast('Erro ao finalizar: ' + error.message, 'error');
-    return;
-  }
-
-  toast('✅ Venda finalizada!', 'success');
-  closeModal();
-  await refreshFila();
-};
 
 // ============================================================
 // ── DRAG-AND-DROP: JUNTAR PEDIDOS NO MESMO CARRINHO ─────────
@@ -7116,13 +7143,18 @@ window.acaoFila = async function(acao, pedidoId) {
 
 // ── Modal de Conferência e Entrega ────────────────────────
 window.abrirModalConferencia = async function(pedidoId) {
-  const { data: p } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
-  if (!p) return;
+  let p = FILA_CACHE.pedidos.find(p => p.id === pedidoId);
+  if (!p) {
+    // Fallback
+    const { data } = await sb.from('pedidos_copia').select('*').eq('id', pedidoId).single();
+    p = data;
+  }
+  if (!p) { toast('Pedido não encontrado', 'error'); return; }
 
   const paginasPorDoc = p.paginas_por_documento || 1;
   const totalPaginas = p.quantidade * paginasPorDoc;
   const folhasEsperadas = Math.ceil(totalPaginas / (p.frente_verso ? 2 : 1));
-  const clienteLabel     = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
+  const clienteLabel = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
 
   openModal('✅ Conferência e Entrega', `
     <div style="display:flex;flex-direction:column;gap:var(--sp-4)">

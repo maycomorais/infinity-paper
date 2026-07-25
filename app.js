@@ -5936,16 +5936,31 @@ window.limparConcluidos = async function() {
 // Variável para debounce
 let _refreshFilaTimeout = null;
 let _refreshFilaRunning = false;
+// BUG CORRIGIDO: antes, cada chamada não-forçada criava sua PRÓPRIA Promise
+// presa a UM setTimeout. Se uma segunda chamada chegasse antes dos 300ms
+// (ex: dois pedidos do mesmo carrinho confirmados em sequência, ou o
+// auto-refresh de 60s cruzando com uma confirmação), ela cancelava o
+// timeout da primeira via clearTimeout() — mas a Promise da primeira
+// chamada nunca era resolvida, porque seu callback nunca executava.
+// Resultado: `await refreshFila()` travava PARA SEMPRE em quem chamou
+// primeiro — e era exatamente ali (confirmarConferencia) que ficava o
+// código que abre o carrinho pra pagamento. Por isso o modal não aparecia.
+// Correção: todas as chamadas dentro da janela de debounce entram numa
+// fila de resolvers; quando a execução (única) finalmente roda, TODAS são
+// resolvidas juntas — nenhuma Promise fica órfã.
+let _refreshFilaResolvers = [];
 
 window.refreshFila = async function(force = false) {
-  // Debounce: se chamada novamente dentro de 300ms, reinicia o timer
   if (!force) {
     if (_refreshFilaTimeout) clearTimeout(_refreshFilaTimeout);
     return new Promise((resolve) => {
+      _refreshFilaResolvers.push(resolve);
       _refreshFilaTimeout = setTimeout(async () => {
         _refreshFilaTimeout = null;
         await _refreshFilaInternal();
-        resolve();
+        const resolvers = _refreshFilaResolvers;
+        _refreshFilaResolvers = [];
+        resolvers.forEach(r => r());
       }, 300);
     });
   }
@@ -6068,6 +6083,16 @@ async function _refreshFilaInternal() {
           ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
           : Math.ceil(p.quantidade / (p.frente_verso ? 2 : 1));
 
+        const rodape = p.status === 'concluido'
+          ? (carrinho
+              ? `<button class="btn btn--success btn--sm" style="flex:1" onclick="verCarrinhoPendente('${p.id}')">💳 Finalizar Venda</button>`
+              : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue${p.forma_pagamento ? ' · ' + labelPagamento(p.forma_pagamento) : ''}</span>`)
+          : `
+              <button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
+              <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
+              <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>
+            `;
+
         return `
           <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}">
             <div class="pedido-card-header">
@@ -6085,9 +6110,7 @@ async function _refreshFilaInternal() {
               ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
             </div>
             <div class="pedido-card-footer">
-              <button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
-              <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
-              <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>
+              ${rodape}
               <span class="pedido-card-valor">${formatMoney(p.total)}</span>
             </div>
           </div>
@@ -6142,8 +6165,16 @@ window.verCarrinhoPendente = async function(pedidoId) {
   if (!carrinho) { toast('Carrinho não encontrado', 'error'); return; }
 
   _carrinhoPendenteAtual = carrinho;
-  const { data: pedidos } = await sb.from('pedidos_copia').select('status, forma_pagamento').eq('carrinho_id', carrinho.id);
-  const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
+  // Usa o cache da fila primeiro (atualizado a cada refreshFila) — evita
+  // uma query extra e deixa a abertura do carrinho mais rápida.
+  let pedidos = (FILA_CACHE.pedidos || [])
+    .filter(x => x.carrinho_id === carrinho.id)
+    .map(x => ({ status: x.status, forma_pagamento: x.forma_pagamento }));
+  if (pedidos.length === 0) {
+    const { data } = await sb.from('pedidos_copia').select('status, forma_pagamento').eq('carrinho_id', carrinho.id);
+    pedidos = data || [];
+  }
+  const todosProntos = pedidos.every(p => p.status === 'concluido' || p.status === 'cancelado');
   const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
   openModal(`🛒 Carrinho de ${carrinho.cliente_nome || 'Cliente'}`, modalBody, 'modal--lg', _avisarFecharCarrinhoSemPagamento);
 };
@@ -6178,33 +6209,42 @@ window.verCarrinhoPorId = async function(carrinhoId) {
     return;
   }
 
-  // Verifica se todos os pedidos de cópia vinculados estão concluídos ou cancelados
-  const { data: pedidos, error: errPedidos } = await sb
-    .from('pedidos_copia')
-    .select('status, forma_pagamento')
-    .eq('carrinho_id', carrinhoId);
-
-  if (errPedidos) {
-    toast('Erro ao verificar status dos pedidos: ' + errPedidos.message, 'error');
-    return;
+  // Verifica status dos pedidos de cópia vinculados — cache primeiro
+  // (atualizado por refreshFila(true) logo antes de chamar esta função,
+  // ex: em confirmarConferencia), com fallback pro banco se não achar.
+  let pedidos = (FILA_CACHE.pedidos || [])
+    .filter(x => x.carrinho_id === carrinhoId)
+    .map(x => ({ status: x.status, forma_pagamento: x.forma_pagamento }));
+  if (pedidos.length === 0) {
+    const { data, error: errPedidos } = await sb
+      .from('pedidos_copia')
+      .select('status, forma_pagamento')
+      .eq('carrinho_id', carrinhoId);
+    if (errPedidos) {
+      toast('Erro ao verificar status dos pedidos: ' + errPedidos.message, 'error');
+      return;
+    }
+    pedidos = data || [];
   }
 
   // Já pago, mas a linha do carrinho não foi apagada (FK) → trata como finalizado
-  const jaPago = (pedidos || []).length > 0 && pedidos.every(p => p.forma_pagamento);
+  const jaPago = pedidos.length > 0 && pedidos.every(p => p.forma_pagamento);
   if (jaPago) {
     await exibirResumoCarrinhoFinalizado(carrinhoId);
     return;
   }
 
-  const todosProntos = (pedidos || []).every(p => p.status === 'concluido' || p.status === 'cancelado');
+  // BUG CORRIGIDO: aqui existia um segundo check que tratava "todos prontos"
+  // (impressão entregue) como sinônimo de "já finalizado" (venda paga) e
+  // mostrava o resumo somente-leitura — mesmo quando forma_pagamento ainda
+  // era null. Resultado: depois da conferência do último item, em vez do
+  // formulário de pagamento abrir, aparecia um resumo read-only que nem
+  // permite escolher a forma de pagamento. `jaPago` acima já cobre
+  // corretamente o caso "realmente finalizado"; "todosProntos" só deve
+  // controlar se o botão de finalizar fica habilitado, não qual modal abre.
+  const todosProntos = pedidos.every(p => p.status === 'concluido' || p.status === 'cancelado');
 
-  // Se todos estão prontos e há pedidos, já foi finalizado – exibe apenas visualização
-  if (todosProntos && pedidos && pedidos.length > 0) {
-    await exibirResumoCarrinhoFinalizado(carrinhoId);
-    return;
-  }
-
-  // Caso contrário, exibe o modal de finalização (com opções de edição)
+  // Exibe o modal de finalização (com opções de edição/pagamento)
   _carrinhoPendenteAtual = carrinho;
   const modalBody = renderCarrinhoPendenteModalBody(carrinho, '', todosProntos);
   openModal(
@@ -7289,8 +7329,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   const obs = document.getElementById('conf-obs')?.value || null;
 
   // Pedido sem carrinho: nunca vai passar por finalizarCarrinhoPendente,
-  // então o pagamento precisa ser definido agora, senão ele "conclui" sem
-  // forma de pagamento e some do controle do caixa.
+  // então o pagamento precisa ser definido agora
   let formaPagamentoStandalone = null;
   if (!carrinhoId && resultado !== 'refazer') {
     formaPagamentoStandalone = document.getElementById('conf-forma-pagamento')?.value || '';
@@ -7342,9 +7381,6 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
         cliente_nome_pdv: pedidoOriginal.cliente_nome_pdv,
         observacoes: `[REIMPRESSÃO PARCIAL de #${pedidoOriginal.numero_pedido}] ${obs || ''}`.trim(),
         forma_pagamento: pedidoOriginal.forma_pagamento,
-        // Mantém o carrinho_id do pedido original: é gratuita (total 0),
-        // mas precisa passar pela finalização do carrinho para receber a
-        // forma de pagamento correta e não ficar com "—" no histórico/caixa.
         carrinho_id: pedidoOriginal.carrinho_id || null,
       });
     }
@@ -7360,7 +7396,6 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
       [campo]: (imp[campo] || 0) + folhasReal,
       [campoTotal]: (imp[campoTotal] || 0) + folhasReal,
     }).eq('id', impressoraId);
-    // atualiza state local
     if (imp[campo] !== undefined) imp[campo] += folhasReal;
     if (imp[campoTotal] !== undefined) imp[campoTotal] += folhasReal;
   }
@@ -7374,7 +7409,7 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
       const consumo = v.quantidade * folhasReal;
       const estoqueAtual = v.insumos?.estoque_atual || 0;
       if (estoqueAtual < consumo) {
-        toast(`⚠️ Estoque de "${v.insumos?.nome}" ficou negativo (usado além do disponível).`, 'warning', 5000);
+        toast(`⚠️ Estoque de "${v.insumos?.nome}" ficou negativo.`, 'warning', 5000);
       }
       await sb.from('produtos').update({ estoque_atual: Math.max(0, estoqueAtual - consumo) }).eq('id', v.insumo_id);
     }
@@ -7389,15 +7424,23 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   }).eq('id', pedidoId);
 
   closeModal();
-  await refreshFila();
+  // force=true aqui: esse é o passo mais crítico do fluxo (é logo depois
+  // dele que decidimos se abrimos o carrinho pra pagamento) — não faz
+  // sentido esperar o debounce de 300ms usado pelo auto-refresh comum.
+  // Esse refresh também atualiza FILA_CACHE.pedidos, usado logo abaixo.
+  await refreshFila(true);
 
-  // Verifica se todos os pedidos do carrinho estão prontos
-  if (carrinhoId) {
-    const { data: irmaos } = await sb.from('pedidos_copia').select('status').eq('carrinho_id', carrinhoId);
-    const todosProntos = (irmaos || []).every(x => x.status === 'concluido' || x.status === 'cancelado');
+  // Verifica se todos os pedidos do carrinho estão prontos, direto do
+  // cache que acabou de ser atualizado — sem nova query, sem delay
+  // artificial: o carrinho abre imediatamente quando é o último item.
+  const carrinhoIdValido = carrinhoId && carrinhoId !== 'null' && carrinhoId !== 'undefined' ? carrinhoId : null;
+
+  if (carrinhoIdValido) {
+    const irmaos = (FILA_CACHE.pedidos || []).filter(x => x.carrinho_id === carrinhoIdValido);
+    const todosProntos = irmaos.length > 0 && irmaos.every(x => x.status === 'concluido' || x.status === 'cancelado');
     if (todosProntos) {
-      toast('🎉 Pedido pronto! Abrindo carrinho para pagamento...', 'success', 3000);
-      setTimeout(() => verCarrinhoPendente(pedidoId), 400);
+      verCarrinhoPorId(carrinhoIdValido);
+      toast('🎉 Pedido pronto — carrinho aberto para pagamento.', 'success', 2500);
       return;
     }
   }

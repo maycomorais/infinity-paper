@@ -6071,47 +6071,140 @@ async function _refreshFilaInternal() {
         continue;
       }
 
-      const cardsHtml = pedidosFiltrados.map(p => {
-        const carrinho = carrinhosMap[p.carrinho_id] || null;
-        let totalCarrinho = 0;
+      // Agrupa por carrinho_id — um carrinho com 2 tipos de impressão (ou
+      // impressão + produto) deve virar UM card só, não um por linha.
+      // Pedidos sem carrinho_id (não deveria acontecer no fluxo normal,
+      // mas por segurança) ficam cada um em seu próprio grupo solo.
+      const gruposMap = {};
+      const ordemGrupos = [];
+      pedidosFiltrados.forEach(p => {
+        const chave = p.carrinho_id || `solo-${p.id}`;
+        if (!gruposMap[chave]) { gruposMap[chave] = []; ordemGrupos.push(chave); }
+        gruposMap[chave].push(p);
+      });
+
+      const cardsHtml = ordemGrupos.map(chave => {
+        const grupo = gruposMap[chave];
+        const principal = grupo[0]; // pedido mais antigo do grupo (query já vem ordenada)
+        const carrinho = carrinhosMap[principal.carrinho_id] || null;
+
+        // Multiplicador correto por item do espelho JSON: FOLHAS quando
+        // "preço por folha" está marcado, quantidade no caso normal —
+        // mesma regra usada no resto do sistema (itemTotal/retirada).
+        let totalCarrinho = grupo.reduce((acc, p) => acc + (p.total || 0), 0);
         if (carrinho) {
-          totalCarrinho = (carrinho.itens || []).reduce((acc, i) => acc + (i.preco_base || 0) * (i.quantidade || 0), 0);
+          totalCarrinho = (carrinho.itens || []).reduce((acc, i) => {
+            const mult = (i.tipo_item === 'copia' && i.preco_por_folha) ? (i.total_folhas || i.quantidade) : i.quantidade;
+            return acc + (i.preco_base || 0) * mult;
+          }, 0);
           totalCarrinho = Math.max(0, totalCarrinho - (carrinho.desconto || 0));
         }
-        const clienteLabel = p.cliente_nome_pdv || `Pedido #${p.numero_pedido}`;
-        const folhasEsperadas = p.paginas_por_documento
-          ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
-          : Math.ceil(p.quantidade / (p.frente_verso ? 2 : 1));
 
-        const rodape = p.status === 'concluido'
+        const clienteLabel = principal.cliente_nome_pdv || `Pedido #${principal.numero_pedido}`;
+        const clienteEscapado = (principal.cliente_nome_pdv || '').replace(/'/g, "\\'");
+        const botaoAdicionar = `<button class="btn btn--ghost btn--sm" onclick="abrirMiniCarrinhoFila('${principal.id}','${clienteEscapado}','${principal.impressora_id || ''}')" title="Adicionar mais itens a este carrinho">🛒 +</button>`;
+        const temProdutos = carrinho && (carrinho.itens || []).some(i => i.tipo_item === 'produto');
+
+        // ── Grupo com um único item: mantém exatamente o layout anterior ──
+        if (grupo.length === 1) {
+          const p = principal;
+          const folhasEsperadas = p.paginas_por_documento
+            ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+            : Math.ceil(p.quantidade / (p.frente_verso ? 2 : 1));
+
+          const rodape = p.status === 'concluido'
+            ? (carrinho
+                ? `<button class="btn btn--success btn--sm" style="flex:1" onclick="verCarrinhoPendente('${p.id}')">💳 Finalizar Venda</button>${botaoAdicionar}`
+                : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue${p.forma_pagamento ? ' · ' + labelPagamento(p.forma_pagamento) : ''}</span>`)
+            : `
+                <button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
+                <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
+                <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>
+                ${botaoAdicionar}
+              `;
+
+          return `
+            <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}"
+                 ${p.status !== 'concluido' && p.status !== 'cancelado' ? `draggable="true" ondragstart="filaDragStart(event,'${p.id}')"` : ''}
+                 ondragover="filaDragOver(event)" ondragleave="filaDragLeave(event)" ondrop="filaDrop(event,'${p.id}')">
+              <div class="pedido-card-header">
+                <span class="pedido-card-num">#${p.numero_pedido}</span>
+                <span class="pedido-card-cliente">${clienteLabel}</span>
+                <span class="status-fila status-fila--${p.status}">${labelStatusFila(p.status)}</span>
+              </div>
+              <div class="pedido-card-body">
+                <div><strong>${p.quantidade}</strong> cópias · ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
+                <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
+                ${temProdutos ? `<div style="font-size:var(--t-xs);color:var(--c-text-3)">📦 + produto(s) no carrinho</div>` : ''}
+                <div style="color:var(--c-text-3);font-size:10px;margin-top:2px">
+                  Recebido: ${formatDateTime(p.created_at)}
+                  ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
+                </div>
+                ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
+              </div>
+              <div class="pedido-card-footer">
+                ${rodape}
+                <span class="pedido-card-valor">${formatMoney(p.total)}</span>
+              </div>
+            </div>
+          `;
+        }
+
+        // ── Grupo com múltiplos itens: um card só, cada linha com sua
+        //    própria conferência, carrinho/total/pagamento únicos ──
+        const todosConcluidosOuCancelados = grupo.every(p => p.status === 'concluido' || p.status === 'cancelado');
+        const statusAgregado = todosConcluidosOuCancelados
+          ? 'concluido'
+          : (['erro', 'conferencia', 'imprimindo', 'na_fila'].find(s => grupo.some(p => p.status === s)) || 'na_fila');
+
+        const linhasItens = grupo.map(p => {
+          const folhasEsperadas = p.paginas_por_documento
+            ? Math.ceil((p.quantidade * p.paginas_por_documento) / (p.frente_verso ? 2 : 1))
+            : Math.ceil(p.quantidade / (p.frente_verso ? 2 : 1));
+          const acaoLinha = (p.status === 'concluido' || p.status === 'cancelado')
+            ? `<span style="font-size:12px;color:${p.status === 'concluido' ? 'var(--c-success)' : 'var(--c-text-3)'}">${p.status === 'concluido' ? '✓' : '✕'}</span>`
+            : `
+                <button class="btn btn--ghost btn--sm" style="padding:2px 8px" onclick="abrirModalConferencia('${p.id}')" title="Confirmar este item">✅</button>
+                <button class="btn btn--ghost btn--sm" style="padding:2px 6px" onclick="acaoFila('cancelar','${p.id}')" title="Cancelar este item">✕</button>
+              `;
+          return `
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px dashed var(--c-border)">
+              <div style="min-width:0">
+                <div><strong>${p.quantidade}</strong> ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
+                <div style="color:var(--c-text-3);font-size:10px">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} · ${labelStatusFila(p.status)}</div>
+              </div>
+              <div style="display:flex;align-items:center;gap:2px;flex-shrink:0">${acaoLinha}</div>
+            </div>
+          `;
+        }).join('');
+
+        const rodapeGrupo = statusAgregado === 'concluido'
           ? (carrinho
-              ? `<button class="btn btn--success btn--sm" style="flex:1" onclick="verCarrinhoPendente('${p.id}')">💳 Finalizar Venda</button>`
-              : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue${p.forma_pagamento ? ' · ' + labelPagamento(p.forma_pagamento) : ''}</span>`)
+              ? `<button class="btn btn--success btn--sm" style="flex:1" onclick="verCarrinhoPendente('${principal.id}')">💳 Finalizar Venda</button>${botaoAdicionar}`
+              : `<span style="font-size:var(--t-xs);color:var(--c-success)">✓ Entregue</span>`)
           : `
-              <button class="btn btn--success btn--sm" onclick="abrirModalConferencia('${p.id}')">✅ Confirmar</button>
-              <button class="btn btn--ghost btn--sm" onclick="acaoFila('cancelar','${p.id}')">✕</button>
-              <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${p.id}')">🛒 Carrinho</button>
+              <button class="btn btn--ghost btn--sm" onclick="verCarrinhoPendente('${principal.id}')">🛒 Carrinho</button>
+              ${botaoAdicionar}
             `;
 
         return `
-          <div class="pedido-card pedido-card--${p.status}" id="pedido-${p.id}">
+          <div class="pedido-card pedido-card--${statusAgregado}" id="carrinho-grupo-${chave}"
+               ${statusAgregado !== 'concluido' ? `draggable="true" ondragstart="filaDragStart(event,'${principal.id}')"` : ''}
+               ondragover="filaDragOver(event)" ondragleave="filaDragLeave(event)" ondrop="filaDrop(event,'${principal.id}')">
             <div class="pedido-card-header">
-              <span class="pedido-card-num">#${p.numero_pedido}</span>
+              <span class="pedido-card-num">#${principal.numero_pedido} <span style="opacity:.7">+${grupo.length - 1}</span></span>
               <span class="pedido-card-cliente">${clienteLabel}</span>
-              <span class="status-fila status-fila--${p.status}">${labelStatusFila(p.status)}</span>
+              <span class="status-fila status-fila--${statusAgregado}">${labelStatusFila(statusAgregado)}</span>
             </div>
             <div class="pedido-card-body">
-              <div><strong>${p.quantidade}</strong> cópias · ${labelTipoCopia(p.tipo)}${p.frente_verso ? ' · F/V' : ''}</div>
-              <div style="color:var(--c-text-3)">📄 ~${folhasEsperadas} folha${folhasEsperadas!==1?'s':''} esperadas</div>
-              <div style="color:var(--c-text-3);font-size:10px;margin-top:2px">
-                Recebido: ${formatDateTime(p.created_at)}
-                ${p.forma_pagamento ? ` · ${labelPagamento(p.forma_pagamento)}` : ''}
-              </div>
+              ${linhasItens}
+              ${temProdutos ? `<div style="font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">📦 + produto(s) no carrinho</div>` : ''}
+              <div style="color:var(--c-text-3);font-size:10px;margin-top:2px">Recebido: ${formatDateTime(principal.created_at)}</div>
               ${carrinho ? `<div style="font-size:var(--t-xs);color:var(--c-accent)">🛒 Carrinho pendente: ≈ ${formatMoney(totalCarrinho)}</div>` : ''}
             </div>
             <div class="pedido-card-footer">
-              ${rodape}
-              <span class="pedido-card-valor">${formatMoney(p.total)}</span>
+              ${rodapeGrupo}
+              <span class="pedido-card-valor">${formatMoney(carrinho ? totalCarrinho : grupo.reduce((a, p) => a + (p.total || 0), 0))}</span>
             </div>
           </div>
         `;
@@ -7340,11 +7433,41 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
   }
 
   if (resultado === 'refazer') {
+    // BUG CORRIGIDO: reimpressão total voltava pra fila sem baixar estoque
+    // nenhum — mas o papel da tentativa que falhou já foi fisicamente
+    // gasto (é descartado, não reaproveitado). O resultado, com o tempo,
+    // era o estoque de folhas ficando cada vez mais otimista em relação
+    // à realidade, proporcional ao volume de reimpressões totais.
+    // Usa folhasReal (o campo "Folhas usadas (real)", sempre visível no
+    // formulário de conferência) como a quantidade desperdiçada.
+    if (pedidoAtual.insumo_folha_id && folhasReal > 0) {
+      const { data: folhaProd } = await sb
+        .from('produtos')
+        .select('estoque_atual')
+        .eq('id', pedidoAtual.insumo_folha_id)
+        .single();
+      if (folhaProd) {
+        await sb.from('produtos')
+          .update({ estoque_atual: Math.max(0, folhaProd.estoque_atual - folhasReal) })
+          .eq('id', pedidoAtual.insumo_folha_id);
+      }
+    }
+    if (pedidoAtual.tipo && folhasReal > 0) {
+      const { data: vinculosInsumo } = await sb.from('copia_insumos')
+        .select('*, insumos:insumo_id(id, nome, estoque_atual)')
+        .eq('tipo_copia', pedidoAtual.tipo);
+      for (const v of (vinculosInsumo || [])) {
+        const consumo = v.quantidade * folhasReal;
+        const estoqueAtual = v.insumos?.estoque_atual || 0;
+        await sb.from('produtos').update({ estoque_atual: Math.max(0, estoqueAtual - consumo) }).eq('id', v.insumo_id);
+      }
+    }
+
     await sb.from('pedidos_copia').update({
       status: 'na_fila',
-      observacoes: `[REIMPRESSÃO TOTAL] ${obs || ''}`.trim(),
+      observacoes: `[REIMPRESSÃO TOTAL — ${folhasReal} folha(s) desperdiçada(s)] ${obs || ''}`.trim(),
     }).eq('id', pedidoId);
-    toast('↺ Pedido voltou para a fila para reimpressão total.', 'warning');
+    toast(`↺ Pedido voltou para a fila. ${folhasReal} folha(s) descontada(s) do estoque (desperdício).`, 'warning', 4500);
     closeModal();
     await refreshFila();
     return;
@@ -7415,10 +7538,23 @@ window.confirmarConferencia = async function(pedidoId, qtdOriginal, folhasEspera
     }
   }
 
-  // Marca pedido como concluído
+  // Marca pedido como concluído.
+  // BUG CORRIGIDO: total_folhas ficava congelado na ESTIMATIVA (calculada
+  // no momento do carrinho) pra sempre — mesmo a baixa de estoque acima
+  // usando folhasReal (o valor real conferido aqui). Se esse pedido fosse
+  // excluído do histórico depois (Caixa → excluir lançamento), a devolução
+  // de estoque em _excluirPedidoCopiaEReverterEstoque lia total_folhas —
+  // ou seja, devolvia a ESTIMATIVA, não a quantidade real que foi
+  // efetivamente descontada. Sempre que o operador corrigia "Folhas usadas
+  // (real)" pra um valor diferente da estimativa (comum: reimpressão por
+  // engasgo, ajuste de frente/verso), o estoque ficava com uma diferença
+  // permanente a cada exclusão. Agora total_folhas é atualizado pro valor
+  // real na conclusão, então tanto o consumo quanto a eventual devolução
+  // usam o mesmo número.
   await sb.from('pedidos_copia').update({
     status: 'concluido',
     concluido_at: new Date().toISOString(),
+    total_folhas: folhasReal,
     observacoes: obs ? `[Conferência] ${obs}` : null,
     ...(formaPagamentoStandalone ? { forma_pagamento: formaPagamentoStandalone, ...camposBRL(formaPagamentoStandalone, pedidoAtual.total || 0) } : {}),
   }).eq('id', pedidoId);

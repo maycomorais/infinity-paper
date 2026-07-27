@@ -735,11 +735,14 @@ window.closeModal = closeModal;
 // Vendas em 'fiado' NÃO contam como receita enquanto não forem
 // quitadas — contam no dia em que o cliente realmente pagar
 // (quitado_em), não no dia da venda original.
-async function getTotalRealizado(tabela, dataInicioISO) {
-  const [{ data: normais }, { data: quitados }] = await Promise.all([
-    sb.from(tabela).select('total').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO),
-    sb.from(tabela).select('total').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO),
-  ]);
+async function getTotalRealizado(tabela, dataInicioISO, dataFimISO = null) {
+  let qNormais = sb.from(tabela).select('total').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO);
+  let qQuitados = sb.from(tabela).select('total').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO);
+  if (dataFimISO) {
+    qNormais = qNormais.lte('created_at', dataFimISO);
+    qQuitados = qQuitados.lte('quitado_em', dataFimISO);
+  }
+  const [{ data: normais }, { data: quitados }] = await Promise.all([qNormais, qQuitados]);
   const total = (normais || []).reduce((a, b) => a + (b.total || 0), 0)
               + (quitados || []).reduce((a, b) => a + (b.total || 0), 0);
   const count = (normais || []).length + (quitados || []).length;
@@ -750,15 +753,21 @@ async function getTotalRealizado(tabela, dataInicioISO) {
 // Mesma regra do getTotalRealizado: fiado pendente não entra; fiado
 // quitado entra no dia da quitação, sob a forma de pagamento real
 // usada pra quitar (forma_pagamento_quitacao).
-async function getBreakdownPagamento(dataInicioISO) {
+// dataFimISO é opcional — sem ele, o período fica aberto (usado pelo
+// fechamento do dia corrente); com ele, fica limitado a uma janela
+// (usado pra reconstruir o relatório de uma sessão de caixa já fechada).
+async function getBreakdownPagamento(dataInicioISO, dataFimISO = null) {
   const grupos = {};
   const soma = (fp, valor) => { grupos[fp] = (grupos[fp] || 0) + (valor || 0); };
 
   for (const tabela of ['pedidos_copia', 'vendas']) {
-    const [{ data: normais }, { data: quitados }] = await Promise.all([
-      sb.from(tabela).select('total,forma_pagamento').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO),
-      sb.from(tabela).select('total,forma_pagamento_quitacao').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO),
-    ]);
+    let qNormais = sb.from(tabela).select('total,forma_pagamento').eq('status', 'concluido').neq('forma_pagamento', 'fiado').gte('created_at', dataInicioISO);
+    let qQuitados = sb.from(tabela).select('total,forma_pagamento_quitacao').eq('forma_pagamento', 'fiado').eq('fiado_quitado', true).gte('quitado_em', dataInicioISO);
+    if (dataFimISO) {
+      qNormais = qNormais.lte('created_at', dataFimISO);
+      qQuitados = qQuitados.lte('quitado_em', dataFimISO);
+    }
+    const [{ data: normais }, { data: quitados }] = await Promise.all([qNormais, qQuitados]);
     (normais || []).forEach(r => soma(r.forma_pagamento || 'dinheiro', r.total));
     (quitados || []).forEach(r => soma(r.forma_pagamento_quitacao || 'dinheiro', r.total));
   }
@@ -1949,6 +1958,7 @@ async function carregarHistoricoVendas() {
                   <span class="table-day-header__label">📅 Vendas dia ${formatDate(g.data)}</span>
                   <span class="table-day-header__count">${resumo.qtd} ${resumo.qtd === 1 ? 'venda' : 'vendas'}</span>
                   <span class="table-day-header__total">Total do dia: ${formatMoney(resumo.total)}</span>
+                  <button class="table-day-header__fechamento-btn" onclick="abrirRelatorioFechamentoDoDia('${g.data}')" title="Ver relatório de fechamento de caixa deste dia">🧾</button>
                 </div>
                 <div class="table-day-header__breakdown">${chipsPagamento}</div>
               </td>
@@ -2165,6 +2175,10 @@ function getVisibleNavItems() {
 // ============================================================
 
 async function renderCaixa(el) {
+  // Reseta a paginação do Histórico de Caixas sempre que a página é
+  // aberta do zero (evita entrar já na página 3 de uma visita anterior).
+  _caixaHistState.pagina = 1;
+
   // Carrega sessões e dados da empresa
   const [{ data: sessoes }, { data: empresa }] = await Promise.all([
     sb.from('caixa_sessoes').select('*, funcionarios(nome)').order('aberto_em', { ascending: false }).limit(10),
@@ -2285,32 +2299,82 @@ async function renderCaixa(el) {
       <div class="table-wrap" id="historico-vendas"></div>
     </div>
 
-    <!-- Histórico de caixas (já existente) -->
+    <!-- Histórico de caixas (paginado) -->
     <div class="card" style="margin-top: var(--sp-4);">
       <div class="card-header"><span class="card-title">Histórico de Caixas</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
-          <tbody>
-            ${(sessoes||[]).map(s => `
-              <tr>
-                <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
-                <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
-                <td>${formatMoney(s.valor_abertura)}</td>
-                <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
-                <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
-                <td style="color:${(s.quebra || 0) > 0 ? 'var(--c-success)' : (s.quebra || 0) < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(s.quebra || 0)}</td>
-                <td>${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}</td>
-              </tr>
-            `).join('') || '<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa registrado</div></div></td></tr>'}
-          </tbody>
-        </table>
-      </div>
+      <div class="table-wrap" id="historico-caixas"></div>
     </div>     
 
   `;
   await carregarHistoricoVendas();
+  await carregarHistoricoCaixas();
 }
+
+// ── Histórico de Caixas — paginado no servidor (não carrega tudo de uma
+// vez), com acesso direto ao relatório de fechamento de qualquer sessão,
+// por mais antiga que seja.
+const _caixaHistState = { pagina: 1, porPagina: 10, totalPaginas: 1 };
+
+async function carregarHistoricoCaixas() {
+  const container = document.getElementById('historico-caixas');
+  if (!container) return;
+
+  const offset = (_caixaHistState.pagina - 1) * _caixaHistState.porPagina;
+  const { data: sessoes, count, error } = await sb
+    .from('caixa_sessoes')
+    .select('*, funcionarios(nome)', { count: 'exact' })
+    .order('aberto_em', { ascending: false })
+    .range(offset, offset + _caixaHistState.porPagina - 1);
+
+  if (error) {
+    container.innerHTML = `<div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Erro ao carregar: ${error.message}</div></div>`;
+    return;
+  }
+
+  _caixaHistState.totalPaginas = Math.max(1, Math.ceil((count || 0) / _caixaHistState.porPagina));
+  // Corrige se a página atual ficou fora do intervalo (ex: última sessão
+  // da última página foi excluída em outra aba)
+  if (_caixaHistState.pagina > _caixaHistState.totalPaginas) {
+    _caixaHistState.pagina = _caixaHistState.totalPaginas;
+    return carregarHistoricoCaixas();
+  }
+
+  container.innerHTML = `
+    <table>
+      <thead><tr><th>Abertura</th><th>Fechamento</th><th>Fundo</th><th>Total Cópias</th><th>Total Vendas</th><th>Quebra</th><th>Status</th></tr></thead>
+      <tbody>
+        ${(sessoes || []).map(s => `
+          <tr>
+            <td class="td-mono">${formatDateTime(s.aberto_em)}</td>
+            <td class="td-mono">${s.fechado_em ? formatDateTime(s.fechado_em) : '—'}</td>
+            <td>${formatMoney(s.valor_abertura)}</td>
+            <td style="color:var(--c-primary)">${formatMoney(s.total_copias)}</td>
+            <td style="color:var(--c-success)">${formatMoney(s.total_vendas)}</td>
+            <td style="color:${(s.quebra || 0) > 0 ? 'var(--c-success)' : (s.quebra || 0) < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(s.quebra || 0)}</td>
+            <td style="display:flex;align-items:center;gap:6px">
+              ${s.fechado_em ? '<span class="badge badge--success">Fechado</span>' : '<span class="badge badge--warning">Aberto</span>'}
+              <button class="btn btn--ghost btn--sm" onclick="verRelatorioFechamento('${s.id}')" title="Ver relatório de fechamento">🧾</button>
+            </td>
+          </tr>
+        `).join('') || `<tr><td colspan="7"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhum caixa registrado</div></div></td></tr>`}
+      </tbody>
+    </table>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:var(--sp-3) var(--sp-4);border-top:1px solid var(--c-border);flex-wrap:wrap;gap:var(--sp-2)">
+      <span style="font-size:var(--t-xs);color:var(--c-text-3)">Página ${_caixaHistState.pagina} de ${_caixaHistState.totalPaginas} · ${count || 0} sessões</span>
+      <div style="display:flex;gap:var(--sp-2)">
+        <button class="btn btn--ghost btn--sm" onclick="mudarPaginaCaixaHist(-1)" ${_caixaHistState.pagina <= 1 ? 'disabled' : ''}>← Anterior</button>
+        <button class="btn btn--ghost btn--sm" onclick="mudarPaginaCaixaHist(1)" ${_caixaHistState.pagina >= _caixaHistState.totalPaginas ? 'disabled' : ''}>Próxima →</button>
+      </div>
+    </div>
+  `;
+}
+
+window.mudarPaginaCaixaHist = function(delta) {
+  const nova = _caixaHistState.pagina + delta;
+  if (nova < 1 || nova > _caixaHistState.totalPaginas) return;
+  _caixaHistState.pagina = nova;
+  carregarHistoricoCaixas();
+};
 
 // ── ABRIR CAIXA ───────────────────────────────────────────
 window.abrirCaixa = function() {
@@ -2745,6 +2809,170 @@ window.confirmarFecharCaixa = async function(sessaoId, totalCopias, totalVendas,
   closeModal();
   renderCaixaStatusWidget();
   navigate('caixa');
+};
+
+// ── Relatório de fechamento (somente leitura) — acessível a qualquer
+// momento a partir do cabeçalho de cada dia no Histórico de Vendas, não
+// só na hora de fechar. Um dia pode ter mais de uma sessão de caixa
+// (abre/fecha várias vezes); nesse caso, deixa escolher qual ver.
+window.abrirRelatorioFechamentoDoDia = async function(dataStr) {
+  const d = new Date(dataStr);
+  const inicioDia = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).toISOString();
+  const fimDia = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999).toISOString();
+
+  const { data: sessoes, error } = await sb
+    .from('caixa_sessoes')
+    .select('*')
+    .gte('aberto_em', inicioDia)
+    .lte('aberto_em', fimDia)
+    .order('aberto_em', { ascending: false });
+
+  if (error) { toast('Erro ao buscar fechamento: ' + error.message, 'error'); return; }
+
+  if (!sessoes || sessoes.length === 0) {
+    toast('Nenhuma sessão de caixa encontrada para este dia.', 'warning');
+    return;
+  }
+
+  if (sessoes.length === 1) {
+    verRelatorioFechamento(sessoes[0].id);
+    return;
+  }
+
+  // Mais de uma sessão nesse dia — deixa escolher qual ver
+  openModal('🧾 Fechamentos deste dia', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-2)">
+      ${sessoes.map(s => `
+        <button class="btn btn--ghost" style="justify-content:space-between;width:100%" onclick="verRelatorioFechamento('${s.id}')">
+          <span>${formatDateTime(s.aberto_em)} → ${s.fechado_em ? formatDateTime(s.fechado_em) : 'ainda aberto'}</span>
+          <span class="badge badge--${s.fechado_em ? 'success' : 'warning'}">${s.fechado_em ? 'Fechado' : 'Aberto'}</span>
+        </button>
+      `).join('')}
+    </div>
+  `);
+};
+
+window.verRelatorioFechamento = async function(sessaoId) {
+  const { data: sessao, error } = await sb
+    .from('caixa_sessoes')
+    .select('*, funcionarios(nome)')
+    .eq('id', sessaoId)
+    .single();
+
+  if (error || !sessao) { toast('Sessão de caixa não encontrada.', 'error'); return; }
+
+  const abertoEmISO = sessao.aberto_em;
+  // Sessão ainda aberta (raro, mas alguém pode clicar no relatório antes
+  // de fechar): usa "agora" como limite superior pra não ficar em aberto.
+  const fechadoEmISO = sessao.fechado_em || new Date().toISOString();
+
+  const [{ total: totalCopias }, { total: totalVendas }, movimentosResp, breakdown] = await Promise.all([
+    getTotalRealizado('pedidos_copia', abertoEmISO, fechadoEmISO),
+    getTotalRealizado('vendas', abertoEmISO, fechadoEmISO),
+    sb.from('caixa_movimentos').select('*').eq('sessao_id', sessaoId),
+    getBreakdownPagamento(abertoEmISO, fechadoEmISO),
+  ]);
+
+  const movimentos = movimentosResp.data || [];
+  const totalGeral = totalCopias + totalVendas;
+  const totalSuprimentos = movimentos.filter(m => m.tipo === 'suprimento').reduce((a, b) => a + b.valor, 0);
+  const totalRetiradas   = movimentos.filter(m => m.tipo === 'retirada').reduce((a, b) => a + b.valor, 0);
+  const totalDespesas    = movimentos.filter(m => m.tipo === 'despesa').reduce((a, b) => a + b.valor, 0);
+  const totalSangrias    = movimentos.filter(m => m.tipo === 'sangria').reduce((a, b) => a + b.valor, 0);
+  const quebra = sessao.quebra || 0;
+
+  openModal('🧾 Relatório de Fechamento', `
+    <div style="display:flex;flex-direction:column;gap:var(--sp-4)">
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="display:flex;justify-content:space-between;font-size:var(--t-xs);color:var(--c-text-3)">
+          <span>Abertura</span><span>${formatDateTime(sessao.aberto_em)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px">
+          <span>Fechamento</span><span>${sessao.fechado_em ? formatDateTime(sessao.fechado_em) : '— (ainda aberto)'}</span>
+        </div>
+        ${sessao.funcionarios?.nome ? `<div style="display:flex;justify-content:space-between;font-size:var(--t-xs);color:var(--c-text-3);margin-top:4px"><span>Operador</span><span>${sessao.funcionarios.nome}</span></div>` : ''}
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">💰 Entradas da sessão</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span style="color:var(--c-text-3)">🖨️ Cópias / Impressões</span>
+          <span style="font-weight:600;color:var(--c-primary)">${formatMoney(totalCopias)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span style="color:var(--c-text-3)">📦 Produtos</span>
+          <span style="font-weight:600;color:var(--c-success)">${formatMoney(totalVendas)}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="font-weight:700">Total da sessão</span>
+          <span style="font-size:var(--t-xl);font-weight:800;color:var(--c-accent)">${formatMoney(totalGeral)}</span>
+        </div>
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">💳 Por forma de pagamento</div>
+        ${Object.keys(breakdown).length === 0 ? `<div style="color:var(--c-text-3);font-size:var(--t-xs)">Nenhuma venda nesta sessão</div>` :
+          Object.entries(breakdown).map(([fp, valor]) => `
+            <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+              <span>${labelPagamento(fp)}</span>
+              <span style="font-weight:600">${formatMoney(valor)}</span>
+            </div>
+          `).join('')}
+      </div>
+
+      <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-sm);color:var(--c-text-2);margin-bottom:var(--sp-3)">🏦 Movimentações do caixa</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">Abertura (fundo de caixa)</span>
+          <span style="font-weight:600">${formatMoney(sessao.valor_abertura || 0)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">+ Suprimentos</span>
+          <span style="font-weight:600;color:var(--c-success)">${formatMoney(totalSuprimentos)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Retiradas</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalRetiradas)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Despesas</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalDespesas)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:var(--t-sm)">
+          <span style="color:var(--c-text-3)">− Sangrias</span>
+          <span style="font-weight:600;color:var(--c-danger)">${formatMoney(totalSangrias)}</span>
+        </div>
+      </div>
+
+      ${sessao.fechado_em ? `
+      <div style="background:var(--c-bg);border:1.5px solid var(--c-primary);border-radius:var(--r-md);padding:var(--sp-4)">
+        <div style="font-size:var(--t-xs);color:var(--c-text-3);margin-bottom:var(--sp-3)">🔍 Conferência final (dinheiro físico)</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span>Saldo esperado</span>
+          <span style="font-weight:600">${formatMoney(sessao.valor_esperado || 0)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:var(--sp-2)">
+          <span>Valor conferido</span>
+          <span style="font-weight:600">${formatMoney(sessao.valor_conferido || 0)}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="font-weight:700">${quebra === 0 ? '✅ Bateu certinho' : quebra > 0 ? '✅ Sobra' : '⚠️ Falta'}</span>
+          <span style="font-weight:800;color:${quebra > 0 ? 'var(--c-success)' : quebra < 0 ? 'var(--c-danger)' : 'var(--c-text-3)'}">${formatMoney(Math.abs(quebra))}</span>
+        </div>
+      </div>
+      ` : `<div style="text-align:center;color:var(--c-warning);font-size:var(--t-sm)">⏳ Este caixa ainda está aberto</div>`}
+
+      ${sessao.observacoes ? `
+      <div class="field">
+        <label>Observações do fechamento</label>
+        <div style="background:var(--c-bg);border-radius:var(--r-md);padding:var(--sp-3);font-size:var(--t-sm);color:var(--c-text-2)">${sessao.observacoes}</div>
+      </div>
+      ` : ''}
+    </div>
+  `, 'modal--lg');
 };
 
 // ============================================================
@@ -5190,6 +5418,7 @@ async function renderPassagens(el) {
               <th>Repasse</th>
               <th>Status</th>
               <th>Repasse Confirmado</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="tbody-passagens">
@@ -5232,15 +5461,15 @@ async function renderPassagens(el) {
     document.getElementById('total-comissao-count').textContent = `${filtradas.filter(p => p.repasse_confirmado).length} passagens`;
 
     if (filtradas.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma passagem encontrada</div></div></td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="12"><div class="empty-state" style="padding:var(--sp-8)"><div class="empty-state-sub">Nenhuma passagem encontrada</div></div></td></tr>`;
       return;
     }
 
     tbody.innerHTML = filtradas.map(p => {
       const isCancelada = p.status === 'cancelada';
       return `
-        <tr data-id="${p.id}" data-status="${p.status}" data-repasse="${p.repasse_confirmado}" style="${isCancelada ? 'opacity:0.5' : ''}">
-          <td><input type="checkbox" class="checkbox-passagem" data-id="${p.id}" ${isCancelada ? 'disabled' : ''} /></td>
+        <tr data-id="${p.id}" data-status="${p.status}" data-repasse="${p.repasse_confirmado}" style="${isCancelada ? 'opacity:0.5' : ''};cursor:pointer" onclick="if(!event.target.closest('input,button'))verDetalhePassagem('${p.id}')">
+          <td onclick="event.stopPropagation()"><input type="checkbox" class="checkbox-passagem" data-id="${p.id}" ${isCancelada ? 'disabled' : ''} /></td>
           <td class="td-mono">#${p.numero_venda}</td>
           <td>${p.origem || '—'}</td>
           <td>${p.destino || '—'}</td>
@@ -5251,6 +5480,10 @@ async function renderPassagens(el) {
           <td style="color:var(--c-danger)">${formatMoney(p.valor_repasse)}</td>
           <td>${badgeStatus(p.status)}</td>
           <td>${p.repasse_confirmado ? '<span class="badge badge--success">✓</span>' : '<span class="badge badge--warning">⏳</span>'}</td>
+          <td onclick="event.stopPropagation()" style="display:flex;gap:4px">
+            <button class="btn btn--ghost btn--sm" onclick="verDetalhePassagem('${p.id}')" title="Ver detalhes">👁️</button>
+            ${!isCancelada ? `<button class="btn btn--ghost btn--sm" style="color:var(--c-danger)" onclick="cancelarPassagem('${p.id}')" title="Cancelar esta passagem">✕</button>` : ''}
+          </td>
         </tr>
       `;
     }).join('');
@@ -7674,7 +7907,7 @@ function _renderTabelaUsuarios(el) {
                 <td class="td-mono">${formatDate(u.created_at)}</td>
                 <td>
                   <div style="display:flex;gap:4px;flex-wrap:wrap">
-                    <button class="btn btn--ghost btn--sm" onclick="editarUsuario('${u.id}')" title="Editar">✏️</button>
+                    <button class="btn btn--ghost btn--sm" onclick="abrirModalUsuario('${u.id}')" title="Editar">✏️</button>
                     ${u.ativo
                       ? `<button class="btn btn--ghost btn--sm" onclick="bloquearUsuario('${u.id}')" title="Bloquear">🔒</button>`
                       : `<button class="btn btn--ghost btn--sm" onclick="desbloquearUsuario('${u.id}')" title="Desbloquear">🔓</button>`
@@ -7715,16 +7948,33 @@ window.mudarPaginaUsuarios = function(novaPagina) {
 
 window.abrirModalUsuario = function(usuarioId) {
   const isEdit = !!usuarioId;
-  let userData = {};
 
-  if (isEdit) {
-    // Precisamos buscar da view ou da tabela profiles
-    sb.from('profiles').select('*').eq('id', State.user.id).maybeSingle()
-    .then(result => console.log('Perfil:', result))
-    .catch(err => console.error('Erro:', err));
-  } else {
-    abrirModalUsuarioForm(isEdit, { nome: '', role: 'funcionario', email: '', senha: '' });
+  if (!isEdit) {
+    abrirModalUsuarioForm(false, { nome: '', role: 'funcionario', email: '', senha: '' });
+    return;
   }
+
+  // BUG CORRIGIDO: antes buscava `.eq('id', State.user.id)` — ou seja,
+  // SEMPRE o usuário logado, nunca o usuário clicado (usuarioId era
+  // ignorado) — e o resultado só ia pro console.log, nunca chegava a
+  // chamar abrirModalUsuarioForm(). Resultado: clicar em "✏️ Editar" em
+  // qualquer usuário não fazia nada visível.
+  // Como a lista já vem carregada em _usuariosState.todos (via RPC
+  // get_usuarios), nem precisa de uma query nova — só procurar no cache
+  // já em memória, o que também deixa a abertura instantânea.
+  const usuario = (_usuariosState.todos || []).find(u => u.id === usuarioId);
+  if (!usuario) {
+    toast('Usuário não encontrado.', 'error');
+    return;
+  }
+
+  abrirModalUsuarioForm(true, {
+    id: usuario.id,
+    nome: usuario.nome || '',
+    email: usuario.email || '',
+    role: usuario.role || 'funcionario',
+    ativo: usuario.ativo !== false,
+  });
 };
 
 function abrirModalUsuarioForm(isEdit, data) {

@@ -6212,12 +6212,17 @@ async function _refreshFilaInternal() {
 
   try {
     const LIMITE = 50;
-    const { data: pedidos, error } = await sb
+    // IMPORTANTE: busca os mais RECENTES primeiro (ascending:false) para que
+    // o limit(50) nunca corte pedidos novos quando já existem >50 pedidos
+    // ativos/concluídos acumulados. Depois inverte no JS para manter a
+    // ordem de exibição do mais antigo para o mais novo (fila normal).
+    const { data: pedidosDesc, error } = await sb
       .from('pedidos_copia')
       .select('*, impressoras(nome, status, colorida, tipo)')
       .in('status', ['na_fila', 'imprimindo', 'conferencia', 'concluido', 'erro'])
-      .order('created_at', { ascending: true })
+      .order('created_at', { ascending: false })
       .limit(LIMITE);
+    const pedidos = pedidosDesc ? [...pedidosDesc].reverse() : pedidosDesc;
 
     if (error) {
       console.error('❌ Erro na consulta:', error);
